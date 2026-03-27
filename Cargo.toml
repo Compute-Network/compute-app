@@ -1,0 +1,66 @@
+[workspace]
+members = [
+    "crates/compute-cli",
+    "crates/compute-daemon",
+    "crates/compute-network",
+    "crates/compute-solana",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Compute-Network/compute-app"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# System info
+sysinfo = "0.34"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Docker
+bollard = "0.18"
+
+# QUIC transport
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+
+# Directories
+dirs = "6"
+
+# Internal crates
+compute-daemon = { path = "crates/compute-daemon" }
+compute-network = { path = "crates/compute-network" }
+compute-solana = { path = "crates/compute-solana" }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = "z"

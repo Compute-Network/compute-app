@@ -1,0 +1,265 @@
+use std::time::{Duration, Instant};
+
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::{
+    DefaultTerminal, Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+};
+
+use super::globe::Globe;
+
+const COMPUTE_LOGO: &[&str] = &[
+    "██████╗ ██████╗ ███╗   ███╗██████╗ ██╗   ██╗████████╗███████╗",
+    "██╔════╝██╔═══██╗████╗ ████║██╔══██╗██║   ██║╚══██╔══╝██╔════╝",
+    "██║     ██║   ██║██╔████╔██║██████╔╝██║   ██║   ██║   █████╗  ",
+    "██║     ██║   ██║██║╚██╔╝██║██╔═══╝ ██║   ██║   ██║   ██╔══╝  ",
+    "╚██████╗╚██████╔╝██║ ╚═╝ ██║██║     ╚██████╔╝   ██║   ███████╗",
+    " ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚═╝      ╚═════╝    ╚═╝   ╚══════╝",
+];
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Steps shown during the startup splash.
+#[derive(Clone)]
+struct StartupStep {
+    label: String,
+    done: bool,
+    #[allow(dead_code)]
+    result: Option<String>,
+}
+
+pub struct SplashScreen {
+    globe: Globe,
+    steps: Vec<StartupStep>,
+    current_step: usize,
+    start_time: Instant,
+    step_timer: Instant,
+    logo_visible_chars: usize,
+    phase: SplashPhase,
+}
+
+#[derive(PartialEq)]
+enum SplashPhase {
+    GlobeFadeIn,
+    LogoTyping,
+    StepsRunning,
+    Complete,
+}
+
+impl SplashScreen {
+    pub fn new(hardware_info: &compute_daemon::hardware::HardwareInfo) -> Self {
+        let mut globe = Globe::new();
+        globe.set_mock_nodes();
+
+        let gpu_name = hardware_info
+            .gpus
+            .first()
+            .map(|g| format!("{} ({})", g.name, format_vram(g.vram_mb)))
+            .unwrap_or_else(|| "No GPU detected".into());
+
+        let steps = vec![
+            StartupStep { label: "Detecting hardware...".into(), done: false, result: None },
+            StartupStep { label: format!("GPU: {gpu_name}"), done: false, result: None },
+            StartupStep { label: "Connecting to network...".into(), done: false, result: None },
+            StartupStep { label: "12,847 nodes online".into(), done: false, result: None },
+        ];
+
+        Self {
+            globe,
+            steps,
+            current_step: 0,
+            start_time: Instant::now(),
+            step_timer: Instant::now(),
+            logo_visible_chars: 0,
+            phase: SplashPhase::GlobeFadeIn,
+        }
+    }
+
+    /// Run the splash screen animation. Returns true if user wants to continue to dashboard.
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<bool> {
+        let tick_rate = Duration::from_millis(50); // 20 fps
+
+        loop {
+            terminal.draw(|frame| self.draw(frame))?;
+
+            // Handle input
+            if event::poll(tick_rate)?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+                    KeyCode::Enter if self.phase == SplashPhase::Complete => {
+                        return Ok(true);
+                    }
+                    // Any key during animation speeds it up
+                    _ if self.phase != SplashPhase::Complete => {
+                        self.skip_to_complete();
+                    }
+                    _ => {}
+                }
+            }
+
+            // Update state
+            self.tick();
+
+            // Auto-complete after all steps done + brief pause
+            if self.phase == SplashPhase::Complete
+                && self.start_time.elapsed() > Duration::from_secs(4)
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    fn tick(&mut self) {
+        self.globe.tick();
+
+        let elapsed = self.start_time.elapsed();
+
+        match self.phase {
+            SplashPhase::GlobeFadeIn => {
+                if elapsed > Duration::from_millis(500) {
+                    self.phase = SplashPhase::LogoTyping;
+                }
+            }
+            SplashPhase::LogoTyping => {
+                // Type out the logo ~3 chars per tick
+                let total_chars: usize = COMPUTE_LOGO.iter().map(|l| l.len()).sum();
+                self.logo_visible_chars = (self.logo_visible_chars + 4).min(total_chars);
+                if self.logo_visible_chars >= total_chars {
+                    self.phase = SplashPhase::StepsRunning;
+                    self.step_timer = Instant::now();
+                }
+            }
+            SplashPhase::StepsRunning => {
+                if self.current_step < self.steps.len() {
+                    let step_delay = match self.current_step {
+                        0 => Duration::from_millis(300),
+                        1 => Duration::from_millis(200),
+                        2 => Duration::from_millis(500),
+                        _ => Duration::from_millis(300),
+                    };
+                    if self.step_timer.elapsed() > step_delay {
+                        self.steps[self.current_step].done = true;
+                        self.current_step += 1;
+                        self.step_timer = Instant::now();
+                    }
+                } else {
+                    self.phase = SplashPhase::Complete;
+                }
+            }
+            SplashPhase::Complete => {}
+        }
+    }
+
+    fn skip_to_complete(&mut self) {
+        for step in &mut self.steps {
+            step.done = true;
+        }
+        self.current_step = self.steps.len();
+        let total_chars: usize = COMPUTE_LOGO.iter().map(|l| l.len()).sum();
+        self.logo_visible_chars = total_chars;
+        self.phase = SplashPhase::Complete;
+    }
+
+    fn draw(&self, frame: &mut Frame) {
+        let area = frame.area();
+
+        // Main horizontal split: 33% globe, 67% content
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
+            .split(area);
+
+        // Left: Globe
+        self.globe.render(chunks[0], frame.buffer_mut());
+
+        // Right: Splash content
+        self.draw_splash_content(frame, chunks[1]);
+    }
+
+    fn draw_splash_content(&self, frame: &mut Frame, area: Rect) {
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // top padding
+                Constraint::Length(8), // logo
+                Constraint::Length(2), // tagline + version
+                Constraint::Length(1), // spacer
+                Constraint::Min(6),    // steps
+                Constraint::Length(2), // bottom message
+            ])
+            .split(area);
+
+        // Logo
+        let total_chars: usize = COMPUTE_LOGO.iter().map(|l| l.len()).sum();
+        let visible = self.logo_visible_chars.min(total_chars);
+
+        let mut logo_lines = Vec::new();
+        let mut chars_shown = 0;
+        for &line in COMPUTE_LOGO {
+            if chars_shown >= visible {
+                logo_lines.push(Line::from(""));
+            } else {
+                let line_visible = (visible - chars_shown).min(line.len());
+                let visible_text: String = line.chars().take(line_visible).collect();
+                logo_lines.push(Line::from(Span::styled(
+                    visible_text,
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )));
+                chars_shown += line.len();
+            }
+        }
+
+        let logo = Paragraph::new(logo_lines);
+        frame.render_widget(logo, right_chunks[1]);
+
+        // Tagline + version
+        let tagline = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Decentralized GPU Infrastructure",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(format!("v{VERSION}"), Style::default().fg(Color::DarkGray))),
+        ]);
+        frame.render_widget(tagline, right_chunks[2]);
+
+        // Steps
+        let mut step_lines = Vec::new();
+        for (i, step) in self.steps.iter().enumerate() {
+            let (icon, color) = if step.done {
+                ("  ✓ ", Color::Green)
+            } else if i == self.current_step && self.phase == SplashPhase::StepsRunning {
+                ("  ◌ ", Color::Yellow)
+            } else {
+                ("    ", Color::DarkGray)
+            };
+
+            if i <= self.current_step || step.done {
+                step_lines.push(Line::from(vec![
+                    Span::styled(icon, Style::default().fg(color)),
+                    Span::styled(&step.label, Style::default().fg(Color::Gray)),
+                ]));
+            }
+        }
+        let steps_widget = Paragraph::new(step_lines);
+        frame.render_widget(steps_widget, right_chunks[4]);
+
+        // Bottom message
+        if self.phase == SplashPhase::Complete {
+            let msg = Paragraph::new(Line::from(Span::styled(
+                "  Daemon started. Earning $COMPUTE...",
+                Style::default().fg(Color::Green),
+            )));
+            frame.render_widget(msg, right_chunks[5]);
+        }
+    }
+}
+
+fn format_vram(vram_mb: u64) -> String {
+    if vram_mb >= 1024 { format!("{}GB", vram_mb / 1024) } else { format!("{vram_mb}MB") }
+}

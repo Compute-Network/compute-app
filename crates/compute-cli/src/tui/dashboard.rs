@@ -1,0 +1,488 @@
+use std::time::{Duration, Instant};
+
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::{
+    DefaultTerminal, Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Sparkline},
+};
+
+use compute_daemon::hardware::{self, HardwareInfo, LiveMetrics};
+use compute_daemon::metrics::{Earnings, NetworkStats, PipelineStatus};
+
+use super::globe::Globe;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub struct Dashboard {
+    globe: Globe,
+    hardware: HardwareInfo,
+    earnings: Earnings,
+    pipeline: PipelineStatus,
+    network: NetworkStats,
+    throughput_history: Vec<u64>,
+    sys: sysinfo::System,
+    live_metrics: LiveMetrics,
+    last_metrics_update: Instant,
+    uptime_start: Instant,
+}
+
+impl Dashboard {
+    pub fn new(hardware: HardwareInfo) -> Self {
+        let mut globe = Globe::new();
+        globe.set_mock_nodes();
+
+        Self {
+            globe,
+            hardware,
+            earnings: Earnings::mock(),
+            pipeline: PipelineStatus::mock(),
+            network: NetworkStats::mock(),
+            throughput_history: generate_mock_throughput(),
+            sys: sysinfo::System::new_all(),
+            live_metrics: LiveMetrics::default(),
+            last_metrics_update: Instant::now(),
+            uptime_start: Instant::now(),
+        }
+    }
+
+    /// Run the dashboard event loop.
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
+        let tick_rate = Duration::from_millis(100); // 10 fps
+
+        loop {
+            terminal.draw(|frame| self.draw(frame))?;
+
+            if event::poll(tick_rate)?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('p') => {
+                        self.pipeline.active = !self.pipeline.active;
+                    }
+                    _ => {}
+                }
+            }
+
+            self.tick();
+        }
+    }
+
+    fn tick(&mut self) {
+        self.globe.tick();
+
+        // Update live metrics every 2 seconds
+        if self.last_metrics_update.elapsed() > Duration::from_secs(2) {
+            self.live_metrics = hardware::collect_live_metrics(&mut self.sys);
+            self.last_metrics_update = Instant::now();
+        }
+
+        // Simulate throughput changes
+        if self.throughput_history.len() > 60 {
+            self.throughput_history.remove(0);
+        }
+        let last = *self.throughput_history.last().unwrap_or(&40);
+        let jitter = (rand_simple() * 10.0 - 5.0) as i64;
+        let new_val = (last as i64 + jitter).clamp(10, 80) as u64;
+        self.throughput_history.push(new_val);
+    }
+
+    fn draw(&self, frame: &mut Frame) {
+        let area = frame.area();
+
+        // Main horizontal split: 33% globe, 67% content
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
+            .split(area);
+
+        // Left panel: Globe + network stats
+        self.draw_globe_panel(frame, chunks[0]);
+
+        // Right panel: All info sections
+        self.draw_right_panel(frame, chunks[1]);
+    }
+
+    fn draw_globe_panel(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(10),   // Globe
+                Constraint::Length(4), // Network stats
+            ])
+            .split(area);
+
+        // Globe
+        let globe_block = Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let inner = globe_block.inner(chunks[0]);
+        frame.render_widget(globe_block, chunks[0]);
+        self.globe.render(inner, frame.buffer_mut());
+
+        // Network stats below globe
+        let stats_block = Block::default()
+            .borders(Borders::RIGHT | Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray));
+        let stats_inner = stats_block.inner(chunks[1]);
+        frame.render_widget(stats_block, chunks[1]);
+
+        let stats = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("  {:>6} ", format_number(self.network.total_nodes)),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("nodes", Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::styled("  ● ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("{:.0} PF", self.network.peak_petaflops),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(" peak", Style::default().fg(Color::DarkGray)),
+            ]),
+        ]);
+        frame.render_widget(stats, stats_inner);
+    }
+
+    fn draw_right_panel(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Length(7), // Node info
+                Constraint::Length(7), // Earnings
+                Constraint::Length(8), // Workload
+                Constraint::Min(5),    // Throughput sparkline
+                Constraint::Length(1), // Keyboard shortcuts
+            ])
+            .split(area);
+
+        self.draw_header(frame, chunks[0]);
+        self.draw_node_info(frame, chunks[1]);
+        self.draw_earnings(frame, chunks[2]);
+        self.draw_workload(frame, chunks[3]);
+        self.draw_throughput(frame, chunks[4]);
+        self.draw_shortcuts(frame, chunks[5]);
+    }
+
+    fn draw_header(&self, frame: &mut Frame, area: Rect) {
+        let status_color = if self.pipeline.active { Color::Green } else { Color::Yellow };
+        let status_text = if self.pipeline.active { "ACTIVE" } else { "PAUSED" };
+
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  COMPUTE",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("              "),
+            Span::styled("● ", Style::default().fg(status_color)),
+            Span::styled(status_text, Style::default().fg(status_color)),
+            Span::raw("     "),
+            Span::styled(format!("v{VERSION}"), Style::default().fg(Color::DarkGray)),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        frame.render_widget(header, area);
+    }
+
+    fn draw_node_info(&self, frame: &mut Frame, area: Rect) {
+        let gpu_name = self
+            .hardware
+            .gpus
+            .first()
+            .map(|g| format!("{} ({})", g.name, format_vram(g.vram_mb)))
+            .unwrap_or_else(|| "No GPU".into());
+
+        let pipeline_stage =
+            if let (Some(s), Some(t)) = (self.pipeline.stage, self.pipeline.total_stages) {
+                format!("Pipeline Stage {s}/{t}")
+            } else {
+                "Not assigned".into()
+            };
+
+        let uptime = format_duration(self.uptime_start.elapsed());
+
+        let cpu_bar = progress_bar(self.live_metrics.cpu_usage as f64, 100.0, 10);
+
+        let lines = vec![
+            Line::from(Span::styled(
+                "  NODE",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  GPU     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&gpu_name, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Stage   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&pipeline_stage, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Uptime  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&uptime, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  CPU     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&cpu_bar, Style::default().fg(Color::White)),
+                Span::styled(
+                    format!(" {:.0}%", self.live_metrics.cpu_usage),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ];
+
+        let widget = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        frame.render_widget(widget, area);
+    }
+
+    fn draw_earnings(&self, frame: &mut Frame, area: Rect) {
+        let e = &self.earnings;
+        let lines = vec![
+            Line::from(Span::styled(
+                "  EARNINGS",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Today      ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:.1} $COMPUTE", e.today), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("    ≈ ${:.2}", e.today * e.usd_rate),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  This Week  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:.1} $COMPUTE", e.this_week),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(
+                    format!("    ≈ ${:.2}", e.this_week * e.usd_rate),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  All Time   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:.0} $COMPUTE", e.all_time),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Pending    ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:.1} $COMPUTE", e.pending),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled("  [c]laim", Style::default().fg(Color::DarkGray)),
+            ]),
+        ];
+
+        let widget = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        frame.render_widget(widget, area);
+    }
+
+    fn draw_workload(&self, frame: &mut Frame, area: Rect) {
+        let p = &self.pipeline;
+        let model = p.model.as_deref().unwrap_or("None");
+
+        let vram_line = if let (Some(used), Some(total)) =
+            (self.live_metrics.gpu_vram_used_mb, self.live_metrics.gpu_vram_total_mb)
+        {
+            format!("{} / {} GB", used / 1024, total / 1024)
+        } else if let Some(gpu) = self.hardware.gpus.first() {
+            format!("-- / {} GB", gpu.vram_mb / 1024)
+        } else {
+            "N/A".into()
+        };
+
+        let temp_line =
+            self.live_metrics.gpu_temp.map(|t| format!("{t}°C")).unwrap_or_else(|| "--".into());
+
+        let power_line =
+            match (self.live_metrics.gpu_power_watts, self.live_metrics.gpu_power_limit_watts) {
+                (Some(p), Some(l)) => format!("{p}W / {l}W"),
+                _ => "--".into(),
+            };
+
+        let lines = vec![
+            Line::from(Span::styled(
+                "  WORKLOAD",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Model     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(model, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Served    ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} requests", format_number(p.requests_served as u32)),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Latency   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:.0}ms avg", p.avg_latency_ms),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  VRAM      ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&vram_line, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Temp      ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&temp_line, Style::default().fg(Color::White)),
+                Span::styled("    Power  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(&power_line, Style::default().fg(Color::White)),
+            ]),
+        ];
+
+        let widget = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+        frame.render_widget(widget, area);
+    }
+
+    fn draw_throughput(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(area);
+
+        let label = Paragraph::new(Line::from(Span::styled(
+            "  THROUGHPUT",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )));
+        frame.render_widget(label, chunks[0]);
+
+        let sparkline = Sparkline::default()
+            .data(&self.throughput_history)
+            .max(100)
+            .style(Style::default().fg(Color::White));
+
+        // Add left padding to sparkline
+        let sparkline_area =
+            Rect { x: chunks[2].x + 2, width: chunks[2].width.saturating_sub(4), ..chunks[2] };
+        frame.render_widget(sparkline, sparkline_area);
+
+        let current_tps = self.throughput_history.last().unwrap_or(&0);
+        let tps_label = Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{current_tps:.1} tok/s"),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .alignment(Alignment::Right);
+        frame.render_widget(
+            tps_label,
+            Rect { width: chunks[3].width.saturating_sub(2), ..chunks[3] },
+        );
+    }
+
+    fn draw_shortcuts(&self, frame: &mut Frame, area: Rect) {
+        let shortcuts = Paragraph::new(Line::from(vec![
+            Span::styled(" [q]", Style::default().fg(Color::DarkGray)),
+            Span::styled("uit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[p]", Style::default().fg(Color::DarkGray)),
+            Span::styled("ause  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[l]", Style::default().fg(Color::DarkGray)),
+            Span::styled("ogs  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[e]", Style::default().fg(Color::DarkGray)),
+            Span::styled("arnings  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[c]", Style::default().fg(Color::DarkGray)),
+            Span::styled("laim  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[i]", Style::default().fg(Color::DarkGray)),
+            Span::styled("nfo", Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(shortcuts, area);
+    }
+}
+
+// --- Helpers ---
+
+fn format_vram(vram_mb: u64) -> String {
+    if vram_mb >= 1024 { format!("{}GB", vram_mb / 1024) } else { format!("{vram_mb}MB") }
+}
+
+fn format_number(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{},{:03}", n / 1_000, n % 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    let days = secs / 86400;
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else {
+        format!("{mins}m")
+    }
+}
+
+fn progress_bar(value: f64, max: f64, width: usize) -> String {
+    let ratio = (value / max).clamp(0.0, 1.0);
+    let filled = (ratio * width as f64).round() as usize;
+    let empty = width - filled;
+    format!("{}{}", "▓".repeat(filled), "░".repeat(empty))
+}
+
+fn generate_mock_throughput() -> Vec<u64> {
+    let mut data = Vec::with_capacity(40);
+    let mut val = 40u64;
+    for i in 0..40 {
+        let jitter = ((i as f64 * 0.5).sin() * 15.0) as i64;
+        val = (val as i64 + jitter).clamp(10, 80) as u64;
+        data.push(val);
+    }
+    data
+}
+
+/// Simple deterministic pseudo-random for throughput jitter. No external dep needed.
+fn rand_simple() -> f64 {
+    use std::time::SystemTime;
+    let nanos =
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().subsec_nanos();
+    (nanos % 1000) as f64 / 1000.0
+}
