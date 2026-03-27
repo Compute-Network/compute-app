@@ -3,6 +3,7 @@ mod tui;
 
 use anyhow::Result;
 use clap::Parser;
+use std::io::Seek;
 
 use cli::{Cli, Commands, ConfigAction, WalletAction};
 use compute_daemon::config::{self, Config};
@@ -115,10 +116,29 @@ fn cmd_logs(lines: usize, follow: bool) -> Result<()> {
     }
 
     if follow {
-        println!(
-            "(follow mode not yet implemented — use `tail -f {}` for now)",
-            log_path.display()
-        );
+        use std::io::Read;
+
+        // Open the file and seek to end, then poll for new data
+        let mut file = std::fs::File::open(&log_path)?;
+        file.seek(std::io::SeekFrom::End(0))?;
+
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match file.read_to_string(&mut buf) {
+                Ok(0) => {
+                    // No new data, sleep briefly
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Ok(_) => {
+                    print!("{buf}");
+                }
+                Err(e) => {
+                    eprintln!("Error reading log: {e}");
+                    break;
+                }
+            }
+        }
     }
 
     Ok(())
