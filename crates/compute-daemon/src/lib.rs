@@ -2,6 +2,7 @@ pub mod benchmark;
 pub mod config;
 pub mod container;
 pub mod daemon;
+pub mod error;
 pub mod hardware;
 pub mod idle;
 pub mod logging;
