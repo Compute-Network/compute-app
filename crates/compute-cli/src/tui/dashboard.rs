@@ -16,6 +16,13 @@ use super::globe::Globe;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Overview,
+    Logs,
+    Config,
+}
+
 pub struct Dashboard {
     globe: Globe,
     hardware: HardwareInfo,
@@ -27,12 +34,17 @@ pub struct Dashboard {
     live_metrics: LiveMetrics,
     last_metrics_update: Instant,
     uptime_start: Instant,
+    active_tab: Tab,
+    log_lines: Vec<String>,
 }
 
 impl Dashboard {
     pub fn new(hardware: HardwareInfo) -> Self {
         let mut globe = Globe::new();
         globe.set_mock_nodes();
+
+        // Try to load recent log lines
+        let log_lines = load_recent_logs(50);
 
         Self {
             globe,
@@ -45,6 +57,8 @@ impl Dashboard {
             live_metrics: LiveMetrics::default(),
             last_metrics_update: Instant::now(),
             uptime_start: Instant::now(),
+            active_tab: Tab::Overview,
+            log_lines,
         }
     }
 
@@ -63,6 +77,22 @@ impl Dashboard {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('p') => {
                         self.pipeline.active = !self.pipeline.active;
+                    }
+                    KeyCode::Char('1') => self.active_tab = Tab::Overview,
+                    KeyCode::Char('2') | KeyCode::Char('l') => {
+                        self.active_tab = Tab::Logs;
+                        self.log_lines = load_recent_logs(100);
+                    }
+                    KeyCode::Char('3') => self.active_tab = Tab::Config,
+                    KeyCode::Tab => {
+                        self.active_tab = match self.active_tab {
+                            Tab::Overview => Tab::Logs,
+                            Tab::Logs => Tab::Config,
+                            Tab::Config => Tab::Overview,
+                        };
+                        if self.active_tab == Tab::Logs {
+                            self.log_lines = load_recent_logs(100);
+                        }
                     }
                     _ => {}
                 }
@@ -152,6 +182,14 @@ impl Dashboard {
     }
 
     fn draw_right_panel(&self, frame: &mut Frame, area: Rect) {
+        match self.active_tab {
+            Tab::Overview => self.draw_overview_panel(frame, area),
+            Tab::Logs => self.draw_logs_panel(frame, area),
+            Tab::Config => self.draw_config_panel(frame, area),
+        }
+    }
+
+    fn draw_overview_panel(&self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -176,17 +214,35 @@ impl Dashboard {
         let status_color = if self.pipeline.active { Color::Green } else { Color::Yellow };
         let status_text = if self.pipeline.active { "ACTIVE" } else { "PAUSED" };
 
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(
-                "  COMPUTE",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("              "),
-            Span::styled("● ", Style::default().fg(status_color)),
-            Span::styled(status_text, Style::default().fg(status_color)),
-            Span::raw("     "),
-            Span::styled(format!("v{VERSION}"), Style::default().fg(Color::DarkGray)),
-        ]))
+        let tab_style = |tab: Tab| {
+            if tab == self.active_tab {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }
+        };
+
+        let header = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "  COMPUTE",
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("         "),
+                Span::styled("● ", Style::default().fg(status_color)),
+                Span::styled(status_text, Style::default().fg(status_color)),
+                Span::raw("     "),
+                Span::styled(format!("v{VERSION}"), Style::default().fg(Color::DarkGray)),
+            ]),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("[1] OVERVIEW", tab_style(Tab::Overview)),
+                Span::raw("  "),
+                Span::styled("[2] LOGS", tab_style(Tab::Logs)),
+                Span::raw("  "),
+                Span::styled("[3] CONFIG", tab_style(Tab::Config)),
+            ]),
+        ])
         .block(
             Block::default()
                 .borders(Borders::BOTTOM)
@@ -417,16 +473,120 @@ impl Dashboard {
             Span::styled("uit  ", Style::default().fg(Color::DarkGray)),
             Span::styled("[p]", Style::default().fg(Color::DarkGray)),
             Span::styled("ause  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[l]", Style::default().fg(Color::DarkGray)),
-            Span::styled("ogs  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[e]", Style::default().fg(Color::DarkGray)),
-            Span::styled("arnings  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[c]", Style::default().fg(Color::DarkGray)),
-            Span::styled("laim  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[i]", Style::default().fg(Color::DarkGray)),
-            Span::styled("nfo", Style::default().fg(Color::DarkGray)),
+            Span::styled("[Tab]", Style::default().fg(Color::DarkGray)),
+            Span::styled(" switch  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[1]", Style::default().fg(Color::DarkGray)),
+            Span::styled("overview  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[2]", Style::default().fg(Color::DarkGray)),
+            Span::styled("logs  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("[3]", Style::default().fg(Color::DarkGray)),
+            Span::styled("config", Style::default().fg(Color::DarkGray)),
         ]));
         frame.render_widget(shortcuts, area);
+    }
+
+    fn draw_logs_panel(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Min(5),    // Log content
+                Constraint::Length(1), // Shortcuts
+            ])
+            .split(area);
+
+        self.draw_header(frame, chunks[0]);
+
+        // Log lines
+        let visible_height = chunks[1].height as usize;
+        let start = self.log_lines.len().saturating_sub(visible_height);
+        let visible_lines: Vec<Line> = self.log_lines[start..]
+            .iter()
+            .map(|line| {
+                Line::from(Span::styled(format!("  {line}"), Style::default().fg(Color::Gray)))
+            })
+            .collect();
+
+        let logs = Paragraph::new(visible_lines).block(Block::default().borders(Borders::NONE));
+        frame.render_widget(logs, chunks[1]);
+
+        self.draw_shortcuts(frame, chunks[2]);
+    }
+
+    fn draw_config_panel(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Min(5),    // Config content
+                Constraint::Length(1), // Shortcuts
+            ])
+            .split(area);
+
+        self.draw_header(frame, chunks[0]);
+
+        // Show current config
+        let config = compute_daemon::config::Config::load().unwrap_or_default();
+        let lines = vec![
+            Line::from(Span::styled(
+                "  CONFIGURATION",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            config_line("  node.name", &config.node.name),
+            config_line("  node.max_gpu_usage", &format!("{}%", config.node.max_gpu_usage)),
+            config_line("  node.max_cpu_usage", &format!("{}%", config.node.max_cpu_usage)),
+            config_line(
+                "  node.idle_threshold",
+                &format!("{} min", config.node.idle_threshold_minutes),
+            ),
+            config_line("  node.pause_on_battery", &config.node.pause_on_battery.to_string()),
+            Line::from(""),
+            config_line(
+                "  wallet.public_address",
+                if config.wallet.public_address.is_empty() {
+                    "(not set)"
+                } else {
+                    &config.wallet.public_address
+                },
+            ),
+            Line::from(""),
+            config_line("  network.orchestrator", &config.network.orchestrator_url),
+            config_line("  network.region", &config.network.region),
+            Line::from(""),
+            config_line("  logging.level", &config.logging.level),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Edit with: compute config set <key> <value>",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let config_widget = Paragraph::new(lines);
+        frame.render_widget(config_widget, chunks[1]);
+
+        self.draw_shortcuts(frame, chunks[2]);
+    }
+}
+
+fn config_line(key: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{key:<30}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(value.to_string(), Style::default().fg(Color::White)),
+    ])
+}
+
+fn load_recent_logs(n: usize) -> Vec<String> {
+    let log_path = compute_daemon::config::logs_dir().ok().map(|d| d.join("compute.log"));
+
+    match log_path {
+        Some(path) if path.exists() => {
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<String> = contents.lines().map(String::from).collect();
+            let start = lines.len().saturating_sub(n);
+            lines[start..].to_vec()
+        }
+        _ => vec!["  No log file found. Start the daemon to generate logs.".into()],
     }
 }
 
