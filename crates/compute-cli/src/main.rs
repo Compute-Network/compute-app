@@ -5,7 +5,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::io::Seek;
 
-use cli::{Cli, Commands, ConfigAction, WalletAction};
+use cli::{Cli, Commands, ConfigAction, ServiceAction, WalletAction};
 use compute_daemon::config::{self, Config};
 use compute_daemon::daemon;
 use compute_daemon::hardware;
@@ -31,6 +31,7 @@ fn main() -> Result<()> {
         Some(Commands::Update) => cmd_update()?,
         Some(Commands::Uninstall) => cmd_uninstall()?,
         Some(Commands::Doctor) => cmd_doctor()?,
+        Some(Commands::Service { action }) => cmd_service(action)?,
         None => {
             // No subcommand — show splash then dashboard
             tui::app::run_splash_then_dashboard()?;
@@ -315,7 +316,9 @@ fn cmd_earnings() -> Result<()> {
 }
 
 fn cmd_benchmark() -> Result<()> {
-    println!("\n  Running benchmark...\n");
+    use compute_daemon::benchmark;
+
+    println!("\n  COMPUTE BENCHMARK\n");
 
     let hw = hardware::detect();
 
@@ -349,6 +352,41 @@ fn cmd_benchmark() -> Result<()> {
         }
     );
 
+    // Run benchmarks
+    println!();
+    println!("  BENCHMARK");
+    println!("  ────────────────────────────────");
+
+    print!("  CPU (single)... ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let (cpu_single, cpu_multi) = benchmark::bench_cpu();
+    println!("{:.1} Mops", cpu_single);
+    println!("  CPU (multi)...  {:.1} Mops ({:.1}x)", cpu_multi, cpu_multi / cpu_single);
+
+    print!("  Memory...       ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let mem_bw = benchmark::bench_memory();
+    println!("{:.1} GB/s", mem_bw);
+
+    print!("  Disk read...    ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let disk = benchmark::bench_disk();
+    println!("{:.0} MB/s", disk);
+
+    let gpu_name = hw.gpus.first().map(|g| g.name.as_str()).unwrap_or("CPU");
+    let gpu_vram = hw.gpus.first().map(|g| g.vram_mb).unwrap_or(0);
+    let tflops = benchmark::estimate_tflops(gpu_name, gpu_vram);
+    println!("  GPU (est.)...   {:.1} TFLOPS FP16", tflops);
+
+    print!("  Network...      ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let rt = tokio::runtime::Runtime::new()?;
+    let download = rt.block_on(benchmark::bench_network_download());
+    match download {
+        Some(mbps) => println!("{:.1} Mbps download", mbps),
+        None => println!("unavailable"),
+    }
+
     println!();
     println!("  PIPELINE ELIGIBILITY");
     println!("  ────────────────────────────────");
@@ -371,9 +409,6 @@ fn cmd_benchmark() -> Result<()> {
             println!("  ⚠ Docker not found — required for workload containers");
         }
     }
-
-    println!();
-    println!("  (Full benchmark with network speed test coming soon)");
     println!();
 
     Ok(())
@@ -485,6 +520,26 @@ fn print_check(label: &str, ok: bool) {
     } else {
         println!("  ✗ {label}");
     }
+}
+
+fn cmd_service(action: ServiceAction) -> Result<()> {
+    match action {
+        ServiceAction::Install => {
+            compute_daemon::service::install_service()?;
+        }
+        ServiceAction::Uninstall => {
+            compute_daemon::service::uninstall_service()?;
+        }
+        ServiceAction::Status => {
+            if compute_daemon::service::is_service_installed() {
+                println!("Service is installed (auto-start on login)");
+            } else {
+                println!("Service is not installed");
+                println!("Install with: compute service install");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn format_duration_short(d: std::time::Duration) -> String {

@@ -82,6 +82,22 @@ pub enum Commands {
 
     /// Diagnose common issues
     Doctor,
+
+    /// Install/uninstall as a system service (auto-start on login)
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ServiceAction {
+    /// Install as a system service (launchd on macOS, systemd on Linux)
+    Install,
+    /// Uninstall the system service
+    Uninstall,
+    /// Check if the service is installed
+    Status,
 }
 
 #[derive(Subcommand)]

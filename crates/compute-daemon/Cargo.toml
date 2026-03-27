@@ -19,6 +19,9 @@ tracing-subscriber = { workspace = true }
 # System info
 sysinfo = { workspace = true }
 
+# HTTP
+reqwest = { workspace = true }
+
 # Docker
 bollard = { workspace = true }
 futures-util = "0.3"
