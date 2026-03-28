@@ -6,7 +6,7 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-compute_rewards = "J2hnoTyYweXqWQtF2zW7SQ2h7BTeKzBUsmKUq8T3HpQP"
+compute_rewards = "8socMypA9fyApkdKwoK8SiP4LngUR1gjh5JqcCzQVb4q"
 
 [registry]
 url = "https://api.apr.dev"

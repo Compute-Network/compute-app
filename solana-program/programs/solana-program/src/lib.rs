@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 
-declare_id!("J2hnoTyYweXqWQtF2zW7SQ2h7BTeKzBUsmKUq8T3HpQP");
+declare_id!("8socMypA9fyApkdKwoK8SiP4LngUR1gjh5JqcCzQVb4q");
 
 #[program]
 pub mod compute_rewards {
