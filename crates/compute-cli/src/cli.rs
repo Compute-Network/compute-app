@@ -74,6 +74,17 @@ pub enum Commands {
     /// Show current pipeline status and peers
     Pipeline,
 
+    /// List online nodes in the network
+    Nodes {
+        /// Show all nodes (default: only online)
+        #[arg(short, long)]
+        all: bool,
+
+        /// Limit number of results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+
     /// Self-update to latest version
     Update,
 

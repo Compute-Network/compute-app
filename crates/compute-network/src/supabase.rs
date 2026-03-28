@@ -75,6 +75,20 @@ pub struct NetworkStats {
     pub online_nodes: u64,
 }
 
+/// Node info for CLI listing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeListEntry {
+    pub wallet_address: String,
+    pub node_name: Option<String>,
+    pub status: Option<String>,
+    pub gpu_model: Option<String>,
+    pub gpu_backend: Option<String>,
+    pub tflops_fp16: Option<f64>,
+    pub region: Option<String>,
+    pub last_heartbeat: Option<String>,
+    pub uptime_seconds: Option<i64>,
+}
+
 /// Minimal node info for discovery/visualization.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OnlineNode {
@@ -239,6 +253,27 @@ impl SupabaseClient {
             .unwrap_or(0);
 
         Ok(NetworkStats { total_nodes, online_nodes })
+    }
+
+    /// Fetch nodes for CLI listing. Optionally filter to online-only.
+    pub async fn list_nodes(&self, online_only: bool, limit: usize) -> Result<Vec<NodeListEntry>> {
+        let status_filter = if online_only { "&status=eq.online" } else { "" };
+
+        let resp = self
+            .client
+            .get(format!(
+                "{}/nodes?select=wallet_address,node_name,status,gpu_model,gpu_backend,tflops_fp16,region,last_heartbeat,uptime_seconds&order=last_heartbeat.desc.nullslast&limit={limit}{status_filter}",
+                self.rest_url
+            ))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to list nodes: {}", resp.status());
+        }
+
+        let nodes: Vec<NodeListEntry> = resp.json().await?;
+        Ok(nodes)
     }
 
     /// Fetch online nodes (for globe visualization).

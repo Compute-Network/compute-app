@@ -6,6 +6,7 @@ use clap::Parser;
 use std::io::Seek;
 
 use cli::{Cli, Commands, ConfigAction, ServiceAction, WalletAction};
+use compute_network::supabase::SupabaseClient;
 use compute_daemon::config::{self, Config};
 use compute_daemon::daemon;
 use compute_daemon::hardware;
@@ -28,6 +29,7 @@ fn main() -> Result<()> {
         Some(Commands::Benchmark) => cmd_benchmark()?,
         Some(Commands::Hardware) => cmd_hardware()?,
         Some(Commands::Pipeline) => cmd_pipeline()?,
+        Some(Commands::Nodes { all, limit }) => cmd_nodes(all, limit)?,
         Some(Commands::Update) => cmd_update()?,
         Some(Commands::Uninstall) => cmd_uninstall()?,
         Some(Commands::Doctor) => cmd_doctor()?,
@@ -523,6 +525,74 @@ fn cmd_pipeline() -> Result<()> {
     }
     println!();
 
+    Ok(())
+}
+
+fn cmd_nodes(all: bool, limit: usize) -> Result<()> {
+    println!("\n  NETWORK NODES\n");
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let nodes = rt.block_on(async {
+        let client = SupabaseClient::new();
+        client.list_nodes(!all, limit).await
+    });
+
+    match nodes {
+        Ok(nodes) if nodes.is_empty() => {
+            println!("  No {} nodes found.", if all { "" } else { "online " });
+            println!("  Be the first! Run `compute start` to join the network.");
+        }
+        Ok(nodes) => {
+            // Header
+            println!(
+                "  {:<12} {:<16} {:<8} {:<20} {:<8} {:<10}",
+                "STATUS", "NAME", "REGION", "GPU", "TFLOPS", "UPTIME"
+            );
+            println!("  {}", "─".repeat(74));
+
+            for node in &nodes {
+                let status = match node.status.as_deref() {
+                    Some("online") => "● online",
+                    Some("idle") => "◐ idle",
+                    Some("paused") => "◌ paused",
+                    _ => "○ offline",
+                };
+
+                let name = node.node_name.as_deref().unwrap_or("-");
+                let name_display = if name.len() > 14 { &name[..14] } else { name };
+
+                let region = node.region.as_deref().unwrap_or("-");
+                let region_display = if region.len() > 6 { &region[..6] } else { region };
+
+                let gpu = node.gpu_model.as_deref().unwrap_or("-");
+                let gpu_display = if gpu.len() > 18 { &gpu[..18] } else { gpu };
+
+                let tflops = node
+                    .tflops_fp16
+                    .map(|t| format!("{t:.1}"))
+                    .unwrap_or_else(|| "-".into());
+
+                let uptime = node
+                    .uptime_seconds
+                    .map(|s| format_duration_short(std::time::Duration::from_secs(s as u64)))
+                    .unwrap_or_else(|| "-".into());
+
+                println!(
+                    "  {:<12} {:<16} {:<8} {:<20} {:<8} {:<10}",
+                    status, name_display, region_display, gpu_display, tflops, uptime
+                );
+            }
+
+            println!();
+            println!("  {} nodes shown", nodes.len());
+        }
+        Err(e) => {
+            println!("  Error fetching nodes: {e}");
+            println!("  Check your internet connection.");
+        }
+    }
+
+    println!();
     Ok(())
 }
 
