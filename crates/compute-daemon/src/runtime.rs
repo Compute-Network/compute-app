@@ -134,19 +134,52 @@ impl DaemonRuntime {
             state.running = false;
         });
 
+        // Set node offline in Supabase
+        let wallet = &self.config.wallet.public_address;
+        if !wallet.is_empty() {
+            let client = compute_network::supabase::SupabaseClient::new();
+            if let Err(e) = client.set_offline(wallet).await {
+                tracing::warn!("Failed to set node offline: {e}");
+            }
+        }
+
         info!("Daemon stopped");
         Ok(())
     }
 
     async fn heartbeat(&self) {
-        // In the future, this will send a heartbeat to the orchestrator.
-        // For now, just log.
+        let state = self.state_rx.borrow().clone();
         tracing::debug!(
             "Heartbeat | idle={} | cpu={:.0}% | uptime={}s",
-            self.state_rx.borrow().idle_state,
-            self.state_rx.borrow().live_metrics.cpu_usage,
-            self.state_rx.borrow().uptime_secs
+            state.idle_state,
+            state.live_metrics.cpu_usage,
+            state.uptime_secs
         );
+
+        // Send heartbeat to Supabase if wallet is configured
+        let wallet = &self.config.wallet.public_address;
+        if !wallet.is_empty() {
+            let idle_str = format!("{}", state.idle_state);
+            let update = compute_network::supabase::HeartbeatUpdate {
+                status: "online".into(),
+                cpu_usage_percent: Some(state.live_metrics.cpu_usage as f64),
+                gpu_usage_percent: state.live_metrics.gpu_usage.map(|v| v as f64),
+                gpu_temp_celsius: state.live_metrics.gpu_temp.map(|v| v as f64),
+                memory_used_mb: Some((state.live_metrics.memory_used_gb * 1024.0) as i64),
+                idle_state: Some(idle_str),
+                uptime_seconds: Some(state.uptime_secs as i64),
+                pipeline_id: None,
+                pipeline_stage: None,
+                requests_served: None,
+                tokens_per_second: None,
+                last_heartbeat: chrono::Utc::now().to_rfc3339(),
+            };
+
+            let client = compute_network::supabase::SupabaseClient::new();
+            if let Err(e) = client.heartbeat(wallet, &update).await {
+                tracing::warn!("Supabase heartbeat failed: {e}");
+            }
+        }
     }
 
     fn update_state<F>(&self, f: F)

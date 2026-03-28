@@ -56,7 +56,7 @@ fn cmd_start() -> Result<()> {
     daemon::write_pid()?;
 
     let config = Config::load()?;
-    let runtime = compute_daemon::runtime::DaemonRuntime::new(config);
+    let runtime = compute_daemon::runtime::DaemonRuntime::new(config.clone());
 
     println!("\n  Daemon started (PID: {})", std::process::id());
     println!("  Run `compute dashboard` to view live stats");
@@ -65,6 +65,11 @@ fn cmd_start() -> Result<()> {
     // Run the daemon event loop
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
+        // Register with Supabase on startup
+        if !config.wallet.public_address.is_empty() {
+            register_node_supabase(&config).await;
+        }
+
         if let Err(e) = runtime.run().await {
             eprintln!("Daemon error: {e}");
         }
@@ -72,6 +77,52 @@ fn cmd_start() -> Result<()> {
 
     daemon::remove_pid()?;
     Ok(())
+}
+
+async fn register_node_supabase(config: &Config) {
+    use compute_network::supabase::{NodeRow, SupabaseClient};
+
+    let hw = hardware::detect();
+    let gpu = hw.gpus.first();
+
+    let tflops = gpu.map(|g| {
+        compute_daemon::benchmark::estimate_tflops(&g.name, g.vram_mb)
+    });
+
+    let node = NodeRow {
+        id: None,
+        wallet_address: config.wallet.public_address.clone(),
+        node_name: Some(config.node.name.clone()),
+        status: Some("online".into()),
+        gpu_model: gpu.map(|g| g.name.clone()),
+        gpu_vram_mb: gpu.map(|g| g.vram_mb as i64),
+        gpu_backend: gpu.map(|g| match g.backend {
+            hardware::GpuBackend::Cuda => "cuda".to_string(),
+            hardware::GpuBackend::Metal => "metal".to_string(),
+            hardware::GpuBackend::Cpu => "cpu".to_string(),
+        }),
+        cpu_model: Some(hw.cpu.brand.clone()),
+        cpu_cores: Some(hw.cpu.cores as i32),
+        memory_mb: Some((hw.memory.total_gb * 1024.0) as i64),
+        os: Some(format!("{} {}", hw.os.name, hw.os.version)),
+        app_version: Some(VERSION.to_string()),
+        region: Some(config.network.region.clone()),
+        tflops_fp16: tflops,
+    };
+
+    let client = SupabaseClient::new();
+    match client.register_node(&node).await {
+        Ok(id) => {
+            println!("  Registered with network (node: {id})");
+            // Persist node_id to config
+            let mut updated_config = config.clone();
+            updated_config.wallet.node_id = id;
+            if let Err(e) = updated_config.save() {
+                eprintln!("  Warning: Could not save node_id to config: {e}");
+            }
+        }
+        Err(e) => eprintln!("  Warning: Could not register with network: {e}"),
+    }
 }
 
 fn cmd_stop() -> Result<()> {
@@ -83,6 +134,8 @@ fn cmd_stop() -> Result<()> {
 }
 
 fn cmd_status() -> Result<()> {
+    let config = Config::load()?;
+
     if daemon::is_running() {
         let pid = daemon::read_pid().unwrap_or(0);
         let uptime =
@@ -92,6 +145,17 @@ fn cmd_status() -> Result<()> {
     } else {
         println!("○ STOPPED  Run `compute start` to begin");
     }
+
+    // Show wallet/node info
+    if !config.wallet.public_address.is_empty() {
+        println!("  Wallet:  {}", config.wallet.public_address);
+        if !config.wallet.node_id.is_empty() {
+            println!("  Node ID: {}", config.wallet.node_id);
+        }
+    } else {
+        println!("  Wallet:  not configured (run `compute init`)");
+    }
+
     Ok(())
 }
 
@@ -235,6 +299,15 @@ fn cmd_init() -> Result<()> {
     let config_path = config::config_file_path()?;
     println!();
     println!("  ✓ Config saved to {}", config_path.display());
+
+    // Register with Supabase if wallet was set
+    if !config.wallet.public_address.is_empty() {
+        print!("  Registering with network... ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(register_node_supabase(&config));
+    }
+
     println!();
     println!("  Get started:");
     println!("    compute start       Start contributing compute");
@@ -283,6 +356,10 @@ fn cmd_wallet(action: Option<WalletAction>) -> Result<()> {
             config.wallet.public_address = address.clone();
             config.save()?;
             println!("Wallet address set to: {address}");
+
+            // Register/update with Supabase
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(register_node_supabase(&config));
         }
         None => {
             if config.wallet.public_address.is_empty() {

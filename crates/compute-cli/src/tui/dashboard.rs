@@ -33,6 +33,7 @@ pub struct Dashboard {
     sys: sysinfo::System,
     live_metrics: LiveMetrics,
     last_metrics_update: Instant,
+    last_network_update: Instant,
     uptime_start: Instant,
     active_tab: Tab,
     log_lines: Vec<String>,
@@ -46,16 +47,20 @@ impl Dashboard {
         // Try to load recent log lines
         let log_lines = load_recent_logs(50);
 
+        // Fetch real network stats from Supabase
+        let network = fetch_network_stats();
+
         Self {
             globe,
             hardware,
             earnings: Earnings::mock(),
             pipeline: PipelineStatus::mock(),
-            network: NetworkStats::mock(),
+            network,
             throughput_history: generate_mock_throughput(),
             sys: sysinfo::System::new_all(),
             live_metrics: LiveMetrics::default(),
             last_metrics_update: Instant::now(),
+            last_network_update: Instant::now(),
             uptime_start: Instant::now(),
             active_tab: Tab::Overview,
             log_lines,
@@ -112,6 +117,12 @@ impl Dashboard {
         if self.last_metrics_update.elapsed() > Duration::from_secs(2) {
             self.live_metrics = hardware::collect_live_metrics(&mut self.sys);
             self.last_metrics_update = Instant::now();
+        }
+
+        // Refresh network stats from Supabase every 60 seconds
+        if self.last_network_update.elapsed() > Duration::from_secs(60) {
+            self.network = fetch_network_stats();
+            self.last_network_update = Instant::now();
         }
 
         // Simulate throughput changes
@@ -716,4 +727,22 @@ fn rand_simple() -> f64 {
     let nanos =
         SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().subsec_nanos();
     (nanos % 1000) as f64 / 1000.0
+}
+
+/// Fetch network stats from Supabase. Falls back to mock data on failure.
+fn fetch_network_stats() -> NetworkStats {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    match rt {
+        Ok(rt) => rt.block_on(async {
+            let client = compute_network::supabase::SupabaseClient::new();
+            match client.get_network_stats().await {
+                Ok(stats) => NetworkStats {
+                    total_nodes: stats.total_nodes as u32,
+                    peak_petaflops: stats.total_nodes as f64 * 0.066, // ~66 TFLOPS avg per node
+                },
+                Err(_) => NetworkStats::mock(),
+            }
+        }),
+        Err(_) => NetworkStats::mock(),
+    }
 }

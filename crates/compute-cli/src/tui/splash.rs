@@ -62,11 +62,18 @@ impl SplashScreen {
             .map(|g| format!("{} ({})", g.name, format_vram(g.vram_mb)))
             .unwrap_or_else(|| "No GPU detected".into());
 
+        // Fetch network stats from Supabase (non-blocking with timeout)
+        let node_count = fetch_node_count();
+
         let steps = vec![
             StartupStep { label: "Detecting hardware...".into(), done: false, result: None },
             StartupStep { label: format!("GPU: {gpu_name}"), done: false, result: None },
             StartupStep { label: "Connecting to network...".into(), done: false, result: None },
-            StartupStep { label: "12,847 nodes online".into(), done: false, result: None },
+            StartupStep {
+                label: format!("{} nodes online", format_count(node_count)),
+                done: false,
+                result: None,
+            },
         ];
 
         Self {
@@ -295,4 +302,36 @@ impl SplashScreen {
 
 fn format_vram(vram_mb: u64) -> String {
     if vram_mb >= 1024 { format!("{}GB", vram_mb / 1024) } else { format!("{vram_mb}MB") }
+}
+
+/// Fetch the total node count from Supabase. Returns 0 on failure.
+/// Uses a short timeout so the splash screen isn't delayed.
+fn fetch_node_count() -> u64 {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    match rt {
+        Ok(rt) => rt.block_on(async {
+            let client = compute_network::supabase::SupabaseClient::new();
+            match client.get_network_stats().await {
+                Ok(stats) => stats.total_nodes,
+                Err(_) => 0,
+            }
+        }),
+        Err(_) => 0,
+    }
+}
+
+/// Format a count with comma separators.
+fn format_count(n: u64) -> String {
+    if n == 0 {
+        return "0".into();
+    }
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
 }

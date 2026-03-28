@@ -24,6 +24,8 @@ pub struct NodeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletConfig {
     pub public_address: String,
+    #[serde(default)]
+    pub node_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +59,7 @@ impl Default for Config {
                 pause_on_battery: true,
                 pause_on_fullscreen: true,
             },
-            wallet: WalletConfig { public_address: String::new() },
+            wallet: WalletConfig { public_address: String::new(), node_id: String::new() },
             network: NetworkConfig {
                 orchestrator_url: "https://api.compute.sh".into(),
                 region: "auto".into(),
@@ -111,6 +113,7 @@ impl Config {
             "node.pause_on_battery" => Some(self.node.pause_on_battery.to_string()),
             "node.pause_on_fullscreen" => Some(self.node.pause_on_fullscreen.to_string()),
             "wallet.public_address" => Some(self.wallet.public_address.clone()),
+            "wallet.node_id" => Some(self.wallet.node_id.clone()),
             "network.orchestrator_url" => Some(self.network.orchestrator_url.clone()),
             "network.region" => Some(self.network.region.clone()),
             "logging.level" => Some(self.logging.level.clone()),
@@ -127,6 +130,7 @@ impl Config {
             "node.pause_on_battery" => self.node.pause_on_battery = value.parse()?,
             "node.pause_on_fullscreen" => self.node.pause_on_fullscreen = value.parse()?,
             "wallet.public_address" => self.wallet.public_address = value.to_string(),
+            "wallet.node_id" => self.wallet.node_id = value.to_string(),
             "network.orchestrator_url" => self.network.orchestrator_url = value.to_string(),
             "network.region" => self.network.region = value.to_string(),
             "logging.level" => self.logging.level = value.to_string(),

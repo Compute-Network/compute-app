@@ -30,6 +30,12 @@ futures-util = "0.3"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
+# Time
+chrono = "0.4"
+
+# Internal crates
+compute-network = { workspace = true }
+
 # Directories
 dirs = { workspace = true }
 
