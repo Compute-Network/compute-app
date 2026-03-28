@@ -94,6 +94,9 @@ fn register_node_async(config: &Config, hw: &hardware::HardwareInfo) {
         hardware::GpuBackend::Metal => "metal".to_string(),
         hardware::GpuBackend::Cpu => "cpu".to_string(),
     });
+    let tflops = gpu.map(|g| {
+        compute_daemon::benchmark::estimate_tflops(&g.name, g.vram_mb)
+    });
     let cpu_model = Some(hw.cpu.brand.clone());
     let cpu_cores = Some(hw.cpu.cores as i32);
     let memory_mb = Some((hw.memory.total_gb * 1024.0) as i64);
@@ -121,7 +124,7 @@ fn register_node_async(config: &Config, hw: &hardware::HardwareInfo) {
                     os: os_str,
                     app_version: Some(version),
                     region: Some(region),
-                    tflops_fp16: None,
+                    tflops_fp16: tflops,
                 };
 
                 match client.register_node(&node).await {
