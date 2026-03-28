@@ -49,6 +49,25 @@ fn cmd_start() -> Result<()> {
         return Ok(());
     }
 
+    // Check if wallet is configured — prompt if not
+    let mut config_check = Config::load()?;
+    if config_check.wallet.public_address.is_empty() {
+        let mut terminal = ratatui::init();
+        let mut onboarding = tui::onboarding::OnboardingScreen::new();
+        let result = onboarding.run(&mut terminal);
+        ratatui::restore();
+
+        match result? {
+            tui::onboarding::OnboardingResult::WalletSet(address) => {
+                config_check.wallet.public_address = address;
+                config::ensure_dirs()?;
+                config_check.save()?;
+            }
+            tui::onboarding::OnboardingResult::Skipped => {}
+            tui::onboarding::OnboardingResult::Quit => return Ok(()),
+        }
+    }
+
     // Show splash screen
     tui::app::run_splash_only()?;
 
