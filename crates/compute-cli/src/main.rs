@@ -778,42 +778,122 @@ fn cmd_doctor() -> Result<()> {
     println!("\n  COMPUTE DOCTOR\n");
 
     let hw = hardware::detect();
+    let config = Config::load()?;
 
-    // Check GPU
+    // === Hardware ===
+    println!("  HARDWARE");
+    println!("  ────────────────────────────────");
+
     let has_gpu = hw.gpus.iter().any(|g| !matches!(g.backend, hardware::GpuBackend::Cpu));
     print_check("GPU detected", has_gpu);
+    if has_gpu {
+        for gpu in &hw.gpus {
+            let vram = if gpu.vram_mb >= 1024 {
+                format!("{}GB", gpu.vram_mb / 1024)
+            } else {
+                format!("{}MB", gpu.vram_mb)
+            };
+            println!("    {} ({}, {})", gpu.name, vram, gpu.backend);
+        }
+    }
 
-    // Check Docker
+    let enough_ram = hw.memory.total_gb >= 8.0;
+    print_check(&format!("RAM >= 8GB ({:.1}GB detected)", hw.memory.total_gb), enough_ram);
+
+    let enough_disk = hw.disk.available_gb > 10.0;
+    print_check(
+        &format!("Disk space > 10GB ({:.0}GB available)", hw.disk.available_gb),
+        enough_disk,
+    );
+
     print_check("Docker available", hw.docker.available);
+    println!();
 
-    // Check config
+    // === Configuration ===
+    println!("  CONFIGURATION");
+    println!("  ────────────────────────────────");
+
     let config_ok = config::config_exists();
     print_check("Config file exists", config_ok);
 
-    // Check daemon
+    let wallet_ok = !config.wallet.public_address.is_empty();
+    print_check("Wallet address configured", wallet_ok);
+    if wallet_ok {
+        let addr = &config.wallet.public_address;
+        let short = if addr.len() > 12 {
+            format!("{}...{}", &addr[..6], &addr[addr.len() - 4..])
+        } else {
+            addr.clone()
+        };
+        println!("    {short}");
+    }
+
+    let node_id_ok = !config.wallet.node_id.is_empty();
+    print_check("Node registered with network", node_id_ok);
+    println!();
+
+    // === Runtime ===
+    println!("  RUNTIME");
+    println!("  ────────────────────────────────");
+
     let daemon_ok = daemon::is_running();
     print_check("Daemon running", daemon_ok);
 
-    // Check disk space
-    let enough_disk = hw.disk.available_gb > 10.0;
-    print_check("Disk space > 10GB", enough_disk);
-
-    // Check RAM
-    let enough_ram = hw.memory.total_gb >= 8.0;
-    print_check("RAM >= 8GB", enough_ram);
-
+    let service_ok = compute_daemon::service::is_service_installed();
+    print_check("Auto-start service installed", service_ok);
     println!();
 
+    // === Network ===
+    println!("  NETWORK");
+    println!("  ────────────────────────────────");
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let (supabase_ok, node_count) = rt.block_on(async {
+        let client = SupabaseClient::new();
+        let healthy = client.health_check().await;
+        let stats = if healthy {
+            client.get_network_stats().await.ok()
+        } else {
+            None
+        };
+        (healthy, stats.map(|s| s.total_nodes).unwrap_or(0))
+    });
+
+    print_check("Supabase API reachable", supabase_ok);
+    if supabase_ok {
+        println!("    {node_count} nodes in network");
+    }
+    println!();
+
+    // === Tips ===
+    let mut tips = Vec::new();
     if !config_ok {
-        println!("  Tip: Run `compute init` to create your config file");
+        tips.push("Run `compute init` to create your config file");
+    }
+    if !wallet_ok {
+        tips.push("Run `compute init` or `compute wallet set <address>` to set your wallet");
+    }
+    if !node_id_ok && wallet_ok {
+        tips.push("Run `compute start` to register with the network");
     }
     if !daemon_ok {
-        println!("  Tip: Run `compute start` to start the daemon");
+        tips.push("Run `compute start` to start the daemon");
+    }
+    if !service_ok && daemon_ok {
+        tips.push("Run `compute service install` for auto-start on login");
     }
     if !hw.docker.available {
-        println!("  Tip: Install Docker from https://docker.com/get-started");
+        tips.push("Install Docker from https://docker.com/get-started");
     }
-    println!();
+
+    if !tips.is_empty() {
+        println!("  RECOMMENDATIONS");
+        println!("  ────────────────────────────────");
+        for tip in tips {
+            println!("  → {tip}");
+        }
+        println!();
+    }
 
     Ok(())
 }
