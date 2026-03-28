@@ -6,6 +6,7 @@ import { serve } from "@hono/node-server";
 import { nodesRouter } from "./routes/nodes.js";
 import { pipelinesRouter } from "./routes/pipelines.js";
 import { completionsRouter } from "./routes/completions.js";
+import { rewardsRouter } from "./routes/rewards.js";
 import { apiKeyAuth } from "./middleware/auth.js";
 import { markStaleNodesOffline } from "./services/nodes.js";
 
@@ -25,6 +26,9 @@ app.route("/v1/nodes", nodesRouter);
 
 // Pipeline management (internal, no auth for now)
 app.route("/v1/pipelines", pipelinesRouter);
+
+// Rewards
+app.route("/v1/rewards", rewardsRouter);
 
 // OpenAI-compatible API (requires API key)
 app.use("/v1/chat/*", apiKeyAuth);
@@ -67,6 +71,8 @@ console.log(`
   │   POST /v1/nodes/:wallet/heartbeat       │
   │   GET  /v1/nodes/stats                   │
   │   POST /v1/pipelines/form                │
+  │   GET  /v1/rewards/:wallet                │
+  │   POST /v1/rewards/:wallet/claim         │
   │   POST /v1/chat/completions  (API key)   │
   │   GET  /v1/models            (API key)   │
   │   GET  /health                           │
