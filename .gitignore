@@ -27,5 +27,12 @@ logs/
 # Compute daemon runtime
 .compute/
 
+# Solana / Anchor
+solana-program/target/
+solana-program/deploy-keypair.json
+solana-program/node_modules/
+solana-program/.anchor/
+solana-program/test-ledger/
+
 # Claude Code
 .claude/
