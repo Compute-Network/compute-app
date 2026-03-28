@@ -101,6 +101,9 @@ impl Dashboard {
                         self.log_lines = load_recent_logs(100);
                     }
                     KeyCode::Char('3') => self.active_tab = Tab::Config,
+                    KeyCode::Char('c') => {
+                        open_claim_page();
+                    }
                     KeyCode::Tab => {
                         self.active_tab = match self.active_tab {
                             Tab::Overview => Tab::Logs,
@@ -564,6 +567,10 @@ impl Dashboard {
             Span::styled("ause ", dim),
         ];
 
+        if w >= 45 {
+            spans.extend([Span::styled("[c]", dim), Span::styled("laim ", dim)]);
+        }
+
         if w >= 50 {
             spans.extend([Span::styled("[Tab]", dim), Span::styled(" switch ", dim)]);
         }
@@ -740,6 +747,31 @@ fn rand_simple() -> f64 {
     let nanos =
         SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().subsec_nanos();
     (nanos % 1000) as f64 / 1000.0
+}
+
+/// Open the claim page in the user's default browser.
+fn open_claim_page() {
+    let config = compute_daemon::config::Config::load().unwrap_or_default();
+    let wallet = &config.wallet.public_address;
+
+    let url = if wallet.is_empty() {
+        "https://computenetwork.sh/dashboard/claim".to_string()
+    } else {
+        format!("https://computenetwork.sh/dashboard/claim?wallet={wallet}")
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn();
+    }
 }
 
 /// Fetch network stats and online nodes from Supabase.

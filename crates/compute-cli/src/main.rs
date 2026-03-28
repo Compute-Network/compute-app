@@ -407,6 +407,7 @@ fn cmd_earnings() -> Result<()> {
     println!("  All Time    {:.0} $COMPUTE", e.all_time);
     println!("  Pending     {:.1} $COMPUTE", e.pending);
     println!();
+    println!("  Claim at: https://computenetwork.sh/dashboard/claim");
     println!("  (Mock data — connect to network for real earnings)");
     println!();
     Ok(())
