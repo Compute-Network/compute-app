@@ -8,36 +8,39 @@ pub struct OrchestratorClient {
     base_url: String,
     client: reqwest::Client,
     node_id: Option<String>,
+    wallet_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeRegistration {
-    pub node_name: String,
     pub wallet_address: String,
-    pub gpu_name: String,
-    pub gpu_vram_mb: u64,
-    pub gpu_backend: String,
-    pub tflops_fp16: f64,
-    pub cpu_cores: usize,
-    pub cpu_brand: String,
-    pub memory_gb: f64,
-    pub os: String,
-    pub arch: String,
-    pub version: String,
-    pub listen_port: u16,
+    pub node_name: Option<String>,
+    pub gpu_model: Option<String>,
+    pub gpu_vram_mb: Option<u64>,
+    pub gpu_backend: Option<String>,
+    pub tflops_fp16: Option<f64>,
+    pub cpu_model: Option<String>,
+    pub cpu_cores: Option<usize>,
+    pub memory_mb: Option<u64>,
+    pub os: Option<String>,
+    pub app_version: Option<String>,
+    pub region: Option<String>,
+    pub listen_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HeartbeatPayload {
-    pub node_id: String,
-    pub cpu_usage: f32,
-    pub memory_used_gb: f64,
-    pub gpu_temp: Option<u32>,
-    pub gpu_usage: Option<f32>,
-    pub idle_state: String,
-    pub uptime_secs: u64,
-    pub pipeline_stage: Option<u32>,
-    pub requests_served: u64,
+    pub status: String,
+    pub cpu_usage_percent: Option<f64>,
+    pub gpu_usage_percent: Option<f64>,
+    pub gpu_temp_celsius: Option<f64>,
+    pub memory_used_mb: Option<i64>,
+    pub idle_state: Option<String>,
+    pub uptime_seconds: Option<i64>,
+    pub pipeline_id: Option<String>,
+    pub pipeline_stage: Option<i32>,
+    pub requests_served: Option<i64>,
+    pub tokens_per_second: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,26 +50,22 @@ pub struct RegistrationResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct HeartbeatResponse {
-    pub status: String,
-    pub assigned_pipeline: Option<PipelineAssignment>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct PipelineAssignment {
     pub pipeline_id: String,
     pub model_id: String,
     pub start_layer: u32,
     pub end_layer: u32,
     pub total_layers: u32,
-    pub peers: Vec<PeerInfo>,
+    pub upstream_addr: Option<String>,
+    pub downstream_addr: Option<String>,
+    pub stage_index: u32,
+    pub total_stages: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PeerInfo {
-    pub node_id: String,
-    pub address: String,
-    pub stage: u32,
+pub struct RewardInfo {
+    pub total: f64,
+    pub count: u64,
 }
 
 impl OrchestratorClient {
@@ -77,7 +76,12 @@ impl OrchestratorClient {
             .build()
             .unwrap_or_default();
 
-        Self { base_url: base_url.to_string(), client, node_id: None }
+        Self {
+            base_url: base_url.to_string(),
+            client,
+            node_id: None,
+            wallet_address: None,
+        }
     }
 
     /// Get the registered node ID.
@@ -104,16 +108,22 @@ impl OrchestratorClient {
 
         let body: RegistrationResponse = resp.json().await?;
         self.node_id = Some(body.node_id.clone());
+        self.wallet_address = Some(registration.wallet_address.clone());
         Ok(body.node_id)
     }
 
     /// Send a heartbeat to the orchestrator.
-    pub async fn heartbeat(&self, payload: &HeartbeatPayload) -> Result<HeartbeatResponse> {
-        let node_id = self.node_id.as_deref().unwrap_or(&payload.node_id);
-
+    pub async fn heartbeat(
+        &self,
+        wallet_address: &str,
+        payload: &HeartbeatPayload,
+    ) -> Result<()> {
         let resp = self
             .client
-            .post(format!("{}/v1/nodes/{}/heartbeat", self.base_url, node_id))
+            .post(format!(
+                "{}/v1/nodes/{}/heartbeat",
+                self.base_url, wallet_address
+            ))
             .json(payload)
             .send()
             .await?;
@@ -123,8 +133,7 @@ impl OrchestratorClient {
             anyhow::bail!("Heartbeat failed: {status}");
         }
 
-        let body: HeartbeatResponse = resp.json().await?;
-        Ok(body)
+        Ok(())
     }
 
     /// Check if the orchestrator is reachable.
@@ -146,12 +155,13 @@ impl OrchestratorClient {
     }
 
     /// Fetch the latest pipeline assignment for this node.
-    pub async fn get_assignment(&self) -> Result<Option<PipelineAssignment>> {
-        let node_id = self.node_id.as_deref().ok_or_else(|| anyhow::anyhow!("Not registered"))?;
-
+    pub async fn get_assignment(&self, node_id: &str) -> Result<Option<PipelineAssignment>> {
         let resp = self
             .client
-            .get(format!("{}/v1/nodes/{}/assignment", self.base_url, node_id))
+            .get(format!(
+                "{}/v1/pipelines/assignment/{}",
+                self.base_url, node_id
+            ))
             .send()
             .await?;
 
@@ -163,5 +173,24 @@ impl OrchestratorClient {
         } else {
             anyhow::bail!("Failed to get assignment: {}", resp.status());
         }
+    }
+
+    /// Get pending rewards for a wallet.
+    pub async fn get_rewards(&self, wallet_address: &str) -> Result<RewardInfo> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/v1/rewards/{}",
+                self.base_url, wallet_address
+            ))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to get rewards: {}", resp.status());
+        }
+
+        let body: RewardInfo = resp.json().await?;
+        Ok(body)
     }
 }
