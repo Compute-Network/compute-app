@@ -9,6 +9,7 @@ import { completionsRouter } from "./routes/completions.js";
 import { rewardsRouter } from "./routes/rewards.js";
 import { apiKeyAuth } from "./middleware/auth.js";
 import { markStaleNodesOffline } from "./services/nodes.js";
+import { initScheduler } from "./services/scheduler.js";
 
 const app = new Hono();
 
@@ -45,6 +46,9 @@ app.onError((err, c) => {
   console.error("Unhandled error:", err);
   return c.json({ error: "Internal server error" }, 500);
 });
+
+// Initialize scheduler (load active pipelines from DB)
+initScheduler().catch(console.error);
 
 // Periodic tasks
 const STALE_CHECK_INTERVAL = 60_000; // 1 minute

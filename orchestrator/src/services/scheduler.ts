@@ -1,6 +1,7 @@
 import type { Node } from "../types/node.js";
 import type { Pipeline, PipelineStage, PipelineAssignment } from "../types/pipeline.js";
 import { getAvailableNodes, assignPipeline, releasePipeline } from "./nodes.js";
+import { savePipeline, updatePipelineStatus, loadActivePipelines } from "./pipelines.js";
 
 // Model definitions — mirrors crates/compute-network/src/models.rs
 interface ModelDef {
@@ -174,6 +175,14 @@ export async function formPipeline(
   }
 
   pipeline.status = "active";
+
+  // Persist to Supabase
+  try {
+    await savePipeline(pipeline);
+  } catch (e) {
+    console.error("Failed to persist pipeline:", e);
+  }
+
   activePipelines.set(pipelineId, pipeline);
 
   return pipeline;
@@ -218,10 +227,29 @@ export function getAssignment(
  */
 export async function terminatePipeline(pipelineId: string): Promise<void> {
   await releasePipeline(pipelineId);
+  await updatePipelineStatus(pipelineId, "terminated").catch(console.error);
   const pipeline = activePipelines.get(pipelineId);
   if (pipeline) {
     pipeline.status = "terminated";
     activePipelines.delete(pipelineId);
+  }
+}
+
+/**
+ * Initialize the scheduler — load active pipelines from Supabase.
+ * Call this on server startup.
+ */
+export async function initScheduler(): Promise<void> {
+  try {
+    const pipelines = await loadActivePipelines();
+    for (const p of pipelines) {
+      activePipelines.set(p.id, p);
+    }
+    if (pipelines.length > 0) {
+      console.log(`Loaded ${pipelines.length} active pipelines from database`);
+    }
+  } catch (e) {
+    console.error("Failed to load pipelines on startup:", e);
   }
 }
 
