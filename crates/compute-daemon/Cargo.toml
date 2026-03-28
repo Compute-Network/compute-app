@@ -39,6 +39,9 @@ compute-network = { workspace = true }
 # Directories
 dirs = { workspace = true }
 
+# Utilities
+shellexpand = "3"
+
 # Unix process management
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
