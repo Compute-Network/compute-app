@@ -1,0 +1,11 @@
+STYLE: Outline
+FEEL: Light, airy, premium — like an architectural wireframe
+WIDTH: 57 chars
+LINES: 5
+NOTES: Uses only outlines with no filled blocks. Matches the
+       "borders as structure" principle. Generous whitespace.
+       Would pair well with the dark terminal background.
+
+╔═╗╔═╗╔╦╗╔═╗╦ ╦╔╦╗╔═╗
+║  ║ ║║║║╠═╝║ ║ ║ ╠╣
+╚═╝╚═╝╩ ╩╩  ╚═╝ ╩ ╚═╝

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -11,14 +11,17 @@ use ratatui::{
 
 use super::globe::Globe;
 
-const COMPUTE_LOGO: &[&str] = &[
-    "██████╗ ██████╗ ███╗   ███╗██████╗ ██╗   ██╗████████╗███████╗",
-    "██╔════╝██╔═══██╗████╗ ████║██╔══██╗██║   ██║╚══██╔══╝██╔════╝",
-    "██║     ██║   ██║██╔████╔██║██████╔╝██║   ██║   ██║   █████╗  ",
-    "██║     ██║   ██║██║╚██╔╝██║██╔═══╝ ██║   ██║   ██║   ██╔══╝  ",
-    "╚██████╗╚██████╔╝██║ ╚═╝ ██║██║     ╚██████╔╝   ██║   ███████╗",
-    " ╚═════╝ ╚═════╝ ╚═╝     ╚═╝╚═╝      ╚═════╝    ╚═╝   ╚══════╝",
+// Main logo — compact block
+const LOGO_MAIN: &[&str] = &[
+    " ██████  ██████  ███    ███ ██████  ██    ██ ████████ ███████",
+    "██      ██    ██ ████  ████ ██   ██ ██    ██    ██    ██",
+    "██      ██    ██ ██ ████ ██ ██████  ██    ██    ██    █████",
+    "██      ██    ██ ██  ██  ██ ██      ██    ██    ██    ██",
+    " ██████  ██████  ██      ██ ██       ██████     ██    ███████",
 ];
+
+// Small logo (< 55 chars) — spaced text
+const LOGO_SMALL: &[&str] = &["C O M P U T E"];
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -44,7 +47,6 @@ pub struct SplashScreen {
 #[derive(PartialEq)]
 enum SplashPhase {
     GlobeFadeIn,
-    LogoTyping,
     StepsRunning,
     Complete,
 }
@@ -92,6 +94,9 @@ impl SplashScreen {
             {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(false);
+                    }
                     KeyCode::Enter if self.phase == SplashPhase::Complete => {
                         return Ok(true);
                     }
@@ -120,17 +125,17 @@ impl SplashScreen {
 
         let elapsed = self.start_time.elapsed();
 
+        // Logo typewriter — runs fast, concurrently with steps
+        let total_chars: usize = LOGO_MAIN.iter().map(|l| l.len()).sum();
+        if self.logo_visible_chars < total_chars {
+            // ~20 chars per tick at 20fps = full logo in ~0.5s
+            self.logo_visible_chars = (self.logo_visible_chars + 20).min(total_chars);
+        }
+
+        // Steps run concurrently with the logo animation
         match self.phase {
             SplashPhase::GlobeFadeIn => {
-                if elapsed > Duration::from_millis(500) {
-                    self.phase = SplashPhase::LogoTyping;
-                }
-            }
-            SplashPhase::LogoTyping => {
-                // Type out the logo ~3 chars per tick
-                let total_chars: usize = COMPUTE_LOGO.iter().map(|l| l.len()).sum();
-                self.logo_visible_chars = (self.logo_visible_chars + 4).min(total_chars);
-                if self.logo_visible_chars >= total_chars {
+                if elapsed > Duration::from_millis(200) {
                     self.phase = SplashPhase::StepsRunning;
                     self.step_timer = Instant::now();
                 }
@@ -138,10 +143,10 @@ impl SplashScreen {
             SplashPhase::StepsRunning => {
                 if self.current_step < self.steps.len() {
                     let step_delay = match self.current_step {
-                        0 => Duration::from_millis(300),
-                        1 => Duration::from_millis(200),
-                        2 => Duration::from_millis(500),
-                        _ => Duration::from_millis(300),
+                        0 => Duration::from_millis(200),
+                        1 => Duration::from_millis(150),
+                        2 => Duration::from_millis(400),
+                        _ => Duration::from_millis(200),
                     };
                     if self.step_timer.elapsed() > step_delay {
                         self.steps[self.current_step].done = true;
@@ -161,47 +166,75 @@ impl SplashScreen {
             step.done = true;
         }
         self.current_step = self.steps.len();
-        let total_chars: usize = COMPUTE_LOGO.iter().map(|l| l.len()).sum();
+        let total_chars: usize = LOGO_MAIN.iter().map(|l| l.len()).sum();
         self.logo_visible_chars = total_chars;
         self.phase = SplashPhase::Complete;
     }
 
     fn draw(&self, frame: &mut Frame) {
-        let area = frame.area();
+        let full_area = frame.area();
 
-        // Main horizontal split: 33% globe, 67% content
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
-            .split(area);
+        // Cap dimensions, align top-left
+        let max_w: u16 = 160;
+        let max_h: u16 = 45;
+        let area = Rect {
+            x: full_area.x,
+            y: full_area.y,
+            width: full_area.width.min(max_w),
+            height: full_area.height.min(max_h),
+        };
 
-        // Left: Globe
-        self.globe.render(chunks[0], frame.buffer_mut());
+        // Responsive breakpoints
+        if area.width >= 80 {
+            // Desktop: side-by-side
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
+                .split(area);
 
-        // Right: Splash content
-        self.draw_splash_content(frame, chunks[1]);
+            self.globe.render(chunks[0], frame.buffer_mut());
+            self.draw_splash_content(frame, chunks[1]);
+        } else if area.width >= 50 {
+            // Vertical: globe on top, content below
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(12), Constraint::Min(8)])
+                .split(area);
+
+            self.globe.render(chunks[0], frame.buffer_mut());
+            self.draw_splash_content(frame, chunks[1]);
+        } else {
+            // Narrow: content only
+            self.draw_splash_content(frame, area);
+        }
     }
 
     fn draw_splash_content(&self, frame: &mut Frame, area: Rect) {
+        let w = area.width as usize;
+
+        // Pick logo variant based on available width
+        let logo_data: &[&str] = if w >= 50 { LOGO_MAIN } else { LOGO_SMALL };
+        let logo_height = logo_data.len() as u16 + 1; // +1 breathing room
+
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2), // top padding
-                Constraint::Length(8), // logo
-                Constraint::Length(2), // tagline + version
-                Constraint::Length(1), // spacer
-                Constraint::Min(6),    // steps
-                Constraint::Length(2), // bottom message
+                Constraint::Length(3),           // top padding
+                Constraint::Length(logo_height), // logo
+                Constraint::Length(2),           // tagline + version
+                Constraint::Length(1),           // spacer
+                Constraint::Min(6),              // steps
+                Constraint::Length(2),           // bottom message
             ])
             .split(area);
 
-        // Logo
-        let total_chars: usize = COMPUTE_LOGO.iter().map(|l| l.len()).sum();
+        // Logo with typewriter animation
+        let total_chars: usize = logo_data.iter().map(|l| l.len()).sum();
         let visible = self.logo_visible_chars.min(total_chars);
 
         let mut logo_lines = Vec::new();
         let mut chars_shown = 0;
-        for &line in COMPUTE_LOGO {
+        for &line in logo_data {
             if chars_shown >= visible {
                 logo_lines.push(Line::from(""));
             } else {

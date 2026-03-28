@@ -1,0 +1,20 @@
+STYLE: Stacked / Vertical
+FEEL: Bold statement, poster-like, memorable
+WIDTH: 11 chars
+LINES: 7
+NOTES: One letter per line. Works well in very narrow terminals
+       or as a sidebar branding element. Bold and distinctive.
+
+ ▄▀▀
+ █
+ ▀▀▄ OMPUTE
+
+Or fully vertical:
+
+C
+O
+M
+P
+U
+T
+E

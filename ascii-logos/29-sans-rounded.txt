@@ -1,0 +1,13 @@
+STYLE: Sans Rounded
+FEEL: DM Sans with rounded terminals — warm, approachable, geometric
+WIDTH: 57 chars
+LINES: 5
+NOTES: Uses rounded corners (╭╮╰╯) to mimic DM Sans's soft terminals.
+       This is the closest match to the actual brand typography.
+
+ ╭━━━╮╭━━━╮╭━╮╭━╮╭━━━╮╭╮  ╭╮╭━━━━╮╭━━━╮
+ ┃╭━╮┃┃╭━╮┃┃┃╰╯┃┃┃╭━╮┃┃┃  ┃┃┃╭╮╭╮┃┃╭━━╯
+ ┃┃ ╰╯┃┃ ┃┃┃╭╮╭╮┃┃╰━╯┃┃┃  ┃┃╰╯┃┃╰╯┃╰━━╮
+ ┃┃ ╭╮┃┃ ┃┃┃┃┃┃┃┃┃╭━━╯┃┃  ┃┃  ┃┃  ┃╭━━╯
+ ┃╰━╯┃┃╰━╯┃┃┃┃┃┃┃┃┃   ┃╰━━╯┃  ┃┃  ┃╰━━╮
+ ╰━━━╯╰━━━╯╰╯╰╯╰╯╰╯   ╰━━━━╯  ╰╯  ╰━━━╯

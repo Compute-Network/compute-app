@@ -1,0 +1,11 @@
+STYLE: Half-Block Pixel
+FEEL: Retro-modern, pixel art, distinctive
+WIDTH: 41 chars
+LINES: 3
+NOTES: Uses Unicode half-block characters (▄▀█) for a compact
+       but visually dense logo. 2x vertical resolution compared
+       to regular characters. Unique look that stands out.
+
+▄▀▀ ▄▀▄ █▄ ▄█ █▀▄ █ █ ▀█▀ █▀▀
+█   █ █ █ ▀ █ █▀  █ █  █  █▀▀
+▀▀▀ ▀▀  ▀   ▀ ▀   ▀▀   ▀  ▀▀▀

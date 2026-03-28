@@ -1,0 +1,10 @@
+STYLE: Wide Block
+FEEL: Cinematic, wide-screen, high-end
+WIDTH: 71 chars
+LINES: 5
+NOTES: Extra letter-spacing between block characters.
+       Reads like a film title card. Premium feel.
+
+█▀▀   █▀█   █▀▄▀█   █▀█   █ █   ▀█▀   █▀▀
+█     █ █   █ ▀ █   █▀▀   █ █    █    █▀▀
+▀▀▀   ▀▀▀   ▀   ▀   ▀     ▀▀▀    ▀    ▀▀▀

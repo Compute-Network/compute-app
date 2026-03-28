@@ -1,0 +1,11 @@
+STYLE: Dot Matrix / Braille
+FEEL: Technical, data-driven, matches the globe rendering style
+WIDTH: 43 chars
+LINES: 5
+NOTES: Uses braille Unicode characters for a dot-matrix effect.
+       Visually ties the logo to the braille globe — cohesive.
+       Very distinctive but may be hard to read at small sizes.
+
+⠀⣠⡀⠀⣠⡀⠀⣤⣤⠀⣠⡀⠀⡄⠀⡄⠀⣤⠀⣤⡄
+⠀⡇⠀⠀⡇⡇⠀⡇⠀⡇⡇⠀⠀⡇⠀⡇⠀⡇⠀⡇⠀
+⠀⠧⠀⠀⠧⠇⠀⠇⠀⠇⠇⠀⠀⠧⠤⠇⠀⠇⠀⠧⠤

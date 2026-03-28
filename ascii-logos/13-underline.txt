@@ -1,0 +1,16 @@
+STYLE: Underline Statement
+FEEL: Typographic, editorial, confident
+WIDTH: 39 chars
+LINES: 3
+NOTES: Plain text with a structural underline using box-drawing.
+       Extremely clean. Lets the word speak for itself.
+       Matches the "restraint and precision" principle perfectly.
+
+  COMPUTE
+  ───────────────────────────────────
+
+  Or with tagline:
+
+  COMPUTE
+  Decentralized GPU Infrastructure
+  ───────────────────────────────────

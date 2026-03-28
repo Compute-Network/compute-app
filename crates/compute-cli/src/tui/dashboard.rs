@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -75,6 +75,9 @@ impl Dashboard {
             {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    }
                     KeyCode::Char('p') => {
                         self.pipeline.active = !self.pipeline.active;
                     }
@@ -122,19 +125,45 @@ impl Dashboard {
     }
 
     fn draw(&self, frame: &mut Frame) {
-        let area = frame.area();
+        let full_area = frame.area();
 
-        // Main horizontal split: 33% globe, 67% content
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
-            .split(area);
+        // Cap dimensions, align top-left
+        let max_w: u16 = 160;
+        let max_h: u16 = 45;
+        let area = Rect {
+            x: full_area.x,
+            y: full_area.y,
+            width: full_area.width.min(max_w),
+            height: full_area.height.min(max_h),
+        };
 
-        // Left panel: Globe + network stats
-        self.draw_globe_panel(frame, chunks[0]);
+        // Responsive breakpoints:
+        // Wide (>= 80 cols): side-by-side globe + content
+        // Medium (50-79 cols): globe on top, content below
+        // Narrow (< 50 cols): no globe, content only
+        if area.width >= 80 {
+            // Desktop: horizontal split
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
+                .split(area);
 
-        // Right panel: All info sections
-        self.draw_right_panel(frame, chunks[1]);
+            self.draw_globe_panel(frame, chunks[0]);
+            self.draw_right_panel(frame, chunks[1]);
+        } else if area.width >= 50 {
+            // Tablet/vertical: globe on top, content below
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(15), Constraint::Min(10)])
+                .split(area);
+
+            // Globe centered in top section
+            self.globe.render(chunks[0], frame.buffer_mut());
+            self.draw_right_panel(frame, chunks[1]);
+        } else {
+            // Narrow/mobile: content only, no globe
+            self.draw_right_panel(frame, area);
+        }
     }
 
     fn draw_globe_panel(&self, frame: &mut Frame, area: Rect) {
@@ -193,11 +222,11 @@ impl Dashboard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Header
+                Constraint::Length(5), // Header
                 Constraint::Length(7), // Node info
                 Constraint::Length(7), // Earnings
                 Constraint::Length(8), // Workload
-                Constraint::Min(5),    // Throughput sparkline
+                Constraint::Min(4),    // Throughput sparkline
                 Constraint::Length(1), // Keyboard shortcuts
             ])
             .split(area);
@@ -211,6 +240,7 @@ impl Dashboard {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
+        let w = area.width as usize;
         let status_color = if self.pipeline.active { Color::Green } else { Color::Yellow };
         let status_text = if self.pipeline.active { "ACTIVE" } else { "PAUSED" };
 
@@ -222,28 +252,60 @@ impl Dashboard {
             }
         };
 
-        let header = Paragraph::new(vec![
-            Line::from(vec![
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(""));
+
+        // Title line — always fits
+        lines.push(Line::from(vec![Span::styled(
+            "  C O M P U T E",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )]));
+
+        // Subtitle + status: combine on one line if wide enough, split if narrow
+        if w >= 55 {
+            lines.push(Line::from(vec![
                 Span::styled(
-                    "  COMPUTE",
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    "  Decentralized GPU Infrastructure",
+                    Style::default().fg(Color::DarkGray),
                 ),
-                Span::raw("         "),
+                Span::raw("  "),
                 Span::styled("● ", Style::default().fg(status_color)),
                 Span::styled(status_text, Style::default().fg(status_color)),
-                Span::raw("     "),
+                Span::raw("  "),
                 Span::styled(format!("v{VERSION}"), Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("● ", Style::default().fg(status_color)),
+                Span::styled(status_text, Style::default().fg(status_color)),
+                Span::raw("  "),
+                Span::styled(format!("v{VERSION}"), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        // Tabs: use short labels on narrow screens
+        if w >= 45 {
+            lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("[1] OVERVIEW", tab_style(Tab::Overview)),
                 Span::raw("  "),
                 Span::styled("[2] LOGS", tab_style(Tab::Logs)),
                 Span::raw("  "),
                 Span::styled("[3] CONFIG", tab_style(Tab::Config)),
-            ]),
-        ])
-        .block(
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled("[1]OVR", tab_style(Tab::Overview)),
+                Span::raw(" "),
+                Span::styled("[2]LOG", tab_style(Tab::Logs)),
+                Span::raw(" "),
+                Span::styled("[3]CFG", tab_style(Tab::Config)),
+            ]));
+        }
+
+        let header = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::BOTTOM)
                 .border_style(Style::default().fg(Color::DarkGray)),
@@ -468,20 +530,29 @@ impl Dashboard {
     }
 
     fn draw_shortcuts(&self, frame: &mut Frame, area: Rect) {
-        let shortcuts = Paragraph::new(Line::from(vec![
-            Span::styled(" [q]", Style::default().fg(Color::DarkGray)),
-            Span::styled("uit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[p]", Style::default().fg(Color::DarkGray)),
-            Span::styled("ause  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[Tab]", Style::default().fg(Color::DarkGray)),
-            Span::styled(" switch  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[1]", Style::default().fg(Color::DarkGray)),
-            Span::styled("overview  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[2]", Style::default().fg(Color::DarkGray)),
-            Span::styled("logs  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("[3]", Style::default().fg(Color::DarkGray)),
-            Span::styled("config", Style::default().fg(Color::DarkGray)),
-        ]));
+        let w = area.width as usize;
+        let dim = Style::default().fg(Color::DarkGray);
+
+        let mut spans = vec![
+            Span::styled(" [q]", dim),
+            Span::styled("uit ", dim),
+            Span::styled("[p]", dim),
+            Span::styled("ause ", dim),
+        ];
+
+        if w >= 50 {
+            spans.extend([Span::styled("[Tab]", dim), Span::styled(" switch ", dim)]);
+        }
+
+        if w >= 35 {
+            spans.extend([
+                Span::styled("[1]", dim),
+                Span::styled("-[3]", dim),
+                Span::styled(" tabs", dim),
+            ]);
+        }
+
+        let shortcuts = Paragraph::new(Line::from(spans));
         frame.render_widget(shortcuts, area);
     }
 
@@ -489,7 +560,7 @@ impl Dashboard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Header
+                Constraint::Length(5), // Header
                 Constraint::Min(5),    // Log content
                 Constraint::Length(1), // Shortcuts
             ])
@@ -517,7 +588,7 @@ impl Dashboard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Header
+                Constraint::Length(5), // Header
                 Constraint::Min(5),    // Config content
                 Constraint::Length(1), // Shortcuts
             ])

@@ -1,0 +1,8 @@
+STYLE: Geometric
+FEEL: Sharp, angular, cyberpunk-adjacent but restrained
+WIDTH: 55 chars
+LINES: 4
+
+ ___  __  _  _ ___  _ _ ___ ___
+|    |  | |\/| |__] |_|  |  |__
+|___ |__| |  | |    |_|  |  |__

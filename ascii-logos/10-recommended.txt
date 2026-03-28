@@ -1,0 +1,15 @@
+STYLE: Recommended — Clean Block (simplified)
+FEEL: Modern, clean, balanced — best fit for Compute's brand
+WIDTH: 51 chars
+LINES: 4
+NOTES: Simplified block style that's lighter than the current heavy
+       blocks but bolder than the thin-line versions. Uses half-blocks
+       for compact height. Clean reading at all terminal sizes.
+
+       RECOMMENDED for the splash screen — pairs well with the
+       spaced caps "C O M P U T E" in the dashboard header.
+
+ ▄████▄  ▄████▄ ██▄ ▄██ ██████ ██  ██ ██████ ██████
+██      ██    ██ ██ █ ██ ██  ██ ██  ██   ██   ██
+██      ██    ██ ██   ██ █████  ██  ██   ██   ████
+ ▀████▀  ▀████▀ ██   ██ ██      ████    ██   ██████

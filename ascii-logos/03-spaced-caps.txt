@@ -1,0 +1,13 @@
+STYLE: Spaced Capitals
+FEEL: Editorial, luxe, confident — matches tight letter-spacing principle
+WIDTH: 17 chars (or wider with more spacing)
+LINES: 1
+NOTES: Currently used in the dashboard header. Mirrors the display-2xl
+       tight letter-spacing from design-language.md. Works at any width.
+       Most aligned with "quiet confidence through restraint."
+
+C O M P U T E
+
+Wider variant:
+
+C  O  M  P  U  T  E

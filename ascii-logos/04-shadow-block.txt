@@ -1,0 +1,11 @@
+STYLE: Shadow Block
+FEEL: Solid, grounded, modern
+WIDTH: 49 chars
+LINES: 4
+NOTES: Uses half-block characters for a compact but bold logo.
+       Good middle ground between the heavy block and thin line styles.
+
+ ██████  ██████  ██   ██ ██████  ██   ██ ████████ ███████
+██      ██    ██ ███ ███ ██   ██ ██   ██    ██    ██
+██      ██    ██ ██ █ ██ ██████  ██   ██    ██    █████
+ ██████  ██████  ██   ██ ██      ██████     ██    ███████

@@ -1,0 +1,10 @@
+STYLE: Gradient Compact
+FEEL: Tight, punchy, shaded but small
+WIDTH: 49 chars
+LINES: 3
+NOTES: Compact 3-line version using gradient shading.
+       Good balance of visual impact and space efficiency.
+
+░▒▓██▓  ░▒▓██▓  ▓█▄▄█▓  ▓███▓  ▓█  █▓  ▓██▓▒  ▓██████▓
+▓█     ▓█   █▓ ▓█▒▒█▓  ▓█▒   ▓█  █▓  ░█▓   ▓█▒
+░▒▓██▓  ░▒▓██▓  ▓█  █▓  ▓█     ░▒▓██▓  ░█▓   ▓██████▓

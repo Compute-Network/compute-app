@@ -1,0 +1,22 @@
+STYLE: Bracket Frame
+FEEL: Terminal-native, systematic, command-line
+WIDTH: 25 chars
+LINES: 3
+NOTES: Framed like a terminal prompt or system identifier.
+       Feels like it belongs in a CLI. Very on-brand for
+       a developer tool. Pairs well with mono font.
+
+┌─────────────────────┐
+│      COMPUTE        │
+└─────────────────────┘
+
+  Or minimal:
+
+[ COMPUTE ]
+
+  Or with status:
+
+┌─────────────────────────────────┐
+│  COMPUTE          ● ACTIVE      │
+│  v0.1.0                         │
+└─────────────────────────────────┘

@@ -1,0 +1,14 @@
+STYLE: Sans Medium (DM Sans weight 500)
+FEEL: The target — medium weight geometric sans, tight spacing
+WIDTH: 57 chars
+LINES: 5
+NOTES: Uses thick box-drawing (┃━) for medium weight.
+       Square corners (┏┓┗┛) match the "flat, sharp aesthetic" from the
+       design language. This is DM Sans medium in ASCII form.
+
+ ┏━━━┓┏━━━┓┏━┓┏━┓┏━━━┓┏┓  ┏┓┏━━━━┓┏━━━┓
+ ┃┏━┓┃┃┏━┓┃┃┗┛┛┃┃┏━┓┃┃┗┓┏┛┃┗┓┏┓┗┛┃┏━━┛
+ ┃┗━┛┃┃┃ ┃┃┃┏┓┏┓┃┃┗━┛┃┃ ┗┛ ┃ ┃┃┃  ┃┗━━┓
+ ┃┏━━┛┃┗━┛┃┃┃┃┃┃┃┃┏━━┛┃ ┏┓ ┃ ┃┃┃  ┃┏━━┛
+ ┃┃   ┗━━━┛┃┛┃┃┃┛┃┃   ┃┏┛┗┓┃ ┃┃┃  ┃┗━━┓
+ ┗┛        ┗━┛┗┛ ┗┛   ┗┛  ┗┛ ┗┛┗┛ ┗━━━┛

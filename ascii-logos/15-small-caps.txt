@@ -1,0 +1,11 @@
+STYLE: Small Caps Block
+FEEL: Compact, modern, punchy
+WIDTH: 37 chars
+LINES: 3
+NOTES: Uses unicode small-cap-like block rendering.
+       Half the height of the heavy blocks. Good for
+       tight spaces while keeping visual weight.
+
+▗▄▄ ▗▄▖ ▗▖▗▖▗▄▖ ▗▖ ▗▖▗▄▄▖▗▄▄▖
+▐   ▐▌▐▌▐▙▞▌▐▙▄ ▐▌ ▐▌ ▐▌ ▐▙▄
+▝▀▀ ▝▀▘ ▐▌ ▐▌▐▌ ▐▌▝▀▘ ▐▌ ▐▌▄▖

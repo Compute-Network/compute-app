@@ -108,6 +108,10 @@ impl Globe {
 
     /// Render the globe into a ratatui Canvas widget.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        if area.width < 4 || area.height < 4 {
+            return;
+        }
+
         let visible_continents: Vec<(f64, f64)> =
             self.continent_points.iter().filter_map(|&p| self.project(p)).collect();
 
@@ -117,7 +121,30 @@ impl Globe {
         let visible_me: Vec<(f64, f64)> =
             self.my_position.iter().filter_map(|&p| self.project(p)).collect();
 
-        // Generate sphere outline (circle)
+        // To make the globe appear circular, we set the canvas bounds so that
+        // one unit in x covers the same physical distance as one unit in y.
+        //
+        // Braille resolution: each char = 2 dots wide, 4 dots tall.
+        // Physical char cell is ~2x taller than wide (aspect ~0.5 w:h).
+        // So each braille dot: width = cell_w/2, height = cell_h/4 = (2*cell_w)/4 = cell_w/2.
+        // Braille dots are roughly square — but line spacing makes rows taller.
+        //
+        // We measure the physical aspect of the render area and set bounds accordingly.
+        // char_ratio = physical width of a char / physical height of a char ≈ 0.5
+        let char_ratio = 0.51;
+        let physical_w = area.width as f64 * char_ratio;
+        let physical_h = area.height as f64; // in char-height units
+
+        let pad = 1.15;
+        let (x_extent, y_extent) = if physical_w > physical_h {
+            // Wider than tall: x range is larger
+            (pad * physical_w / physical_h, pad)
+        } else {
+            // Taller than wide: y range is larger
+            (pad, pad * physical_h / physical_w)
+        };
+
+        // Generate sphere outline (unit circle — canvas bounds handle aspect)
         let outline: Vec<(f64, f64)> = (0..120)
             .map(|i| {
                 let theta = (i as f64 / 120.0) * std::f64::consts::TAU;
@@ -126,19 +153,12 @@ impl Globe {
             .collect();
 
         let canvas = Canvas::default()
-            .x_bounds([-1.3, 1.3])
-            .y_bounds([-1.3, 1.3])
+            .x_bounds([-x_extent, x_extent])
+            .y_bounds([-y_extent, y_extent])
             .paint(move |ctx| {
-                // Draw sphere outline
                 ctx.draw(&Points { coords: &outline, color: Color::DarkGray });
-
-                // Draw continents
                 ctx.draw(&Points { coords: &visible_continents, color: Color::White });
-
-                // Draw network nodes
                 ctx.draw(&Points { coords: &visible_nodes, color: Color::Green });
-
-                // Draw "you" marker
                 ctx.draw(&Points { coords: &visible_me, color: Color::Yellow });
             })
             .marker(ratatui::symbols::Marker::Braille);

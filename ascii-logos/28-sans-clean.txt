@@ -1,0 +1,10 @@
+STYLE: Sans Clean
+FEEL: Closest to DM Sans — geometric, rounded terminals, even stroke weight
+WIDTH: 61 chars
+LINES: 5
+
+ ██████  ██████  ███    ███ ██████  ██    ██ ████████ ███████
+██      ██    ██ ████  ████ ██   ██ ██    ██    ██    ██
+██      ██    ██ ██ ████ ██ ██████  ██    ██    ██    █████
+██      ██    ██ ██  ██  ██ ██      ██    ██    ██    ██
+ ██████  ██████  ██      ██ ██       ██████     ██    ███████
