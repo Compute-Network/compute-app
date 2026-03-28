@@ -527,10 +527,168 @@ fn cmd_pipeline() -> Result<()> {
 }
 
 fn cmd_update() -> Result<()> {
-    println!("Self-update not yet implemented.");
-    println!("Current version: v{VERSION}");
-    println!("Check https://github.com/Compute-Network/compute-app/releases for updates.");
+    println!("\n  COMPUTE UPDATE\n");
+    println!("  Current version: v{VERSION}");
+    print!("  Checking for updates... ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        match check_latest_release().await {
+            Ok(Some((tag, download_url))) => {
+                let latest = tag.trim_start_matches('v');
+                if latest == VERSION {
+                    println!("up to date");
+                } else {
+                    println!("v{latest} available");
+                    println!();
+                    println!("  Download: {download_url}");
+                    println!();
+
+                    // Attempt auto-update
+                    print!("  Downloading... ");
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+
+                    match download_and_replace(&download_url).await {
+                        Ok(()) => {
+                            println!("done");
+                            println!("  Updated to v{latest}");
+                            println!("  Restart compute to use the new version.");
+                        }
+                        Err(e) => {
+                            println!("failed");
+                            println!("  Error: {e}");
+                            println!("  Manual update: download from the URL above and replace the binary.");
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                println!("no releases found");
+                println!("  Check: https://github.com/Compute-Network/compute-app/releases");
+            }
+            Err(e) => {
+                println!("failed");
+                println!("  Error: {e}");
+                println!("  Check: https://github.com/Compute-Network/compute-app/releases");
+            }
+        }
+    });
+
+    println!();
     Ok(())
+}
+
+/// Check the latest release from GitHub releases API.
+/// Returns (tag_name, download_url) for the current platform.
+async fn check_latest_release() -> Result<Option<(String, String)>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(format!("compute-cli/{VERSION}"))
+        .build()?;
+
+    let resp = client
+        .get("https://api.github.com/repos/Compute-Network/compute-app/releases/latest")
+        .send()
+        .await?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    if !resp.status().is_success() {
+        anyhow::bail!("GitHub API error: {}", resp.status());
+    }
+
+    let release: serde_json::Value = resp.json().await?;
+
+    let tag = release["tag_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No tag_name in release"))?
+        .to_string();
+
+    // Find the asset for this platform
+    let target = current_target();
+    let assets = release["assets"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("No assets in release"))?;
+
+    for asset in assets {
+        let name = asset["name"].as_str().unwrap_or("");
+        if name.contains(&target) {
+            let url = asset["browser_download_url"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            return Ok(Some((tag, url)));
+        }
+    }
+
+    // If no platform-specific asset, return the release URL
+    let html_url = release["html_url"]
+        .as_str()
+        .unwrap_or("https://github.com/Compute-Network/compute-app/releases")
+        .to_string();
+
+    Ok(Some((tag, html_url)))
+}
+
+/// Download a binary and replace the current executable.
+async fn download_and_replace(url: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .user_agent(format!("compute-cli/{VERSION}"))
+        .build()?;
+
+    let resp = client.get(url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Download failed: {}", resp.status());
+    }
+
+    let bytes = resp.bytes().await?;
+
+    let current_exe = std::env::current_exe()?;
+    let backup = current_exe.with_extension("old");
+
+    // Rename current binary to .old, write new binary
+    std::fs::rename(&current_exe, &backup)?;
+    std::fs::write(&current_exe, &bytes)?;
+
+    // Make executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&current_exe, perms)?;
+    }
+
+    // Clean up backup
+    let _ = std::fs::remove_file(&backup);
+
+    Ok(())
+}
+
+/// Determine the current platform target string for asset matching.
+fn current_target() -> String {
+    let os = if cfg!(target_os = "macos") {
+        "apple-darwin"
+    } else if cfg!(target_os = "linux") {
+        "unknown-linux"
+    } else if cfg!(target_os = "windows") {
+        "pc-windows"
+    } else {
+        "unknown"
+    };
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "unknown"
+    };
+
+    format!("{arch}-{os}")
 }
 
 fn cmd_uninstall() -> Result<()> {

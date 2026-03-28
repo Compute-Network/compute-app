@@ -42,13 +42,22 @@ pub struct Dashboard {
 impl Dashboard {
     pub fn new(hardware: HardwareInfo) -> Self {
         let mut globe = Globe::new();
-        globe.set_mock_nodes();
+
+        // Fetch real nodes from Supabase for globe visualization
+        let config = compute_daemon::config::Config::load().unwrap_or_default();
+        let (network, node_regions) = fetch_network_and_nodes();
+        if !node_regions.is_empty() {
+            globe.set_nodes_from_regions(&node_regions);
+            globe.set_my_position(
+                Some(&config.network.region),
+                &config.wallet.public_address,
+            );
+        } else {
+            globe.set_mock_nodes();
+        }
 
         // Try to load recent log lines
         let log_lines = load_recent_logs(50);
-
-        // Fetch real network stats from Supabase
-        let network = fetch_network_stats();
 
         Self {
             globe,
@@ -119,9 +128,13 @@ impl Dashboard {
             self.last_metrics_update = Instant::now();
         }
 
-        // Refresh network stats from Supabase every 60 seconds
+        // Refresh network stats and nodes from Supabase every 60 seconds
         if self.last_network_update.elapsed() > Duration::from_secs(60) {
-            self.network = fetch_network_stats();
+            let (network, node_regions) = fetch_network_and_nodes();
+            self.network = network;
+            if !node_regions.is_empty() {
+                self.globe.set_nodes_from_regions(&node_regions);
+            }
             self.last_network_update = Instant::now();
         }
 
@@ -729,20 +742,32 @@ fn rand_simple() -> f64 {
     (nanos % 1000) as f64 / 1000.0
 }
 
-/// Fetch network stats from Supabase. Falls back to mock data on failure.
-fn fetch_network_stats() -> NetworkStats {
+/// Fetch network stats and online nodes from Supabase.
+/// Returns (stats, list of (wallet, region) for globe).
+fn fetch_network_and_nodes() -> (NetworkStats, Vec<(String, Option<String>)>) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
     match rt {
         Ok(rt) => rt.block_on(async {
             let client = compute_network::supabase::SupabaseClient::new();
-            match client.get_network_stats().await {
-                Ok(stats) => NetworkStats {
-                    total_nodes: stats.total_nodes as u32,
-                    peak_petaflops: stats.total_nodes as f64 * 0.066, // ~66 TFLOPS avg per node
+
+            let stats = match client.get_network_stats().await {
+                Ok(s) => NetworkStats {
+                    total_nodes: s.total_nodes as u32,
+                    peak_petaflops: s.total_nodes as f64 * 0.066,
                 },
                 Err(_) => NetworkStats::mock(),
-            }
+            };
+
+            let nodes = match client.get_online_nodes().await {
+                Ok(n) => n
+                    .into_iter()
+                    .map(|node| (node.wallet_address, node.region))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+
+            (stats, nodes)
         }),
-        Err(_) => NetworkStats::mock(),
+        Err(_) => (NetworkStats::mock(), Vec::new()),
     }
 }

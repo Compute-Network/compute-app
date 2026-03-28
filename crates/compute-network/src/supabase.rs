@@ -75,6 +75,17 @@ pub struct NetworkStats {
     pub online_nodes: u64,
 }
 
+/// Minimal node info for discovery/visualization.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OnlineNode {
+    pub wallet_address: String,
+    pub node_name: Option<String>,
+    pub region: Option<String>,
+    pub gpu_model: Option<String>,
+    pub gpu_backend: Option<String>,
+    pub tflops_fp16: Option<f64>,
+}
+
 /// Client for the Supabase REST API (PostgREST).
 pub struct SupabaseClient {
     client: reqwest::Client,
@@ -228,6 +239,26 @@ impl SupabaseClient {
             .unwrap_or(0);
 
         Ok(NetworkStats { total_nodes, online_nodes })
+    }
+
+    /// Fetch online nodes (for globe visualization).
+    /// Returns wallet_address, node_name, region, gpu_model for each online node.
+    pub async fn get_online_nodes(&self) -> Result<Vec<OnlineNode>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/nodes?select=wallet_address,node_name,region,gpu_model,gpu_backend,tflops_fp16&status=eq.online&limit=500",
+                self.rest_url
+            ))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to fetch online nodes: {}", resp.status());
+        }
+
+        let nodes: Vec<OnlineNode> = resp.json().await?;
+        Ok(nodes)
     }
 
     /// Check if Supabase is reachable.

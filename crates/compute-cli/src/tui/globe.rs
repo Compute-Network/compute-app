@@ -59,7 +59,6 @@ impl Globe {
 
     /// Set mock node positions for demo purposes.
     pub fn set_mock_nodes(&mut self) {
-        // Scatter some nodes around the world
         let node_coords = [
             (37.7749, -122.4194), // San Francisco
             (40.7128, -74.0060),  // New York
@@ -83,6 +82,25 @@ impl Globe {
 
         // User's node (San Francisco for demo)
         self.my_position = Some(latlon_to_xyz(37.7749, -122.4194));
+    }
+
+    /// Set node positions from region strings (from Supabase discovery).
+    /// Each region is mapped to approximate coordinates. Nodes with unknown
+    /// regions are spread across the globe using a hash of their wallet address.
+    pub fn set_nodes_from_regions(&mut self, regions: &[(String, Option<String>)]) {
+        self.node_positions = regions
+            .iter()
+            .map(|(wallet, region)| {
+                let (lat, lon) = region_to_latlon(region.as_deref(), wallet);
+                latlon_to_xyz(lat, lon)
+            })
+            .collect();
+    }
+
+    /// Set this node's position from its region.
+    pub fn set_my_position(&mut self, region: Option<&str>, wallet: &str) {
+        let (lat, lon) = region_to_latlon(region, wallet);
+        self.my_position = Some(latlon_to_xyz(lat, lon));
     }
 
     /// Project a 3D point with the current rotation, returning 2D coords if visible.
@@ -165,6 +183,60 @@ impl Globe {
 
         canvas.render(area, buf);
     }
+}
+
+/// Map a region string (or cloud region code) to approximate lat/lon.
+/// Falls back to a deterministic pseudo-random position based on wallet address hash.
+fn region_to_latlon(region: Option<&str>, wallet: &str) -> (f64, f64) {
+    if let Some(r) = region {
+        let r = r.to_lowercase();
+        // Match common cloud region codes and geographic names
+        if r.contains("us-east") || r.contains("virginia") || r.contains("new-york") {
+            return (39.0, -77.5);
+        }
+        if r.contains("us-west") || r.contains("oregon") || r.contains("california") {
+            return (37.8, -122.4);
+        }
+        if r.contains("us-central") || r.contains("iowa") {
+            return (41.9, -93.6);
+        }
+        if r.contains("eu-west") || r.contains("ireland") || r.contains("london") {
+            return (51.5, -0.1);
+        }
+        if r.contains("eu-central") || r.contains("frankfurt") || r.contains("germany") {
+            return (50.1, 8.7);
+        }
+        if r.contains("ap-southeast") || r.contains("singapore") {
+            return (1.4, 103.8);
+        }
+        if r.contains("ap-northeast") || r.contains("tokyo") || r.contains("japan") {
+            return (35.7, 139.7);
+        }
+        if r.contains("ap-south") || r.contains("mumbai") || r.contains("india") {
+            return (19.1, 72.9);
+        }
+        if r.contains("sa-east") || r.contains("sao-paulo") || r.contains("brazil") {
+            return (-23.6, -46.6);
+        }
+        if r.contains("sydney") || r.contains("australia") {
+            return (-33.9, 151.2);
+        }
+        if r.contains("seoul") || r.contains("korea") {
+            return (37.6, 127.0);
+        }
+        if r.contains("canada") || r.contains("toronto") {
+            return (43.7, -79.4);
+        }
+        if r.contains("africa") || r.contains("cape-town") {
+            return (-33.9, 18.4);
+        }
+    }
+
+    // Deterministic pseudo-random position from wallet address
+    let hash: u64 = wallet.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    let lat = ((hash % 1400) as f64 / 10.0) - 70.0; // -70 to +70
+    let lon = (((hash / 1400) % 3600) as f64 / 10.0) - 180.0; // -180 to +180
+    (lat, lon)
 }
 
 /// Convert latitude/longitude (degrees) to 3D cartesian coordinates on a unit sphere.
