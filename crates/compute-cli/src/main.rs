@@ -6,10 +6,10 @@ use clap::Parser;
 use std::io::Seek;
 
 use cli::{Cli, Commands, ConfigAction, ServiceAction, WalletAction};
-use compute_network::supabase::SupabaseClient;
 use compute_daemon::config::{self, Config};
 use compute_daemon::daemon;
 use compute_daemon::hardware;
+use compute_network::supabase::SupabaseClient;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -106,9 +106,7 @@ async fn register_node_supabase(config: &Config) {
     let hw = hardware::detect();
     let gpu = hw.gpus.first();
 
-    let tflops = gpu.map(|g| {
-        compute_daemon::benchmark::estimate_tflops(&g.name, g.vram_mb)
-    });
+    let tflops = gpu.map(|g| compute_daemon::benchmark::estimate_tflops(&g.name, g.vram_mb));
 
     let node = NodeRow {
         id: None,
@@ -587,10 +585,8 @@ fn cmd_nodes(all: bool, limit: usize) -> Result<()> {
                 let gpu = node.gpu_model.as_deref().unwrap_or("-");
                 let gpu_display = if gpu.len() > 18 { &gpu[..18] } else { gpu };
 
-                let tflops = node
-                    .tflops_fp16
-                    .map(|t| format!("{t:.1}"))
-                    .unwrap_or_else(|| "-".into());
+                let tflops =
+                    node.tflops_fp16.map(|t| format!("{t:.1}")).unwrap_or_else(|| "-".into());
 
                 let uptime = node
                     .uptime_seconds
@@ -699,17 +695,13 @@ async fn check_latest_release() -> Result<Option<(String, String)>> {
 
     // Find the asset for this platform
     let target = current_target();
-    let assets = release["assets"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("No assets in release"))?;
+    let assets =
+        release["assets"].as_array().ok_or_else(|| anyhow::anyhow!("No assets in release"))?;
 
     for asset in assets {
         let name = asset["name"].as_str().unwrap_or("");
         if name.contains(&target) {
-            let url = asset["browser_download_url"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let url = asset["browser_download_url"].as_str().unwrap_or("").to_string();
             return Ok(Some((tag, url)));
         }
     }
@@ -871,11 +863,7 @@ fn cmd_doctor() -> Result<()> {
     let (supabase_ok, node_count) = rt.block_on(async {
         let client = SupabaseClient::new();
         let healthy = client.health_check().await;
-        let stats = if healthy {
-            client.get_network_stats().await.ok()
-        } else {
-            None
-        };
+        let stats = if healthy { client.get_network_stats().await.ok() } else { None };
         (healthy, stats.map(|s| s.total_nodes).unwrap_or(0))
     });
 

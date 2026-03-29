@@ -9,8 +9,8 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
 
 use super::engine::*;
@@ -96,12 +96,8 @@ impl LlamaCppEngine {
                     .unwrap_or(&PathBuf::from("/tmp"))
                     .to_string_lossy()
                     .to_string();
-                let shard_filename = config
-                    .shard_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
+                let shard_filename =
+                    config.shard_path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
                 cmd.args([
                     "run",
@@ -155,13 +151,7 @@ impl LlamaCppEngine {
     /// Check if the llama-server is healthy.
     async fn health(&self) -> bool {
         let url = format!("http://127.0.0.1:{}/health", self.server_port);
-        match self
-            .http_client
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-        {
+        match self.http_client.get(&url).timeout(std::time::Duration::from_secs(2)).send().await {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
         }
@@ -229,9 +219,7 @@ impl LlamaCppEngine {
         let tokens = result["tokens"]
             .as_array()
             .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|id| id as u32))
-                    .collect::<Vec<_>>()
+                arr.iter().filter_map(|v| v.as_u64().map(|id| id as u32)).collect::<Vec<_>>()
             })
             .unwrap_or_default();
 
@@ -260,11 +248,7 @@ impl LlamaCppEngine {
         // For now, we pass through the data as a placeholder.
         // The actual implementation requires a patched llama.cpp server with
         // a /forward endpoint that accepts raw tensor input.
-        debug!(
-            "Processing activation: shape={:?}, size={}B",
-            shape,
-            input_data.len()
-        );
+        debug!("Processing activation: shape={:?}, size={}B", shape, input_data.len());
 
         // Placeholder: in production, this calls a custom /forward endpoint
         // on llama-server that accepts and returns raw hidden states.
@@ -344,9 +328,7 @@ impl InferenceEngine for LlamaCppEngine {
         // If using Docker, stop the container
         if self.backend == InferenceBackend::DockerCuda {
             let container_name = format!("compute-inference-{}", self.server_port);
-            let _ = Command::new("docker")
-                .args(["stop", &container_name])
-                .output();
+            let _ = Command::new("docker").args(["stop", &container_name]).output();
         }
 
         self.server_process = None;
@@ -358,10 +340,8 @@ impl InferenceEngine for LlamaCppEngine {
     }
 
     async fn forward(&self, input: Activation) -> Result<ForwardResult> {
-        let config = self
-            .shard_config
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No shard loaded"))?;
+        let config =
+            self.shard_config.as_ref().ok_or_else(|| anyhow::anyhow!("No shard loaded"))?;
 
         if self.status != EngineStatus::Ready {
             anyhow::bail!("Engine not ready (status: {:?})", self.status);
@@ -378,9 +358,7 @@ impl InferenceEngine for LlamaCppEngine {
             Ok(ForwardResult::Tokens(result))
         } else {
             // First or middle stage: run layers and output activations
-            let output_data = self
-                .get_activations(&input.data, &input.shape)
-                .await?;
+            let output_data = self.get_activations(&input.data, &input.shape).await?;
 
             Ok(ForwardResult::Activations(Activation {
                 request_id: input.request_id,
@@ -405,11 +383,7 @@ impl InferenceEngine for LlamaCppEngine {
         let result: serde_json::Value = resp.json().await?;
         let tokens = result["tokens"]
             .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|id| id as u32))
-                    .collect()
-            })
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|id| id as u32)).collect())
             .unwrap_or_default();
 
         Ok(tokens)
@@ -479,12 +453,13 @@ impl Drop for LlamaCppEngine {
 fn find_llama_server() -> Result<PathBuf> {
     // Check if it's in PATH
     if let Ok(output) = Command::new("which").arg("llama-server").output()
-        && output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
         }
+    }
 
     // Check common locations
     let candidates = [

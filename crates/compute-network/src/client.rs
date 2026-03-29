@@ -76,12 +76,7 @@ impl OrchestratorClient {
             .build()
             .unwrap_or_default();
 
-        Self {
-            base_url: base_url.to_string(),
-            client,
-            node_id: None,
-            wallet_address: None,
-        }
+        Self { base_url: base_url.to_string(), client, node_id: None, wallet_address: None }
     }
 
     /// Get the registered node ID.
@@ -113,17 +108,10 @@ impl OrchestratorClient {
     }
 
     /// Send a heartbeat to the orchestrator.
-    pub async fn heartbeat(
-        &self,
-        wallet_address: &str,
-        payload: &HeartbeatPayload,
-    ) -> Result<()> {
+    pub async fn heartbeat(&self, wallet_address: &str, payload: &HeartbeatPayload) -> Result<()> {
         let resp = self
             .client
-            .post(format!(
-                "{}/v1/nodes/{}/heartbeat",
-                self.base_url, wallet_address
-            ))
+            .post(format!("{}/v1/nodes/{}/heartbeat", self.base_url, wallet_address))
             .json(payload)
             .send()
             .await?;
@@ -158,10 +146,7 @@ impl OrchestratorClient {
     pub async fn get_assignment(&self, node_id: &str) -> Result<Option<PipelineAssignment>> {
         let resp = self
             .client
-            .get(format!(
-                "{}/v1/pipelines/assignment/{}",
-                self.base_url, node_id
-            ))
+            .get(format!("{}/v1/pipelines/assignment/{}", self.base_url, node_id))
             .send()
             .await?;
 
@@ -179,10 +164,7 @@ impl OrchestratorClient {
     pub async fn get_rewards(&self, wallet_address: &str) -> Result<RewardInfo> {
         let resp = self
             .client
-            .get(format!(
-                "{}/v1/rewards/{}",
-                self.base_url, wallet_address
-            ))
+            .get(format!("{}/v1/rewards/{}", self.base_url, wallet_address))
             .send()
             .await?;
 

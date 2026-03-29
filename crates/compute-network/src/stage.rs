@@ -11,8 +11,8 @@
 
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info};
 
 use crate::transport::node::{PeerConnection, TransportNode};
@@ -137,11 +137,8 @@ impl StageRunner {
 
         // Connect to downstream if not the last stage
         let downstream: Option<PeerConnection> = if let Some(addr) = self.config.downstream_addr {
-            let conn = self
-                .transport
-                .connect(addr)
-                .await
-                .context("Failed to connect to downstream")?;
+            let conn =
+                self.transport.connect(addr).await.context("Failed to connect to downstream")?;
             info!("Connected to downstream stage at {addr}");
             Some(conn)
         } else {
@@ -209,8 +206,7 @@ impl StageRunner {
                                     error!("Failed to send tokens: {e}");
                                     self.stats.errors += 1;
                                 } else {
-                                    self.stats.tokens_generated +=
-                                        tokens.tokens.len() as u64;
+                                    self.stats.tokens_generated += tokens.tokens.len() as u64;
                                 }
                             }
                             Err(e) => {
@@ -218,11 +214,10 @@ impl StageRunner {
                                 self.stats.errors += 1;
 
                                 // Send error back
-                                let err_msg =
-                                    PipelineMessage::Control(ControlMessage::Error {
-                                        node_id: self.transport.node_id().to_string(),
-                                        message: e.to_string(),
-                                    });
+                                let err_msg = PipelineMessage::Control(ControlMessage::Error {
+                                    node_id: self.transport.node_id().to_string(),
+                                    message: e.to_string(),
+                                });
                                 let _ = peer.send_activations(&err_msg).await;
                             }
                         }
@@ -247,13 +242,11 @@ impl StageRunner {
                         // Could dynamically reassign layers here
                     }
                     PipelineMessage::Ping(ping) => {
-                        let pong = PipelineMessage::Pong(
-                            crate::transport::protocol::PongMessage {
-                                node_id: self.transport.node_id().to_string(),
-                                timestamp_ms: ping.timestamp_ms,
-                                latency_ms: None,
-                            },
-                        );
+                        let pong = PipelineMessage::Pong(crate::transport::protocol::PongMessage {
+                            node_id: self.transport.node_id().to_string(),
+                            timestamp_ms: ping.timestamp_ms,
+                            latency_ms: None,
+                        });
                         let _ = peer.send_activations(&pong).await;
                     }
                     other => {

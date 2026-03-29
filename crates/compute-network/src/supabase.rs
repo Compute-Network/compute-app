@@ -137,10 +137,7 @@ impl SupabaseClient {
             .build()
             .unwrap_or_default();
 
-        Self {
-            client,
-            rest_url: format!("{SUPABASE_URL}/rest/v1"),
-        }
+        Self { client, rest_url: format!("{SUPABASE_URL}/rest/v1") }
     }
 
     /// Register a new node or update existing one (upsert by wallet_address).
@@ -180,10 +177,7 @@ impl SupabaseClient {
 
         let resp = self
             .client
-            .patch(format!(
-                "{}/nodes?wallet_address=eq.{}",
-                self.rest_url, wallet_address
-            ))
+            .patch(format!("{}/nodes?wallet_address=eq.{}", self.rest_url, wallet_address))
             .header("Prefer", "return=minimal")
             .json(update)
             .send()
@@ -208,10 +202,7 @@ impl SupabaseClient {
 
         let resp = self
             .client
-            .patch(format!(
-                "{}/nodes?wallet_address=eq.{}",
-                self.rest_url, wallet_address
-            ))
+            .patch(format!("{}/nodes?wallet_address=eq.{}", self.rest_url, wallet_address))
             .header("Prefer", "return=minimal")
             .json(&StatusUpdate { status: "offline".into() })
             .send()
@@ -247,10 +238,7 @@ impl SupabaseClient {
         // Count online nodes
         let resp = self
             .client
-            .get(format!(
-                "{}/nodes?select=id&status=eq.online",
-                self.rest_url
-            ))
+            .get(format!("{}/nodes?select=id&status=eq.online", self.rest_url))
             .header("Prefer", "count=exact")
             .header("Range-Unit", "items")
             .header("Range", "0-0")

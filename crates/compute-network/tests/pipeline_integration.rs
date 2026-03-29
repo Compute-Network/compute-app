@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use compute_network::pipeline::{ModelSpec, NodeCapabilities, allocate_layers, form_pipeline};
 use compute_network::transport::node::TransportNode;
 use compute_network::transport::protocol::{
-    ActivationPayload, ControlMessage, PipelineMessage, PingMessage, PongMessage, TensorDtype,
+    ActivationPayload, ControlMessage, PingMessage, PipelineMessage, PongMessage, TensorDtype,
 };
 
 /// Simulate a 3-stage pipeline: scheduler allocates layers, then activations flow through.
@@ -252,10 +252,7 @@ async fn test_latency_ping_pong() {
 
     let conn = node_a.connect(addr_b).await.unwrap();
 
-    let ping = PipelineMessage::Ping(PingMessage {
-        node_id: "node-a".into(),
-        timestamp_ms: 1000,
-    });
+    let ping = PipelineMessage::Ping(PingMessage { node_id: "node-a".into(), timestamp_ms: 1000 });
     conn.send_activations(&ping).await.unwrap();
 
     // Receive pong from node_b
@@ -297,9 +294,8 @@ async fn test_pipeline_teardown() {
     });
 
     let conn = node_a.connect(addr_b).await.unwrap();
-    let release = PipelineMessage::Control(ControlMessage::Release {
-        reason: "pipeline complete".into(),
-    });
+    let release =
+        PipelineMessage::Control(ControlMessage::Release { reason: "pipeline complete".into() });
     conn.send_activations(&release).await.unwrap();
 
     node_b_handle.await.unwrap();

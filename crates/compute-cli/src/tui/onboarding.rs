@@ -91,11 +91,7 @@ impl OnboardingScreen {
         }
     }
 
-    fn handle_key(
-        &mut self,
-        code: KeyCode,
-        _modifiers: KeyModifiers,
-    ) -> Option<OnboardingResult> {
+    fn handle_key(&mut self, code: KeyCode, _modifiers: KeyModifiers) -> Option<OnboardingResult> {
         match self.step {
             OnboardingStep::Welcome => {
                 match code {
@@ -159,7 +155,9 @@ impl OnboardingScreen {
                             self.success = true;
                             return Some(OnboardingResult::WalletSet(address));
                         } else {
-                            self.error_message = Some("Invalid Solana address. Must be 32-44 base58 characters.".into());
+                            self.error_message = Some(
+                                "Invalid Solana address. Must be 32-44 base58 characters.".into(),
+                            );
                         }
                     }
                     _ => {}
@@ -225,11 +223,11 @@ impl OnboardingScreen {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),  // top padding
-                Constraint::Length(3),  // header
-                Constraint::Length(1),  // spacer
+                Constraint::Length(3), // top padding
+                Constraint::Length(3), // header
+                Constraint::Length(1), // spacer
                 Constraint::Min(10),   // main content
-                Constraint::Length(2),  // bottom help
+                Constraint::Length(2), // bottom help
             ])
             .split(area);
 
@@ -239,10 +237,7 @@ impl OnboardingScreen {
                 "  SETUP",
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(
-                format!("  v{VERSION}"),
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(format!("  v{VERSION}"), Style::default().fg(Color::DarkGray))),
         ]);
         frame.render_widget(header, chunks[1]);
 
@@ -308,20 +303,18 @@ impl OnboardingScreen {
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),  // label
-                Constraint::Length(3),  // input box
-                Constraint::Length(2),  // error/status
+                Constraint::Length(2), // label
+                Constraint::Length(3), // input box
+                Constraint::Length(2), // error/status
                 Constraint::Min(0),    // remaining
             ])
             .split(area);
 
         // Label
-        let label = Paragraph::new(vec![
-            Line::from(Span::styled(
-                "  SOLANA WALLET ADDRESS",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-            )),
-        ]);
+        let label = Paragraph::new(vec![Line::from(Span::styled(
+            "  SOLANA WALLET ADDRESS",
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ))]);
         frame.render_widget(label, inner_chunks[0]);
 
         // Input box — calculate visible area
@@ -334,11 +327,7 @@ impl OnboardingScreen {
 
         // Build the display string with cursor
         let display_text = if self.input.is_empty() && self.step == OnboardingStep::WalletInput {
-            if self.cursor_blink {
-                "█".to_string()
-            } else {
-                " ".to_string()
-            }
+            if self.cursor_blink { "█".to_string() } else { " ".to_string() }
         } else {
             let mut text = self.input.clone();
             if self.step == OnboardingStep::WalletInput && self.cursor_blink {
@@ -361,9 +350,8 @@ impl OnboardingScreen {
             Color::DarkGray
         };
 
-        let input_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color));
+        let input_block =
+            Block::default().borders(Borders::ALL).border_style(Style::default().fg(border_color));
 
         let input_text = Paragraph::new(Line::from(Span::styled(
             display_text,

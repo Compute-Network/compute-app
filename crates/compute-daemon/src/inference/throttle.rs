@@ -7,8 +7,8 @@
 //!
 //! Also handles process priority management and VRAM budgeting.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -170,11 +170,7 @@ impl VramBudget {
         let available = (total_vram_mb * max_pct) / 100;
         let reserved = total_vram_mb - available;
 
-        Self {
-            total_mb: total_vram_mb,
-            reserved_mb: reserved,
-            available_mb: available,
-        }
+        Self { total_mb: total_vram_mb, reserved_mb: reserved, available_mb: available }
     }
 
     /// Check if a shard fits within the VRAM budget.

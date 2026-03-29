@@ -175,10 +175,7 @@ pub fn detect_backend(hw: &crate::hardware::HardwareInfo) -> InferenceBackend {
     }
 
     // Check for NVIDIA GPU + Docker
-    let has_cuda = hw
-        .gpus
-        .iter()
-        .any(|g| matches!(g.backend, crate::hardware::GpuBackend::Cuda));
+    let has_cuda = hw.gpus.iter().any(|g| matches!(g.backend, crate::hardware::GpuBackend::Cuda));
     if has_cuda && hw.docker.available {
         return InferenceBackend::DockerCuda;
     }
@@ -229,10 +226,7 @@ mod tests {
                 version: "6.0".into(),
                 arch: "x86_64".into(),
             },
-            docker: hardware::DockerStatus {
-                available: true,
-                version: Some("24.0".into()),
-            },
+            docker: hardware::DockerStatus { available: true, version: Some("24.0".into()) },
         };
         assert_eq!(detect_backend(&hw), InferenceBackend::DockerCuda);
     }
@@ -254,10 +248,7 @@ mod tests {
                 version: "6.0".into(),
                 arch: "x86_64".into(),
             },
-            docker: hardware::DockerStatus {
-                available: false,
-                version: None,
-            },
+            docker: hardware::DockerStatus { available: false, version: None },
         };
         assert_eq!(detect_backend(&hw), InferenceBackend::Cpu);
     }
@@ -284,9 +275,6 @@ mod tests {
     fn test_engine_status_equality() {
         assert_eq!(EngineStatus::Ready, EngineStatus::Ready);
         assert_ne!(EngineStatus::Ready, EngineStatus::Paused);
-        assert_ne!(
-            EngineStatus::Error("a".into()),
-            EngineStatus::Error("b".into())
-        );
+        assert_ne!(EngineStatus::Error("a".into()), EngineStatus::Error("b".into()));
     }
 }

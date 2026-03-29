@@ -38,9 +38,7 @@ impl ShardCache {
 
     /// Default cache directory (~/.compute/models/).
     pub fn default_dir() -> PathBuf {
-        crate::config::config_dir()
-            .unwrap_or_else(|| PathBuf::from("~/.compute"))
-            .join("models")
+        crate::config::config_dir().unwrap_or_else(|| PathBuf::from("~/.compute")).join("models")
     }
 
     /// Ensure the cache directory exists.
@@ -57,15 +55,17 @@ impl ShardCache {
 
         // Check file size matches
         if let Ok(metadata) = std::fs::metadata(&path)
-            && shard.size_bytes > 0 && metadata.len() != shard.size_bytes {
-                debug!(
-                    "Cached shard {} has wrong size (expected {}, got {})",
-                    shard.filename,
-                    shard.size_bytes,
-                    metadata.len()
-                );
-                return false;
-            }
+            && shard.size_bytes > 0
+            && metadata.len() != shard.size_bytes
+        {
+            debug!(
+                "Cached shard {} has wrong size (expected {}, got {})",
+                shard.filename,
+                shard.size_bytes,
+                metadata.len()
+            );
+            return false;
+        }
 
         true
     }
@@ -179,11 +179,7 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
         .timeout(std::time::Duration::from_secs(3600)) // 1 hour for large files
         .build()?;
 
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .context("Download request failed")?;
+    let resp = client.get(url).send().await.context("Download request failed")?;
 
     if !resp.status().is_success() {
         anyhow::bail!("Download failed: HTTP {}", resp.status());
@@ -194,9 +190,8 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
 
     // Write to a temp file first, then rename (atomic)
     let tmp_path = dest.with_extension("tmp");
-    let mut file = tokio::fs::File::create(&tmp_path)
-        .await
-        .context("Failed to create temp file")?;
+    let mut file =
+        tokio::fs::File::create(&tmp_path).await.context("Failed to create temp file")?;
 
     use tokio::io::AsyncWriteExt;
     let mut stream = resp.bytes_stream();
@@ -218,9 +213,7 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
     drop(file);
 
     // Rename temp file to final destination
-    tokio::fs::rename(&tmp_path, dest)
-        .await
-        .context("Failed to move downloaded file")?;
+    tokio::fs::rename(&tmp_path, dest).await.context("Failed to move downloaded file")?;
 
     Ok(())
 }
@@ -325,10 +318,7 @@ mod tests {
         };
 
         let path = cache.shard_path(&shard);
-        assert_eq!(
-            path,
-            PathBuf::from("/tmp/compute-test-cache/llama-70b/shard-0-39.gguf")
-        );
+        assert_eq!(path, PathBuf::from("/tmp/compute-test-cache/llama-70b/shard-0-39.gguf"));
     }
 
     #[test]

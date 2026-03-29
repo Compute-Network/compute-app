@@ -58,10 +58,7 @@ impl Dashboard {
         let (network, node_regions) = fetch_network_and_nodes();
         if !node_regions.is_empty() {
             globe.set_nodes_from_regions(&node_regions);
-            globe.set_my_position(
-                Some(&config.network.region),
-                &config.wallet.public_address,
-            );
+            globe.set_my_position(Some(&config.network.region), &config.wallet.public_address);
         } else {
             globe.set_mock_nodes();
         }
@@ -295,13 +292,14 @@ impl Dashboard {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let w = area.width as usize;
-        let (status_color, status_text) = if self.pipeline.active && self.pipeline.tokens_per_sec > 0.0 {
-            (Color::Green, "ACTIVE")
-        } else if self.pipeline.active {
-            (Color::Green, "ONLINE")
-        } else {
-            (Color::DarkGray, "IDLE")
-        };
+        let (status_color, status_text) =
+            if self.pipeline.active && self.pipeline.tokens_per_sec > 0.0 {
+                (Color::Green, "ACTIVE")
+            } else if self.pipeline.active {
+                (Color::Green, "ONLINE")
+            } else {
+                (Color::DarkGray, "IDLE")
+            };
 
         let tab_style = |tab: Tab| {
             if tab == self.active_tab {
@@ -564,11 +562,8 @@ impl Dashboard {
         frame.render_widget(label, chunks[0]);
 
         // Ensure a visible baseline — minimum value is 1, max scales to data
-        let display_data: Vec<u64> = self
-            .throughput_history
-            .iter()
-            .map(|&v| if v == 0 { 1 } else { v })
-            .collect();
+        let display_data: Vec<u64> =
+            self.throughput_history.iter().map(|&v| if v == 0 { 1 } else { v }).collect();
 
         let data_max = display_data.iter().copied().max().unwrap_or(1).max(8);
 
@@ -825,10 +820,7 @@ fn fetch_network_and_nodes() -> (NetworkStats, Vec<(String, Option<String>)>) {
             };
 
             let nodes = match client.get_online_nodes().await {
-                Ok(n) => n
-                    .into_iter()
-                    .map(|node| (node.wallet_address, node.region))
-                    .collect(),
+                Ok(n) => n.into_iter().map(|node| (node.wallet_address, node.region)).collect(),
                 Err(_) => Vec::new(),
             };
 

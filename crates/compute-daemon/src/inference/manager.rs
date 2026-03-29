@@ -20,11 +20,7 @@ pub enum InferenceStatus {
     /// Starting up llama-server.
     Starting,
     /// Running inference for a pipeline.
-    Running {
-        pipeline_id: String,
-        model_name: String,
-        port: u16,
-    },
+    Running { pipeline_id: String, model_name: String, port: u16 },
     /// Error state.
     Error(String),
 }
@@ -76,11 +72,7 @@ impl InferenceManager {
 
     /// Check if we should start or stop inference based on the pipeline assignment.
     /// Called by the daemon on each heartbeat cycle.
-    pub fn check_assignment(
-        &mut self,
-        pipeline_id: Option<&str>,
-        model_name: Option<&str>,
-    ) {
+    pub fn check_assignment(&mut self, pipeline_id: Option<&str>, model_name: Option<&str>) {
         match (&self.status, pipeline_id) {
             // Not running, got assigned → start
             (InferenceStatus::Idle | InferenceStatus::Error(_), Some(pid)) => {
@@ -142,10 +134,14 @@ impl InferenceManager {
 
         let result = Command::new("llama-server")
             .args([
-                "--model", &path,
-                "--port", &self.port.to_string(),
-                "--ctx-size", "2048",
-                "--n-gpu-layers", "999",
+                "--model",
+                &path,
+                "--port",
+                &self.port.to_string(),
+                "--ctx-size",
+                "2048",
+                "--n-gpu-layers",
+                "999",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -228,10 +224,7 @@ impl InferenceManager {
         let slots_total = body.matches("\"is_processing\":").count() as u32;
         let slots_idle = slots_total.saturating_sub(slots_processing);
 
-        Some(InferenceMetrics {
-            slots_idle,
-            slots_processing,
-        })
+        Some(InferenceMetrics { slots_idle, slots_processing })
     }
 }
 

@@ -212,10 +212,8 @@ impl DaemonRuntime {
                 });
 
                 // Tell inference manager about the assignment
-                inference_mgr.check_assignment(
-                    node.pipeline_id.as_deref(),
-                    node.model_name.as_deref(),
-                );
+                inference_mgr
+                    .check_assignment(node.pipeline_id.as_deref(), node.model_name.as_deref());
             }
             Ok(None) => {
                 tracing::debug!("Node not found in Supabase");
