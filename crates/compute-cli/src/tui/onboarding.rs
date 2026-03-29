@@ -1,3 +1,4 @@
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -30,17 +31,20 @@ pub struct OnboardingScreen {
     cursor_pos: usize,
     error_message: Option<String>,
     success: bool,
-    registering: bool,
     step: OnboardingStep,
     cursor_blink: bool,
     last_blink: Instant,
+    llama_found: bool,
+    install_rx: Option<mpsc::Receiver<Result<(), String>>>,
+    install_status: Option<String>,
 }
 
 #[derive(PartialEq)]
 enum OnboardingStep {
     Welcome,
     WalletInput,
-    Registering,
+    DependencyCheck,
+    Installing,
     Done,
 }
 
@@ -55,10 +59,12 @@ impl OnboardingScreen {
             cursor_pos: 0,
             error_message: None,
             success: false,
-            registering: false,
             step: OnboardingStep::Welcome,
             cursor_blink: true,
             last_blink: Instant::now(),
+            llama_found: find_llama_server(),
+            install_rx: None,
+            install_status: None,
         }
     }
 
@@ -87,7 +93,9 @@ impl OnboardingScreen {
                 }
             }
 
-            self.tick();
+            if let Some(result) = self.tick() {
+                return Ok(result);
+            }
         }
     }
 
@@ -147,13 +155,15 @@ impl OnboardingScreen {
                         }
                         let address = self.input.trim().to_string();
                         if compute_solana::is_valid_address(&address) {
-                            self.step = OnboardingStep::Registering;
-                            self.registering = true;
-                            // Registration happens in the main flow after we return
-                            // For now, mark as done immediately — the caller handles async registration
-                            self.step = OnboardingStep::Done;
-                            self.success = true;
-                            return Some(OnboardingResult::WalletSet(address));
+                            // Check if we need to install llama-server
+                            if self.llama_found {
+                                self.step = OnboardingStep::Done;
+                                self.success = true;
+                                return Some(OnboardingResult::WalletSet(address));
+                            } else {
+                                self.start_llama_install();
+                                self.step = OnboardingStep::Installing;
+                            }
                         } else {
                             self.error_message = Some(
                                 "Invalid Solana address. Must be 32-44 base58 characters.".into(),
@@ -164,7 +174,15 @@ impl OnboardingScreen {
                 }
                 None
             }
-            OnboardingStep::Registering => None,
+            OnboardingStep::DependencyCheck => {
+                // Install failed — Enter to retry
+                if matches!(code, KeyCode::Enter) {
+                    self.start_llama_install();
+                    self.step = OnboardingStep::Installing;
+                }
+                None
+            }
+            OnboardingStep::Installing => None,
             OnboardingStep::Done => {
                 if code == KeyCode::Enter {
                     let addr = self.input.trim().to_string();
@@ -176,7 +194,7 @@ impl OnboardingScreen {
         }
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self) -> Option<OnboardingResult> {
         self.globe.tick();
 
         // Cursor blink every 500ms
@@ -184,6 +202,29 @@ impl OnboardingScreen {
             self.cursor_blink = !self.cursor_blink;
             self.last_blink = Instant::now();
         }
+
+        // Poll install progress
+        if self.step == OnboardingStep::Installing
+            && let Some(ref rx) = self.install_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            match result {
+                Ok(()) => {
+                    self.llama_found = true;
+                    self.install_status = Some("Installed successfully".into());
+                    self.step = OnboardingStep::Done;
+                    self.success = true;
+                    let addr = self.input.trim().to_string();
+                    return Some(OnboardingResult::WalletSet(addr));
+                }
+                Err(e) => {
+                    self.install_status = Some(format!("Install failed: {e}"));
+                    self.step = OnboardingStep::DependencyCheck;
+                }
+            }
+        }
+
+        None
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -219,6 +260,28 @@ impl OnboardingScreen {
         }
     }
 
+    fn start_llama_install(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.install_rx = Some(rx);
+        self.install_status = Some("Installing llama.cpp via Homebrew...".into());
+
+        std::thread::spawn(move || {
+            let result = std::process::Command::new("brew")
+                .args(["install", "llama.cpp"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .status();
+
+            let _ = tx.send(match result {
+                Ok(status) if status.success() => Ok(()),
+                Ok(status) => Err(format!("brew exited with code {status}")),
+                Err(e) => Err(format!(
+                    "Homebrew not found: {e}. Install manually: https://github.com/ggerganov/llama.cpp"
+                )),
+            });
+        });
+    }
+
     fn draw_content(&self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -244,8 +307,11 @@ impl OnboardingScreen {
         // Main content based on step
         match self.step {
             OnboardingStep::Welcome => self.draw_welcome(frame, chunks[3]),
-            OnboardingStep::WalletInput | OnboardingStep::Registering => {
+            OnboardingStep::WalletInput => {
                 self.draw_wallet_input(frame, chunks[3]);
+            }
+            OnboardingStep::DependencyCheck | OnboardingStep::Installing => {
+                self.draw_dependency_check(frame, chunks[3]);
             }
             OnboardingStep::Done => self.draw_done(frame, chunks[3]),
         }
@@ -254,7 +320,8 @@ impl OnboardingScreen {
         let help_text = match self.step {
             OnboardingStep::Welcome => "  [Enter] Continue  [S] Skip  [Esc] Quit",
             OnboardingStep::WalletInput => "  [Enter] Submit  [Enter on empty] Skip  [Esc] Quit",
-            OnboardingStep::Registering => "  Registering...",
+            OnboardingStep::DependencyCheck => "  [Enter] Retry  [Esc] Quit",
+            OnboardingStep::Installing => "  Installing...",
             OnboardingStep::Done => "  [Enter] Continue",
         };
         let help = Paragraph::new(Line::from(Span::styled(
@@ -382,14 +449,61 @@ impl OnboardingScreen {
             )));
             frame.render_widget(hint, msg_area);
         }
+    }
 
-        if self.registering {
-            let reg_msg = Paragraph::new(Line::from(Span::styled(
-                "  Registering with network...",
+    fn draw_dependency_check(&self, frame: &mut Frame, area: Rect) {
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  DEPENDENCIES",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+        ];
+
+        if self.step == OnboardingStep::Installing {
+            let status = self.install_status.as_deref().unwrap_or("Installing...");
+            lines.push(Line::from(Span::styled(
+                format!("  {status}"),
                 Style::default().fg(Color::Yellow),
             )));
-            frame.render_widget(reg_msg, inner_chunks[3]);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  This may take a minute...",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            // Only shown after a failed install attempt
+            if let Some(ref status) = self.install_status {
+                lines.push(Line::from(Span::styled(
+                    format!("  {status}"),
+                    Style::default().fg(Color::Red),
+                )));
+                lines.push(Line::from(""));
+            }
+
+            if cfg!(target_os = "macos") {
+                lines.push(Line::from(Span::styled(
+                    "  Press [Enter] to retry, or install manually:",
+                    Style::default().fg(Color::Gray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  brew install llama.cpp",
+                    Style::default().fg(Color::White),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  Install manually and restart:",
+                    Style::default().fg(Color::Gray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  https://github.com/ggerganov/llama.cpp",
+                    Style::default().fg(Color::White),
+                )));
+            }
         }
+
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn draw_done(&self, frame: &mut Frame, area: Rect) {
@@ -407,4 +521,18 @@ impl OnboardingScreen {
         ];
         frame.render_widget(Paragraph::new(lines), area);
     }
+}
+
+/// Check if llama-server is available on the system.
+fn find_llama_server() -> bool {
+    // Check PATH
+    if let Ok(output) = std::process::Command::new("which").arg("llama-server").output()
+        && output.status.success()
+    {
+        return true;
+    }
+
+    // Check common locations
+    let candidates = ["/usr/local/bin/llama-server", "/opt/homebrew/bin/llama-server"];
+    candidates.iter().any(|p| std::path::Path::new(p).exists())
 }

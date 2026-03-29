@@ -819,6 +819,37 @@ fn cmd_doctor() -> Result<()> {
     );
 
     print_check("Docker available", hw.docker.available);
+
+    // Check for llama-server (required for inference)
+    let llama_server_found = std::process::Command::new("which")
+        .arg("llama-server")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+        || std::path::Path::new("/opt/homebrew/bin/llama-server").exists()
+        || std::path::Path::new("/usr/local/bin/llama-server").exists();
+    print_check("llama-server available", llama_server_found);
+
+    // Check for model files
+    let models_dir =
+        dirs::home_dir().map(|h| h.join(".compute").join("models")).unwrap_or_default();
+    let has_models = models_dir.exists()
+        && std::fs::read_dir(&models_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .any(|e| e.path().extension().map(|ext| ext == "gguf").unwrap_or(false))
+            })
+            .unwrap_or(false);
+    print_check("GGUF model files present", has_models);
+    if has_models && let Ok(entries) = std::fs::read_dir(&models_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            if entry.path().extension().map(|ext| ext == "gguf").unwrap_or(false) {
+                let size_mb = entry.metadata().map(|m| m.len() / (1024 * 1024)).unwrap_or(0);
+                println!("    {} ({size_mb}MB)", entry.file_name().to_string_lossy());
+            }
+        }
+    }
     println!();
 
     // === Configuration ===
@@ -892,6 +923,12 @@ fn cmd_doctor() -> Result<()> {
     }
     if !hw.docker.available {
         tips.push("Install Docker from https://docker.com/get-started");
+    }
+    if !llama_server_found {
+        tips.push("Install llama.cpp: brew install llama.cpp (macOS) or build from source");
+    }
+    if !has_models {
+        tips.push("Place .gguf model files in ~/.compute/models/");
     }
 
     if !tips.is_empty() {
