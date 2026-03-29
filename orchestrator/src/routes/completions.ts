@@ -52,36 +52,70 @@ completionsRouter.post("/chat/completions", async (c) => {
     }
   }
 
-  // Build the prompt from messages
-  const prompt = req.messages
-    ? req.messages.map((m) => `${m.role}: ${m.content}`).join("\n")
-    : req.prompt ?? "";
+  // Route the request to the first stage's llama-server.
+  // For single-node pipelines, this is a direct proxy.
+  // For multi-node, this would go through the QUIC pipeline stages.
+  const firstStage = pipeline.stages[0];
+  const nodeAddr = firstStage.listen_addr;
 
-  // TODO: Actually route the request through the pipeline stages.
-  // For now, return a placeholder response showing the pipeline is ready.
-  const response: CompletionResponse = {
-    id: `cmpl-${Date.now().toString(36)}`,
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model: req.model,
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: "assistant",
-          content: `[Pipeline ${pipeline.id} active with ${pipeline.stages.length} stages serving ${model.name}. Inference routing not yet implemented.]`,
+  // Resolve the inference server address.
+  // In production, each node runs llama-server and reports its address.
+  // For now, use localhost:8090 as the default inference port.
+  const inferenceUrl = `http://127.0.0.1:8090/v1/chat/completions`;
+
+  try {
+    const inferenceResp = await fetch(inferenceUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: req.model,
+        messages: req.messages,
+        prompt: req.prompt,
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        stream: req.stream,
+      }),
+    });
+
+    if (!inferenceResp.ok) {
+      const text = await inferenceResp.text();
+      return c.json(
+        {
+          error: {
+            message: `Inference failed: ${text}`,
+            type: "server_error",
+          },
         },
-        finish_reason: "stop",
-      },
-    ],
-    usage: {
-      prompt_tokens: prompt.split(/\s+/).length,
-      completion_tokens: 0,
-      total_tokens: prompt.split(/\s+/).length,
-    },
-  };
+        502
+      );
+    }
 
-  return c.json(response);
+    const result = await inferenceResp.json();
+
+    // Record rewards for this request
+    const { recordRequestReward } = await import("../services/rewards.js");
+    const usage = (result as any).usage;
+    if (usage) {
+      await recordRequestReward(
+        pipeline,
+        usage.completion_tokens ?? 0,
+        usage.prompt_tokens ?? 0
+      ).catch(console.error);
+    }
+
+    return c.json(result);
+  } catch (e: any) {
+    return c.json(
+      {
+        error: {
+          message: `Failed to reach inference node: ${e.message}`,
+          type: "server_error",
+        },
+      },
+      502
+    );
+  }
 });
 
 // List available models (OpenAI-compatible)

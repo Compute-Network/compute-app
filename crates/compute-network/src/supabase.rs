@@ -89,6 +89,17 @@ pub struct NodeListEntry {
     pub uptime_seconds: Option<i64>,
 }
 
+/// Info about own node (for checking pipeline assignments).
+#[derive(Debug, Clone, Deserialize)]
+pub struct OwnNodeInfo {
+    pub id: String,
+    pub pipeline_id: Option<String>,
+    pub pipeline_stage: Option<i32>,
+    pub pipeline_total_stages: Option<i32>,
+    pub model_name: Option<String>,
+    pub pending_compute: Option<f64>,
+}
+
 /// Minimal node info for discovery/visualization.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OnlineNode {
@@ -294,6 +305,25 @@ impl SupabaseClient {
 
         let nodes: Vec<OnlineNode> = resp.json().await?;
         Ok(nodes)
+    }
+
+    /// Get this node's current record (to check for pipeline assignment).
+    pub async fn get_own_node(&self, wallet_address: &str) -> Result<Option<OwnNodeInfo>> {
+        let resp = self
+            .client
+            .get(format!(
+                "{}/nodes?select=id,pipeline_id,pipeline_stage,pipeline_total_stages,model_name,pending_compute&wallet_address=eq.{}&limit=1",
+                self.rest_url, wallet_address
+            ))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to fetch node: {}", resp.status());
+        }
+
+        let rows: Vec<OwnNodeInfo> = resp.json().await?;
+        Ok(rows.into_iter().next())
     }
 
     /// Check if Supabase is reachable.

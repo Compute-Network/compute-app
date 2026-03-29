@@ -8,6 +8,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::hardware;
 use crate::idle::{IdleDetector, IdleState};
+use crate::inference::manager::{InferenceManager, InferenceStatus};
 use crate::metrics::{Earnings, NetworkStats, PipelineStatus};
 
 /// Shared state between the daemon runtime and the TUI.
@@ -21,6 +22,7 @@ pub struct DaemonState {
     pub pipeline: PipelineStatus,
     pub network: NetworkStats,
     pub uptime_secs: u64,
+    pub inference_status: String,
 }
 
 impl Default for DaemonState {
@@ -31,9 +33,10 @@ impl Default for DaemonState {
             hardware: hardware::detect(),
             live_metrics: hardware::LiveMetrics::default(),
             earnings: Earnings::mock(),
-            pipeline: PipelineStatus::mock(),
+            pipeline: PipelineStatus::default(),
             network: NetworkStats::mock(),
             uptime_secs: 0,
+            inference_status: "idle".into(),
         }
     }
 }
@@ -67,6 +70,7 @@ impl DaemonRuntime {
         info!("Daemon starting...");
 
         let mut idle_detector = IdleDetector::new(self.config.node.idle_threshold_minutes);
+        let mut inference_mgr = InferenceManager::new();
         let mut sys = sysinfo::System::new_all();
         let start_time = std::time::Instant::now();
 
@@ -87,6 +91,7 @@ impl DaemonRuntime {
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
         let mut metrics_interval = tokio::time::interval(Duration::from_secs(5));
         let mut idle_interval = tokio::time::interval(Duration::from_secs(2));
+        let mut assignment_interval = tokio::time::interval(Duration::from_secs(10));
 
         loop {
             if self.shutdown.load(Ordering::SeqCst) {
@@ -96,14 +101,20 @@ impl DaemonRuntime {
 
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
-                    self.heartbeat().await;
+                    self.heartbeat(&inference_mgr).await;
+                }
+                _ = assignment_interval.tick() => {
+                    // Check for pipeline assignment from orchestrator
+                    self.check_assignment(&mut inference_mgr).await;
                 }
                 _ = metrics_interval.tick() => {
                     let metrics = hardware::collect_live_metrics(&mut sys);
                     let uptime = start_time.elapsed().as_secs();
+                    let inf_status = inference_mgr.status().to_string();
                     self.update_state(|state| {
                         state.live_metrics = metrics;
                         state.uptime_secs = uptime;
+                        state.inference_status = inf_status;
                     });
                 }
                 _ = idle_interval.tick() => {
@@ -114,7 +125,6 @@ impl DaemonRuntime {
 
                     match idle_state {
                         IdleState::HeavyUse => {
-                            // Would pause workloads here
                             tracing::debug!("Heavy use detected, workloads paused");
                         }
                         IdleState::Idle => {
@@ -134,6 +144,9 @@ impl DaemonRuntime {
             state.running = false;
         });
 
+        // Stop inference if running
+        drop(inference_mgr);
+
         // Set node offline in Supabase
         let wallet = &self.config.wallet.public_address;
         if !wallet.is_empty() {
@@ -147,12 +160,59 @@ impl DaemonRuntime {
         Ok(())
     }
 
-    async fn heartbeat(&self) {
+    /// Check if this node has been assigned to a pipeline.
+    async fn check_assignment(&self, inference_mgr: &mut InferenceManager) {
+        let wallet = &self.config.wallet.public_address;
+        if wallet.is_empty() {
+            return;
+        }
+
+        let client = compute_network::supabase::SupabaseClient::new();
+        match client.get_own_node(wallet).await {
+            Ok(Some(node)) => {
+                // Update pipeline status in TUI
+                let has_pipeline = node.pipeline_id.is_some();
+                let pending = node.pending_compute.unwrap_or(0.0);
+
+                self.update_state(|state| {
+                    if has_pipeline {
+                        state.pipeline.active = true;
+                        state.pipeline.stage = node.pipeline_stage.map(|s| s as u32);
+                        state.pipeline.total_stages = node.pipeline_total_stages.map(|s| s as u32);
+                        state.pipeline.model = node.model_name.clone();
+                    } else {
+                        state.pipeline.active = false;
+                        state.pipeline.stage = None;
+                        state.pipeline.total_stages = None;
+                        state.pipeline.model = None;
+                    }
+                    state.earnings.pending = pending;
+                });
+
+                // Tell inference manager about the assignment
+                inference_mgr.check_assignment(
+                    node.pipeline_id.as_deref(),
+                    node.model_name.as_deref(),
+                );
+            }
+            Ok(None) => {
+                tracing::debug!("Node not found in Supabase");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to check assignment: {e}");
+            }
+        }
+    }
+
+    async fn heartbeat(&self, inference_mgr: &InferenceManager) {
         let state = self.state_rx.borrow().clone();
+        let inf_status = inference_mgr.status();
+
         tracing::debug!(
-            "Heartbeat | idle={} | cpu={:.0}% | uptime={}s",
+            "Heartbeat | idle={} | cpu={:.0}% | inference={} | uptime={}s",
             state.idle_state,
             state.live_metrics.cpu_usage,
+            inf_status,
             state.uptime_secs
         );
 
@@ -160,6 +220,14 @@ impl DaemonRuntime {
         let wallet = &self.config.wallet.public_address;
         if !wallet.is_empty() {
             let idle_str = format!("{}", state.idle_state);
+
+            let (pipeline_id, pipeline_stage) = match inf_status {
+                InferenceStatus::Running { pipeline_id, .. } => {
+                    (Some(pipeline_id.clone()), state.pipeline.stage.map(|s| s as i32))
+                }
+                _ => (None, None),
+            };
+
             let update = compute_network::supabase::HeartbeatUpdate {
                 status: "online".into(),
                 cpu_usage_percent: Some(state.live_metrics.cpu_usage as f64),
@@ -168,8 +236,8 @@ impl DaemonRuntime {
                 memory_used_mb: Some((state.live_metrics.memory_used_gb * 1024.0) as i64),
                 idle_state: Some(idle_str),
                 uptime_seconds: Some(state.uptime_secs as i64),
-                pipeline_id: None,
-                pipeline_stage: None,
+                pipeline_id,
+                pipeline_stage,
                 requests_served: None,
                 tokens_per_second: None,
                 last_heartbeat: chrono::Utc::now().to_rfc3339(),
