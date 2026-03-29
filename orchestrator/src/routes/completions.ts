@@ -93,15 +93,39 @@ completionsRouter.post("/chat/completions", async (c) => {
 
     const result = await inferenceResp.json();
 
-    // Record rewards for this request
+    // Record rewards and update node throughput
     const { recordRequestReward } = await import("../services/rewards.js");
     const usage = (result as any).usage;
+    const timings = (result as any).timings;
     if (usage) {
       await recordRequestReward(
         pipeline,
         usage.completion_tokens ?? 0,
         usage.prompt_tokens ?? 0
       ).catch(console.error);
+    }
+
+    // Write tokens_per_second and requests_served to node in Supabase
+    if (timings) {
+      const tps = timings.predicted_per_second ?? 0;
+      const { supabase } = await import("../services/db.js");
+      try {
+        const current = await supabase
+          .from("nodes")
+          .select("requests_served")
+          .eq("id", firstStage.node_id)
+          .single();
+
+        await supabase
+          .from("nodes")
+          .update({
+            tokens_per_second: Math.round(tps * 10) / 10,
+            requests_served: (current.data?.requests_served ?? 0) + 1,
+          })
+          .eq("id", firstStage.node_id);
+      } catch (e) {
+        console.error("Failed to update node metrics:", e);
+      }
     }
 
     return c.json(result);

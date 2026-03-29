@@ -142,15 +142,11 @@ impl Dashboard {
             self.live_metrics = state.live_metrics;
             self.earnings.pending = state.earnings.pending;
 
-            // Update throughput from pipeline tokens/sec
             if self.throughput_history.len() > 60 {
                 self.throughput_history.remove(0);
             }
-            let tps = if state.pipeline.active {
-                state.pipeline.tokens_per_sec as u64
-            } else {
-                0
-            };
+            // Use tokens_per_sec from daemon state (updated by inference manager)
+            let tps = state.pipeline.tokens_per_sec as u64;
             self.throughput_history.push(tps);
 
             self.pipeline = state.pipeline;
@@ -167,7 +163,7 @@ impl Dashboard {
             }
             let last = *self.throughput_history.last().unwrap_or(&40);
             let jitter = (rand_simple() * 10.0 - 5.0) as i64;
-            let new_val = (last as i64 + jitter).clamp(10, 80) as u64;
+            let new_val = (last as i64 + jitter).clamp(0, 80) as u64;
             self.throughput_history.push(new_val);
         }
 
@@ -299,8 +295,13 @@ impl Dashboard {
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let w = area.width as usize;
-        let status_color = if self.pipeline.active { Color::Green } else { Color::Yellow };
-        let status_text = if self.pipeline.active { "ACTIVE" } else { "PAUSED" };
+        let (status_color, status_text) = if self.pipeline.active && self.pipeline.tokens_per_sec > 0.0 {
+            (Color::Green, "ACTIVE")
+        } else if self.pipeline.active {
+            (Color::Green, "ONLINE")
+        } else {
+            (Color::DarkGray, "IDLE")
+        };
 
         let tab_style = |tab: Tab| {
             if tab == self.active_tab {
@@ -562,21 +563,30 @@ impl Dashboard {
         )));
         frame.render_widget(label, chunks[0]);
 
+        // Ensure a visible baseline — minimum value is 1, max scales to data
+        let display_data: Vec<u64> = self
+            .throughput_history
+            .iter()
+            .map(|&v| if v == 0 { 1 } else { v })
+            .collect();
+
+        let data_max = display_data.iter().copied().max().unwrap_or(1).max(8);
+
         let sparkline = Sparkline::default()
-            .data(&self.throughput_history)
-            .max(100)
+            .data(&display_data)
+            .max(data_max)
             .style(Style::default().fg(Color::White));
 
-        // Add left padding to sparkline
         let sparkline_area =
             Rect { x: chunks[2].x + 2, width: chunks[2].width.saturating_sub(4), ..chunks[2] };
         frame.render_widget(sparkline, sparkline_area);
 
+        // Show actual value (0 when idle, not 1)
         let current_tps = self.throughput_history.last().unwrap_or(&0);
         let tps_label = Paragraph::new(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!("{current_tps:.1} tok/s"),
+                format!("{current_tps} tok/s"),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             ),
         ]))
@@ -762,14 +772,7 @@ fn progress_bar(value: f64, max: f64, width: usize) -> String {
 }
 
 fn generate_mock_throughput() -> Vec<u64> {
-    let mut data = Vec::with_capacity(40);
-    let mut val = 40u64;
-    for i in 0..40 {
-        let jitter = ((i as f64 * 0.5).sin() * 15.0) as i64;
-        val = (val as i64 + jitter).clamp(10, 80) as u64;
-        data.push(val);
-    }
-    data
+    vec![0; 40] // Start with zeros — sparkline renders 1-block baseline
 }
 
 /// Simple deterministic pseudo-random for throughput jitter. No external dep needed.

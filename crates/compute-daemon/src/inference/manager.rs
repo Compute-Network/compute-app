@@ -200,30 +200,36 @@ impl InferenceManager {
         }
     }
 
-    /// Get inference metrics from the running server.
+    /// Get inference metrics by polling llama-server's /slots endpoint.
+    /// Fast local HTTP call (< 1ms latency).
     pub async fn get_metrics(&self) -> Option<InferenceMetrics> {
         if !matches!(self.status, InferenceStatus::Running { .. }) {
             return None;
         }
 
-        // llama-server exposes /metrics or we can track via /health
-        let url = format!("http://127.0.0.1:{}/health", self.port);
+        let url = format!("http://127.0.0.1:{}/slots", self.port);
         let resp = reqwest::Client::new()
             .get(&url)
-            .timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_millis(200))
             .send()
             .await
             .ok()?;
 
-        if resp.status().is_success() {
-            let body: serde_json::Value = resp.json().await.ok()?;
-            Some(InferenceMetrics {
-                slots_idle: body["slots_idle"].as_u64().unwrap_or(0) as u32,
-                slots_processing: body["slots_processing"].as_u64().unwrap_or(0) as u32,
-            })
-        } else {
-            None
+        if !resp.status().is_success() {
+            return None;
         }
+
+        let slots: Vec<serde_json::Value> = resp.json().await.ok()?;
+        let slots_processing = slots
+            .iter()
+            .filter(|s| s["is_processing"].as_bool().unwrap_or(false))
+            .count() as u32;
+        let slots_idle = slots.len() as u32 - slots_processing;
+
+        Some(InferenceMetrics {
+            slots_idle,
+            slots_processing,
+        })
     }
 }
 

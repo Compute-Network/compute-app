@@ -98,6 +98,8 @@ pub struct OwnNodeInfo {
     pub pipeline_total_stages: Option<i32>,
     pub model_name: Option<String>,
     pub pending_compute: Option<f64>,
+    pub tokens_per_second: Option<f64>,
+    pub requests_served: Option<i64>,
 }
 
 /// Minimal node info for discovery/visualization.
@@ -312,7 +314,7 @@ impl SupabaseClient {
         let resp = self
             .client
             .get(format!(
-                "{}/nodes?select=id,pipeline_id,pipeline_stage,pipeline_total_stages,model_name,pending_compute&wallet_address=eq.{}&limit=1",
+                "{}/nodes?select=id,pipeline_id,pipeline_stage,pipeline_total_stages,model_name,pending_compute,tokens_per_second,requests_served&wallet_address=eq.{}&limit=1",
                 self.rest_url, wallet_address
             ))
             .send()
