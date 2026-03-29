@@ -30,6 +30,8 @@ pub struct Dashboard {
     pipeline: PipelineStatus,
     network: NetworkStats,
     throughput_history: Vec<u64>,
+    smoothed_tps: f64,
+    last_throughput_push: Instant,
     sys: sysinfo::System,
     live_metrics: LiveMetrics,
     last_metrics_update: Instant,
@@ -72,7 +74,9 @@ impl Dashboard {
             earnings: Earnings::mock(),
             pipeline: PipelineStatus::mock(),
             network,
-            throughput_history: generate_mock_throughput(),
+            throughput_history: vec![0; 60],
+            smoothed_tps: 0.0,
+            last_throughput_push: Instant::now(),
             sys: sysinfo::System::new_all(),
             live_metrics: LiveMetrics::default(),
             last_metrics_update: Instant::now(),
@@ -139,12 +143,25 @@ impl Dashboard {
             self.live_metrics = state.live_metrics;
             self.earnings.pending = state.earnings.pending;
 
-            if self.throughput_history.len() > 60 {
-                self.throughput_history.remove(0);
+            // Smooth toward target
+            let target = state.pipeline.tokens_per_sec;
+            if target > self.smoothed_tps {
+                self.smoothed_tps += (target - self.smoothed_tps) * 0.3;
+            } else {
+                self.smoothed_tps += (target - self.smoothed_tps) * 0.15;
             }
-            // Use tokens_per_sec from daemon state (updated by inference manager)
-            let tps = state.pipeline.tokens_per_sec as u64;
-            self.throughput_history.push(tps);
+            if self.smoothed_tps < 1.0 {
+                self.smoothed_tps = 0.0;
+            }
+
+            // Push every 200ms (60 entries = 12 seconds visible)
+            if self.last_throughput_push.elapsed() >= Duration::from_millis(200) {
+                if self.throughput_history.len() >= 60 {
+                    self.throughput_history.remove(0);
+                }
+                self.throughput_history.push(self.smoothed_tps as u64);
+                self.last_throughput_push = Instant::now();
+            }
 
             self.pipeline = state.pipeline;
         } else {
@@ -154,14 +171,14 @@ impl Dashboard {
                 self.last_metrics_update = Instant::now();
             }
 
-            // Simulated throughput
-            if self.throughput_history.len() > 60 {
-                self.throughput_history.remove(0);
+            // Push one value every 500ms
+            if self.last_throughput_push.elapsed() >= Duration::from_millis(500) {
+                if self.throughput_history.len() >= 60 {
+                    self.throughput_history.remove(0);
+                }
+                self.throughput_history.push(0);
+                self.last_throughput_push = Instant::now();
             }
-            let last = *self.throughput_history.last().unwrap_or(&40);
-            let jitter = (rand_simple() * 10.0 - 5.0) as i64;
-            let new_val = (last as i64 + jitter).clamp(0, 80) as u64;
-            self.throughput_history.push(new_val);
         }
 
         // Refresh network stats and nodes from Supabase every 60 seconds
@@ -561,15 +578,12 @@ impl Dashboard {
         )));
         frame.render_widget(label, chunks[0]);
 
-        // Ensure a visible baseline — minimum value is 1, max scales to data
-        let display_data: Vec<u64> =
-            self.throughput_history.iter().map(|&v| if v == 0 { 1 } else { v }).collect();
-
-        let data_max = display_data.iter().copied().max().unwrap_or(1).max(8);
+        // Fixed scale: max 200, baseline offset 25 (always 1 visible block)
+        let display_data: Vec<u64> = self.throughput_history.iter().map(|&v| v + 25).collect();
 
         let sparkline = Sparkline::default()
             .data(&display_data)
-            .max(data_max)
+            .max(200)
             .style(Style::default().fg(Color::White));
 
         let sparkline_area =
@@ -764,18 +778,6 @@ fn progress_bar(value: f64, max: f64, width: usize) -> String {
     let filled = (ratio * width as f64).round() as usize;
     let empty = width - filled;
     format!("{}{}", "▓".repeat(filled), "░".repeat(empty))
-}
-
-fn generate_mock_throughput() -> Vec<u64> {
-    vec![0; 40] // Start with zeros — sparkline renders 1-block baseline
-}
-
-/// Simple deterministic pseudo-random for throughput jitter. No external dep needed.
-fn rand_simple() -> f64 {
-    use std::time::SystemTime;
-    let nanos =
-        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().subsec_nanos();
-    (nanos % 1000) as f64 / 1000.0
 }
 
 /// Open the claim page in the user's default browser.
