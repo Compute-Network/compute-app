@@ -20,23 +20,17 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: compute-linux-x86_64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: compute-linux-aarch64
             cross: true
           - target: x86_64-apple-darwin
             os: macos-13
-            artifact: compute-darwin-x86_64
           - target: aarch64-apple-darwin
             os: macos-14
-            artifact: compute-darwin-aarch64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: compute-windows-x86_64
           - target: aarch64-pc-windows-msvc
             os: windows-latest
-            artifact: compute-windows-aarch64
 
     steps:
       - uses: actions/checkout@v4
@@ -63,28 +57,30 @@ jobs:
         if: "!matrix.cross"
         run: cargo build --release --target ${{ matrix.target }} -p compute-cli
 
-      # Package - Unix
+      # Package - Unix: bare binary named compute-{target}
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }}.tar.gz compute
-          cd ../../..
+          cp target/${{ matrix.target }}/release/compute compute-${{ matrix.target }}
+          tar czf compute-${{ matrix.target }}.tar.gz compute-${{ matrix.target }}
+          shasum -a 256 compute-${{ matrix.target }}.tar.gz > compute-${{ matrix.target }}.tar.gz.sha256
 
       # Package - Windows
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/compute.exe" -DestinationPath "${{ matrix.artifact }}.zip"
+          Copy-Item "target/${{ matrix.target }}/release/compute.exe" "compute-${{ matrix.target }}.exe"
+          Compress-Archive -Path "compute-${{ matrix.target }}.exe" -DestinationPath "compute-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: compute-${{ matrix.target }}
           path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.zip
+            compute-${{ matrix.target }}.tar.gz
+            compute-${{ matrix.target }}.tar.gz.sha256
+            compute-${{ matrix.target }}.zip
 
   release:
     name: Create Release
@@ -104,4 +100,5 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/**/*.tar.gz
+            artifacts/**/*.tar.gz.sha256
             artifacts/**/*.zip

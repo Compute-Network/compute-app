@@ -61,7 +61,7 @@ impl Default for Config {
             },
             wallet: WalletConfig { public_address: String::new(), node_id: String::new() },
             network: NetworkConfig {
-                orchestrator_url: "https://compute-orchestrator-production-7e29.up.railway.app"
+                orchestrator_url: "https://api.computenetwork.sh"
                     .into(),
                 region: "auto".into(),
             },
@@ -218,7 +218,7 @@ mod tests {
         assert!(config.wallet.public_address.is_empty());
         assert_eq!(
             config.network.orchestrator_url,
-            "https://compute-orchestrator-production-7e29.up.railway.app"
+            "https://api.computenetwork.sh"
         );
         assert_eq!(config.network.region, "auto");
         assert_eq!(config.logging.level, "info");
