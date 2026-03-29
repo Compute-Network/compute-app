@@ -202,6 +202,9 @@ impl InferenceManager {
 
     /// Get inference metrics by polling llama-server's /slots endpoint.
     /// Fast local HTTP call (< 1ms latency).
+    ///
+    /// Note: /slots can return malformed JSON when prompts contain control chars,
+    /// so we parse with string matching rather than JSON deserialization.
     pub async fn get_metrics(&self) -> Option<InferenceMetrics> {
         if !matches!(self.status, InferenceStatus::Running { .. }) {
             return None;
@@ -219,12 +222,11 @@ impl InferenceManager {
             return None;
         }
 
-        let slots: Vec<serde_json::Value> = resp.json().await.ok()?;
-        let slots_processing = slots
-            .iter()
-            .filter(|s| s["is_processing"].as_bool().unwrap_or(false))
-            .count() as u32;
-        let slots_idle = slots.len() as u32 - slots_processing;
+        // Use string matching — JSON may be malformed when prompts contain control chars
+        let body = resp.text().await.ok()?;
+        let slots_processing = body.matches("\"is_processing\":true").count() as u32;
+        let slots_total = body.matches("\"is_processing\":").count() as u32;
+        let slots_idle = slots_total.saturating_sub(slots_processing);
 
         Some(InferenceMetrics {
             slots_idle,
