@@ -241,10 +241,15 @@ export async function terminatePipeline(pipelineId: string): Promise<void> {
  */
 export async function initScheduler(): Promise<void> {
   try {
-    // Clean up any orphaned pipeline assignments on nodes
-    // (from previous server crashes or restarts)
-    await releasePipeline("__cleanup__").catch(() => {});
     const { supabase } = await import("./db.js");
+
+    // Terminate all stale pipelines and clear node assignments
+    // On restart, we have no in-memory state, so all DB pipelines are stale
+    await supabase
+      .from("pipelines")
+      .update({ status: "terminated", terminated_at: new Date().toISOString() })
+      .in("status", ["forming", "active"]);
+
     await supabase
       .from("nodes")
       .update({
@@ -254,16 +259,8 @@ export async function initScheduler(): Promise<void> {
         model_name: null,
       })
       .not("pipeline_id", "is", null);
-    console.log("Cleaned up orphaned pipeline assignments");
 
-    // Load active pipelines from DB
-    const pipelines = await loadActivePipelines();
-    for (const p of pipelines) {
-      activePipelines.set(p.id, p);
-    }
-    if (pipelines.length > 0) {
-      console.log(`Loaded ${pipelines.length} active pipelines from database`);
-    }
+    console.log("Cleaned up stale pipelines and node assignments");
   } catch (e) {
     console.error("Failed to init scheduler:", e);
   }
