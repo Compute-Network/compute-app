@@ -395,18 +395,41 @@ fn cmd_wallet(action: Option<WalletAction>) -> Result<()> {
 }
 
 fn cmd_earnings() -> Result<()> {
-    let e = compute_daemon::metrics::Earnings::mock();
+    let config = Config::load()?;
+    let wallet = &config.wallet.public_address;
+
     println!();
     println!("  EARNINGS");
     println!("  ────────────────────────────────");
-    println!("  Today       {:.1} $COMPUTE  ≈ ${:.2}", e.today, e.today * e.usd_rate);
-    println!("  This Week   {:.1} $COMPUTE  ≈ ${:.2}", e.this_week, e.this_week * e.usd_rate);
-    println!("  This Month  {:.1} $COMPUTE  ≈ ${:.2}", e.this_month, e.this_month * e.usd_rate);
-    println!("  All Time    {:.0} $COMPUTE", e.all_time);
-    println!("  Pending     {:.1} $COMPUTE", e.pending);
-    println!();
-    println!("  Claim at: https://computenetwork.sh/dashboard/claim");
-    println!("  (Mock data — connect to network for real earnings)");
+
+    if wallet.is_empty() {
+        println!("  No wallet configured. Run `compute init` first.");
+        println!();
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let node = rt.block_on(async {
+        let client = SupabaseClient::new();
+        client.get_own_node(wallet).await
+    });
+
+    match node {
+        Ok(Some(n)) => {
+            let pending = n.pending_compute.unwrap_or(0.0);
+            let earned = n.total_earned_compute.unwrap_or(0.0);
+            println!("  Earned      {:.2} $COMPUTE", earned);
+            println!("  Pending     {:.2} $COMPUTE", pending);
+            println!();
+            println!("  Claim at: https://computenetwork.sh/dashboard/claim");
+        }
+        Ok(None) => {
+            println!("  Node not registered. Start the daemon to register.");
+        }
+        Err(e) => {
+            println!("  Could not fetch earnings: {e}");
+        }
+    }
     println!();
     Ok(())
 }
@@ -518,28 +541,49 @@ fn cmd_hardware() -> Result<()> {
 }
 
 fn cmd_pipeline() -> Result<()> {
-    if !daemon::is_running() {
-        println!("Daemon is not running. Start with `compute start`");
-        return Ok(());
-    }
+    let config = Config::load()?;
+    let wallet = &config.wallet.public_address;
 
-    let p = compute_daemon::metrics::PipelineStatus::mock();
     println!();
     println!("  PIPELINE STATUS");
     println!("  ────────────────────────────────");
-    if p.active {
-        println!("  Status:   ● Active");
-        if let (Some(s), Some(t)) = (p.stage, p.total_stages) {
-            println!("  Stage:    {s} / {t}");
+
+    if wallet.is_empty() {
+        println!("  No wallet configured. Run `compute init` first.");
+        println!();
+        return Ok(());
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let node = rt.block_on(async {
+        let client = SupabaseClient::new();
+        client.get_own_node(wallet).await
+    });
+
+    match node {
+        Ok(Some(n)) => {
+            if n.pipeline_id.is_some() {
+                println!("  Status:   ● Active");
+                if let (Some(s), Some(t)) = (n.pipeline_stage, n.pipeline_total_stages) {
+                    println!("  Stage:    {} / {}", s, t);
+                }
+                if let Some(ref model) = n.model_name {
+                    println!("  Model:    {model}");
+                }
+                println!("  Served:   {} requests", n.requests_served.unwrap_or(0));
+                if let Some(tps) = n.tokens_per_second {
+                    println!("  Speed:    {:.1} tok/s", tps);
+                }
+            } else {
+                println!("  Status:   ○ Waiting for assignment");
+            }
         }
-        if let Some(ref model) = p.model {
-            println!("  Model:    {model}");
+        Ok(None) => {
+            println!("  Node not registered. Start the daemon to register.");
         }
-        println!("  Served:   {} requests", p.requests_served);
-        println!("  Latency:  {:.0}ms avg", p.avg_latency_ms);
-        println!("  Speed:    {:.1} tok/s", p.tokens_per_sec);
-    } else {
-        println!("  Status:   ○ Waiting for assignment");
+        Err(e) => {
+            println!("  Could not fetch status: {e}");
+        }
     }
     println!();
 

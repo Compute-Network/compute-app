@@ -61,8 +61,7 @@ impl Default for Config {
             },
             wallet: WalletConfig { public_address: String::new(), node_id: String::new() },
             network: NetworkConfig {
-                orchestrator_url: "https://api.computenetwork.sh"
-                    .into(),
+                orchestrator_url: "https://api.computenetwork.sh".into(),
                 region: "auto".into(),
             },
             docker: DockerConfig {
@@ -216,10 +215,7 @@ mod tests {
         assert!(config.node.pause_on_battery);
         assert!(config.node.pause_on_fullscreen);
         assert!(config.wallet.public_address.is_empty());
-        assert_eq!(
-            config.network.orchestrator_url,
-            "https://api.computenetwork.sh"
-        );
+        assert_eq!(config.network.orchestrator_url, "https://api.computenetwork.sh");
         assert_eq!(config.network.region, "auto");
         assert_eq!(config.logging.level, "info");
     }

@@ -23,6 +23,46 @@ enum Tab {
     Config,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ConfigItemKind {
+    Text,
+    Toggle,
+    Choice, // cycles through options
+}
+
+struct ConfigItem {
+    label: &'static str,
+    key: &'static str,
+    kind: ConfigItemKind,
+}
+
+const CONFIG_ITEMS: &[ConfigItem] = &[
+    ConfigItem {
+        label: "Wallet Address",
+        key: "wallet.public_address",
+        kind: ConfigItemKind::Text,
+    },
+    ConfigItem { label: "Node Name", key: "node.name", kind: ConfigItemKind::Text },
+    ConfigItem { label: "Usage Priority", key: "node.max_gpu_usage", kind: ConfigItemKind::Choice },
+    ConfigItem {
+        label: "Pause on Battery",
+        key: "node.pause_on_battery",
+        kind: ConfigItemKind::Toggle,
+    },
+    ConfigItem {
+        label: "Pause on Fullscreen",
+        key: "node.pause_on_fullscreen",
+        kind: ConfigItemKind::Toggle,
+    },
+    ConfigItem {
+        label: "Auto-start on Login",
+        key: "service.autostart",
+        kind: ConfigItemKind::Toggle,
+    },
+    ConfigItem { label: "Region", key: "network.region", kind: ConfigItemKind::Text },
+    ConfigItem { label: "Log Level", key: "logging.level", kind: ConfigItemKind::Choice },
+];
+
 pub struct Dashboard {
     globe: Globe,
     hardware: HardwareInfo,
@@ -39,6 +79,12 @@ pub struct Dashboard {
     uptime_start: Instant,
     active_tab: Tab,
     log_lines: Vec<String>,
+    log_scroll: usize,
+    last_log_update: Instant,
+    config_selected: usize,
+    config_editing: bool,
+    config_edit_buffer: String,
+    config_confirm: Option<String>, // "Are you sure?" for wallet changes
     daemon_state_rx: Option<tokio::sync::watch::Receiver<compute_daemon::runtime::DaemonState>>,
 }
 
@@ -71,8 +117,8 @@ impl Dashboard {
         Self {
             globe,
             hardware,
-            earnings: Earnings::mock(),
-            pipeline: PipelineStatus::mock(),
+            earnings: Earnings::default(),
+            pipeline: PipelineStatus::default(),
             network,
             throughput_history: vec![0; 60],
             smoothed_tps: 0.0,
@@ -84,6 +130,12 @@ impl Dashboard {
             uptime_start: Instant::now(),
             active_tab: Tab::Overview,
             log_lines,
+            log_scroll: 0,
+            last_log_update: Instant::now(),
+            config_selected: 0,
+            config_editing: false,
+            config_edit_buffer: String::new(),
+            config_confirm: None,
             daemon_state_rx: None,
         }
     }
@@ -100,6 +152,25 @@ impl Dashboard {
                 && key.kind == KeyEventKind::Press
             {
                 match key.code {
+                    // Config editing mode intercepts all keys
+                    _ if self.config_editing && self.active_tab == Tab::Config => {
+                        self.handle_config_key(key.code);
+                        continue;
+                    }
+                    // Confirmation dialog
+                    _ if self.config_confirm.is_some() && self.active_tab == Tab::Config => {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                if let Some(new_wallet) = self.config_confirm.take() {
+                                    self.apply_wallet_change(&new_wallet);
+                                }
+                            }
+                            _ => {
+                                self.config_confirm = None;
+                            }
+                        }
+                        continue;
+                    }
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
@@ -116,6 +187,30 @@ impl Dashboard {
                     KeyCode::Char('c') => {
                         open_claim_page();
                     }
+                    KeyCode::Up if self.active_tab == Tab::Logs => {
+                        if self.log_scroll > 0 {
+                            self.log_scroll -= 1;
+                        }
+                    }
+                    KeyCode::Down if self.active_tab == Tab::Logs => {
+                        self.log_scroll += 1;
+                    }
+                    KeyCode::End if self.active_tab == Tab::Logs => {
+                        self.log_scroll = 0; // 0 = follow tail
+                    }
+                    KeyCode::Up if self.active_tab == Tab::Config => {
+                        if self.config_selected > 0 {
+                            self.config_selected -= 1;
+                        }
+                    }
+                    KeyCode::Down if self.active_tab == Tab::Config => {
+                        if self.config_selected < CONFIG_ITEMS.len() - 1 {
+                            self.config_selected += 1;
+                        }
+                    }
+                    KeyCode::Enter if self.active_tab == Tab::Config => {
+                        self.start_config_edit();
+                    }
                     KeyCode::Tab => {
                         self.active_tab = match self.active_tab {
                             Tab::Overview => Tab::Logs,
@@ -123,7 +218,8 @@ impl Dashboard {
                             Tab::Config => Tab::Overview,
                         };
                         if self.active_tab == Tab::Logs {
-                            self.log_lines = load_recent_logs(100);
+                            self.log_lines = load_recent_logs(500);
+                            self.log_scroll = 0;
                         }
                     }
                     _ => {}
@@ -179,6 +275,12 @@ impl Dashboard {
                 self.throughput_history.push(0);
                 self.last_throughput_push = Instant::now();
             }
+        }
+
+        // Refresh logs every 2 seconds when on logs tab
+        if self.active_tab == Tab::Logs && self.last_log_update.elapsed() > Duration::from_secs(2) {
+            self.log_lines = load_recent_logs(500);
+            self.last_log_update = Instant::now();
         }
 
         // Refresh network stats and nodes from Supabase every 60 seconds
@@ -649,20 +751,281 @@ impl Dashboard {
 
         self.draw_header(frame, chunks[0]);
 
-        // Log lines
         let visible_height = chunks[1].height as usize;
-        let start = self.log_lines.len().saturating_sub(visible_height);
-        let visible_lines: Vec<Line> = self.log_lines[start..]
-            .iter()
-            .map(|line| {
-                Line::from(Span::styled(format!("  {line}"), Style::default().fg(Color::Gray)))
-            })
-            .collect();
 
-        let logs = Paragraph::new(visible_lines).block(Block::default().borders(Borders::NONE));
-        frame.render_widget(logs, chunks[1]);
+        if self.log_lines.is_empty() {
+            // Generate live status lines from daemon state
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    "  LIVE STATUS",
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+            ];
+
+            if let Some(ref rx) = self.daemon_state_rx {
+                let state = rx.borrow();
+                let uptime = state.uptime_secs;
+                let h = uptime / 3600;
+                let m = (uptime % 3600) / 60;
+                let s = uptime % 60;
+
+                lines.push(Line::from(Span::styled(
+                    format!("  [{h:02}:{m:02}:{s:02}] Daemon running"),
+                    Style::default().fg(Color::Green),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("  [{h:02}:{m:02}:{s:02}] Idle state: {}", state.idle_state),
+                    Style::default().fg(Color::Gray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  [{h:02}:{m:02}:{s:02}] CPU: {:.0}% | RAM: {:.1}GB",
+                        state.live_metrics.cpu_usage, state.live_metrics.memory_used_gb
+                    ),
+                    Style::default().fg(Color::Gray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("  [{h:02}:{m:02}:{s:02}] Inference: {}", state.inference_status),
+                    Style::default().fg(Color::Gray),
+                )));
+                if state.pipeline.active {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  [{h:02}:{m:02}:{s:02}] Pipeline active: {:.1} tok/s",
+                            state.pipeline.tokens_per_sec
+                        ),
+                        Style::default().fg(Color::Green),
+                    )));
+                }
+            } else {
+                lines.push(Line::from(Span::styled(
+                    "  Daemon not connected",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+
+            let widget = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+            frame.render_widget(widget, chunks[1]);
+        } else {
+            // Show log file content with scrolling
+            let total = self.log_lines.len();
+            let end =
+                if self.log_scroll == 0 { total } else { total.saturating_sub(self.log_scroll) };
+            let start = end.saturating_sub(visible_height);
+
+            let visible_lines: Vec<Line> = self.log_lines[start..end]
+                .iter()
+                .map(|line| {
+                    let color = if line.contains("ERROR") || line.contains("error") {
+                        Color::Red
+                    } else if line.contains("WARN") || line.contains("warn") {
+                        Color::Yellow
+                    } else if line.contains("INFO") || line.contains("info") {
+                        Color::Gray
+                    } else {
+                        Color::DarkGray
+                    };
+                    Line::from(Span::styled(format!("  {line}"), Style::default().fg(color)))
+                })
+                .collect();
+
+            let scroll_indicator = if self.log_scroll > 0 {
+                format!(" (scrolled +{})", self.log_scroll)
+            } else {
+                " (following)".into()
+            };
+
+            let logs = Paragraph::new(visible_lines).block(
+                Block::default()
+                    .borders(Borders::NONE)
+                    .title(Span::styled(scroll_indicator, Style::default().fg(Color::DarkGray))),
+            );
+            frame.render_widget(logs, chunks[1]);
+        }
 
         self.draw_shortcuts(frame, chunks[2]);
+    }
+
+    fn get_config_value(&self, key: &str) -> String {
+        let config = compute_daemon::config::Config::load().unwrap_or_default();
+        match key {
+            "wallet.public_address" => {
+                if config.wallet.public_address.is_empty() {
+                    "(not set)".into()
+                } else {
+                    config.wallet.public_address
+                }
+            }
+            "node.name" => config.node.name,
+            "node.max_gpu_usage" => match config.node.max_gpu_usage {
+                0..=40 => "Low".into(),
+                41..=70 => "Medium".into(),
+                _ => "High".into(),
+            },
+            "node.pause_on_battery" => {
+                if config.node.pause_on_battery { "On" } else { "Off" }.into()
+            }
+            "node.pause_on_fullscreen" => {
+                if config.node.pause_on_fullscreen { "On" } else { "Off" }.into()
+            }
+            "service.autostart" => {
+                if compute_daemon::service::is_service_installed() { "On" } else { "Off" }.into()
+            }
+            "network.region" => config.network.region,
+            "logging.level" => config.logging.level,
+            _ => "?".into(),
+        }
+    }
+
+    fn start_config_edit(&mut self) {
+        let item = &CONFIG_ITEMS[self.config_selected];
+        match item.kind {
+            ConfigItemKind::Toggle => {
+                // Toggle immediately
+                let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+                match item.key {
+                    "node.pause_on_battery" => {
+                        config.node.pause_on_battery = !config.node.pause_on_battery
+                    }
+                    "node.pause_on_fullscreen" => {
+                        config.node.pause_on_fullscreen = !config.node.pause_on_fullscreen
+                    }
+                    "service.autostart" => {
+                        if compute_daemon::service::is_service_installed() {
+                            let _ = compute_daemon::service::uninstall_service();
+                        } else {
+                            let _ = compute_daemon::service::install_service();
+                        }
+                        return; // Don't save config for service
+                    }
+                    _ => {}
+                }
+                let _ = config.save();
+            }
+            ConfigItemKind::Choice => {
+                // Cycle through options
+                let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+                match item.key {
+                    "node.max_gpu_usage" => {
+                        config.node.max_gpu_usage = match config.node.max_gpu_usage {
+                            0..=40 => 70,  // Low → Medium
+                            41..=70 => 90, // Medium → High
+                            _ => 30,       // High → Low
+                        };
+                        // Scale CPU proportionally
+                        config.node.max_cpu_usage = match config.node.max_gpu_usage {
+                            0..=40 => 25,
+                            41..=70 => 50,
+                            _ => 80,
+                        };
+                    }
+                    "logging.level" => {
+                        config.logging.level = match config.logging.level.as_str() {
+                            "info" => "debug".into(),
+                            "debug" => "warn".into(),
+                            "warn" => "error".into(),
+                            _ => "info".into(),
+                        };
+                    }
+                    _ => {}
+                }
+                let _ = config.save();
+            }
+            ConfigItemKind::Text => {
+                self.config_editing = true;
+                let current = self.get_config_value(item.key);
+                self.config_edit_buffer =
+                    if current == "(not set)" { String::new() } else { current };
+            }
+        }
+    }
+
+    fn handle_config_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.config_editing = false;
+                self.config_edit_buffer.clear();
+            }
+            KeyCode::Enter => {
+                let item = &CONFIG_ITEMS[self.config_selected];
+                let value = self.config_edit_buffer.clone();
+                self.config_editing = false;
+
+                if item.key == "wallet.public_address" {
+                    if !value.is_empty() && !compute_solana::is_valid_address(&value) {
+                        return; // Invalid address, ignore
+                    }
+                    // Show confirmation
+                    self.config_confirm = Some(value);
+                } else {
+                    self.apply_config_change(item.key, &value);
+                }
+                self.config_edit_buffer.clear();
+            }
+            KeyCode::Char(c) => {
+                self.config_edit_buffer.push(c);
+            }
+            KeyCode::Backspace => {
+                self.config_edit_buffer.pop();
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_config_change(&self, key: &str, value: &str) {
+        let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+        match key {
+            "node.name" => config.node.name = value.to_string(),
+            "network.region" => config.network.region = value.to_string(),
+            _ => {}
+        }
+        let _ = config.save();
+    }
+
+    fn apply_wallet_change(&self, new_wallet: &str) {
+        let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+        config.wallet.public_address = new_wallet.to_string();
+        config.wallet.node_id.clear(); // Reset node_id, will re-register
+        let _ = config.save();
+
+        // Register with Supabase in background
+        if !new_wallet.is_empty() {
+            let wallet = new_wallet.to_string();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+                if let Ok(rt) = rt {
+                    rt.block_on(async {
+                        let client = compute_network::supabase::SupabaseClient::new();
+                        let node = compute_network::supabase::NodeRow {
+                            id: None,
+                            wallet_address: wallet,
+                            node_name: None,
+                            status: Some("online".into()),
+                            gpu_model: None,
+                            gpu_vram_mb: None,
+                            gpu_backend: None,
+                            cpu_model: None,
+                            cpu_cores: None,
+                            memory_mb: None,
+                            os: None,
+                            app_version: Some(env!("CARGO_PKG_VERSION").into()),
+                            region: None,
+                            tflops_fp16: None,
+                        };
+                        match client.register_node(&node).await {
+                            Ok(id) => {
+                                if let Ok(mut cfg) = compute_daemon::config::Config::load() {
+                                    cfg.wallet.node_id = id;
+                                    let _ = cfg.save();
+                                }
+                            }
+                            Err(e) => tracing::warn!("Re-registration failed: {e}"),
+                        }
+                    });
+                }
+            });
+        }
     }
 
     fn draw_config_panel(&self, frame: &mut Frame, area: Rect) {
@@ -677,55 +1040,79 @@ impl Dashboard {
 
         self.draw_header(frame, chunks[0]);
 
-        // Show current config
-        let config = compute_daemon::config::Config::load().unwrap_or_default();
-        let lines = vec![
+        let mut lines = vec![
             Line::from(Span::styled(
-                "  CONFIGURATION",
+                "  SETTINGS",
                 Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            config_line("  node.name", &config.node.name),
-            config_line("  node.max_gpu_usage", &format!("{}%", config.node.max_gpu_usage)),
-            config_line("  node.max_cpu_usage", &format!("{}%", config.node.max_cpu_usage)),
-            config_line(
-                "  node.idle_threshold",
-                &format!("{} min", config.node.idle_threshold_minutes),
-            ),
-            config_line("  node.pause_on_battery", &config.node.pause_on_battery.to_string()),
-            Line::from(""),
-            config_line(
-                "  wallet.public_address",
-                if config.wallet.public_address.is_empty() {
-                    "(not set)"
-                } else {
-                    &config.wallet.public_address
-                },
-            ),
-            Line::from(""),
-            config_line("  network.orchestrator", &config.network.orchestrator_url),
-            config_line("  network.region", &config.network.region),
-            Line::from(""),
-            config_line("  logging.level", &config.logging.level),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Edit with: compute config set <key> <value>",
-                Style::default().fg(Color::DarkGray),
-            )),
         ];
+
+        // Confirmation dialog
+        if let Some(ref wallet) = self.config_confirm {
+            lines.push(Line::from(Span::styled(
+                "  Are you sure you want to change your wallet address?",
+                Style::default().fg(Color::Yellow),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("  New: {wallet}"),
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Y] Confirm   [N] Cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let widget = Paragraph::new(lines);
+            frame.render_widget(widget, chunks[1]);
+            self.draw_shortcuts(frame, chunks[2]);
+            return;
+        }
+
+        for (i, item) in CONFIG_ITEMS.iter().enumerate() {
+            let is_selected = i == self.config_selected;
+            let value = if self.config_editing && is_selected {
+                format!("{}█", self.config_edit_buffer)
+            } else {
+                self.get_config_value(item.key)
+            };
+
+            let arrow = if is_selected { "▸ " } else { "  " };
+            let label_color = if is_selected { Color::White } else { Color::DarkGray };
+            let value_color = if is_selected {
+                if self.config_editing { Color::Yellow } else { Color::White }
+            } else {
+                Color::Gray
+            };
+
+            let hint = match item.kind {
+                ConfigItemKind::Toggle if is_selected => "  ↵ toggle",
+                ConfigItemKind::Choice if is_selected => "  ↵ cycle",
+                ConfigItemKind::Text if is_selected => "  ↵ edit",
+                _ => "",
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{arrow}{:<22}", item.label),
+                    Style::default().fg(label_color),
+                ),
+                Span::styled(value, Style::default().fg(value_color)),
+                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  ↑↓ Navigate   ↵ Edit/Toggle   Esc Cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
 
         let config_widget = Paragraph::new(lines);
         frame.render_widget(config_widget, chunks[1]);
 
         self.draw_shortcuts(frame, chunks[2]);
     }
-}
-
-fn config_line(key: &str, value: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{key:<30}"), Style::default().fg(Color::DarkGray)),
-        Span::styled(value.to_string(), Style::default().fg(Color::White)),
-    ])
 }
 
 fn load_recent_logs(n: usize) -> Vec<String> {
@@ -738,7 +1125,7 @@ fn load_recent_logs(n: usize) -> Vec<String> {
             let start = lines.len().saturating_sub(n);
             lines[start..].to_vec()
         }
-        _ => vec!["  No log file found. Start the daemon to generate logs.".into()],
+        _ => Vec::new(), // Empty = show live daemon status instead
     }
 }
 
@@ -818,7 +1205,7 @@ fn fetch_network_and_nodes() -> (NetworkStats, Vec<(String, Option<String>)>) {
                     total_nodes: s.total_nodes as u32,
                     peak_petaflops: s.total_nodes as f64 * 0.066,
                 },
-                Err(_) => NetworkStats::mock(),
+                Err(_) => NetworkStats::default(),
             };
 
             let nodes = match client.get_online_nodes().await {
@@ -828,6 +1215,6 @@ fn fetch_network_and_nodes() -> (NetworkStats, Vec<(String, Option<String>)>) {
 
             (stats, nodes)
         }),
-        Err(_) => (NetworkStats::mock(), Vec::new()),
+        Err(_) => (NetworkStats::default(), Vec::new()),
     }
 }

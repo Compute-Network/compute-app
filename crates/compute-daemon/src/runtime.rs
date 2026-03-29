@@ -33,9 +33,9 @@ impl Default for DaemonState {
             idle_state: IdleState::Idle,
             hardware: hardware::detect(),
             live_metrics: hardware::LiveMetrics::default(),
-            earnings: Earnings::mock(),
+            earnings: Earnings::default(),
             pipeline: PipelineStatus::default(),
-            network: NetworkStats::mock(),
+            network: NetworkStats::default(),
             uptime_secs: 0,
             inference_status: "idle".into(),
         }
