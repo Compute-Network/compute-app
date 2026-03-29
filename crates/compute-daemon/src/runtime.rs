@@ -10,6 +10,7 @@ use crate::hardware;
 use crate::idle::{IdleDetector, IdleState};
 use crate::inference::manager::{InferenceManager, InferenceStatus};
 use crate::metrics::{Earnings, NetworkStats, PipelineStatus};
+use crate::relay::RelayClient;
 
 /// Shared state between the daemon runtime and the TUI.
 #[derive(Debug, Clone)]
@@ -88,6 +89,14 @@ impl DaemonRuntime {
             self.state_rx.borrow().hardware.cpu.cores
         );
 
+        // Start WebSocket relay to orchestrator
+        let relay = RelayClient::new(&self.config, self.shutdown.clone());
+        let relay_handle = tokio::spawn(async move {
+            if let Err(e) = relay.run().await {
+                tracing::error!("[relay] Fatal error: {e}");
+            }
+        });
+
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
         let mut metrics_interval = tokio::time::interval(Duration::from_secs(1));
         let mut idle_interval = tokio::time::interval(Duration::from_secs(2));
@@ -165,7 +174,8 @@ impl DaemonRuntime {
             state.running = false;
         });
 
-        // Stop inference if running
+        // Stop relay and inference
+        relay_handle.abort();
         drop(inference_mgr);
 
         // Set node offline in Supabase

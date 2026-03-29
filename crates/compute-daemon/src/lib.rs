@@ -8,5 +8,6 @@ pub mod idle;
 pub mod inference;
 pub mod logging;
 pub mod metrics;
+pub mod relay;
 pub mod runtime;
 pub mod service;

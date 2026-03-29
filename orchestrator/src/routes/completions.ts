@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { CompletionRequest } from "../types/pipeline.js";
 import type { CompletionResponse } from "../types/pipeline.js";
 import * as scheduler from "../services/scheduler.js";
+import * as relay from "../services/relay.js";
 
 export const completionsRouter = new Hono();
 
@@ -52,51 +53,67 @@ completionsRouter.post("/chat/completions", async (c) => {
     }
   }
 
-  // Route the request to the first stage's llama-server.
-  // For single-node pipelines, this is a direct proxy.
-  // For multi-node, this would go through the QUIC pipeline stages.
   const firstStage = pipeline.stages[0];
-  const nodeAddr = firstStage.listen_addr;
+  const nodeId = firstStage.node_id;
 
-  // Resolve the inference server address.
-  // In production, each node runs llama-server and reports its address.
-  // For now, use localhost:8090 as the default inference port.
-  const inferenceUrl = `http://127.0.0.1:8090/v1/chat/completions`;
+  // Build the inference request payload
+  const inferenceBody = {
+    model: req.model,
+    messages: req.messages,
+    prompt: req.prompt,
+    max_tokens: req.max_tokens,
+    temperature: req.temperature,
+    top_p: req.top_p,
+    stream: req.stream,
+  };
 
   try {
-    const inferenceResp = await fetch(inferenceUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: req.model,
-        messages: req.messages,
-        prompt: req.prompt,
-        max_tokens: req.max_tokens,
-        temperature: req.temperature,
-        top_p: req.top_p,
-        stream: req.stream,
-      }),
-    });
+    let result: any;
 
-    if (!inferenceResp.ok) {
-      const text = await inferenceResp.text();
-      return c.json(
-        {
-          error: {
-            message: `Inference failed: ${text}`,
-            type: "server_error",
+    if (relay.isConnected(nodeId)) {
+      // Route through WebSocket relay
+      const response = await relay.sendRequest(nodeId, inferenceBody);
+      if (response.status !== 200) {
+        return c.json(
+          {
+            error: {
+              message: `Inference failed: ${JSON.stringify(response.body)}`,
+              type: "server_error",
+            },
           },
-        },
-        502
-      );
-    }
+          502
+        );
+      }
+      result = response.body;
+    } else {
+      // Fallback: direct HTTP (only works when orchestrator and node are co-located)
+      const inferenceUrl = `http://127.0.0.1:8090/v1/chat/completions`;
+      const inferenceResp = await fetch(inferenceUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(inferenceBody),
+      });
 
-    const result = await inferenceResp.json();
+      if (!inferenceResp.ok) {
+        const text = await inferenceResp.text();
+        return c.json(
+          {
+            error: {
+              message: `Inference failed: ${text}`,
+              type: "server_error",
+            },
+          },
+          502
+        );
+      }
+
+      result = await inferenceResp.json();
+    }
 
     // Record rewards and update node throughput
     const { recordRequestReward } = await import("../services/rewards.js");
-    const usage = (result as any).usage;
-    const timings = (result as any).timings;
+    const usage = result.usage;
+    const timings = result.timings;
     if (usage) {
       await recordRequestReward(
         pipeline,

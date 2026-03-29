@@ -46,6 +46,9 @@ clap = { version = "4", features = ["derive"] }
 # Docker
 bollard = "0.18"
 
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
 # QUIC transport
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

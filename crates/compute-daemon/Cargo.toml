@@ -26,6 +26,9 @@ reqwest = { workspace = true }
 bollard = { workspace = true }
 futures-util = "0.3"
 
+# WebSocket
+tokio-tungstenite = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }

@@ -2,17 +2,23 @@ import "dotenv/config";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
-import { serve } from "@hono/node-server";
+import { createAdaptorServer } from "@hono/node-server";
+import { createNodeWebSocket } from "@hono/node-ws";
 
 import { nodesRouter } from "./routes/nodes.js";
 import { pipelinesRouter } from "./routes/pipelines.js";
 import { completionsRouter } from "./routes/completions.js";
 import { rewardsRouter } from "./routes/rewards.js";
+import { createWsRoute, setUpgradeWebSocket } from "./routes/ws.js";
 import { apiKeyAuth } from "./middleware/auth.js";
 import { markStaleNodesOffline } from "./services/nodes.js";
 import { initScheduler } from "./services/scheduler.js";
 
 const app = new Hono();
+
+// Create WebSocket helper
+const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
+setUpgradeWebSocket(upgradeWebSocket);
 
 // Global middleware
 app.use("*", cors());
@@ -31,6 +37,9 @@ app.route("/v1/pipelines", pipelinesRouter);
 
 // Rewards
 app.route("/v1/rewards", rewardsRouter);
+
+// WebSocket relay for nodes
+app.route("/v1/ws", createWsRoute());
 
 // OpenAI-compatible API (requires API key)
 app.use("/v1/chat/*", apiKeyAuth);
@@ -80,10 +89,13 @@ console.log(`
   │   POST /v1/rewards/:wallet/claim         │
   │   POST /v1/chat/completions  (API key)   │
   │   GET  /v1/models            (API key)   │
+  │   WS   /v1/ws                (relay)     │
   │   GET  /health                           │
   │                                          │
   │   Port: ${port}                              │
   └──────────────────────────────────────────┘
 `);
 
-serve({ fetch: app.fetch, port });
+const server = createAdaptorServer({ fetch: app.fetch });
+injectWebSocket(server);
+server.listen(port);
