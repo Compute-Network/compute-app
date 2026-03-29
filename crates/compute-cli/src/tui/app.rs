@@ -72,8 +72,28 @@ fn run_inner(
     let continue_to_dashboard = splash.run(terminal)?;
 
     if continue_to_dashboard {
-        let mut dashboard = Dashboard::new(hw);
+        // Start daemon runtime in the background, get state receiver for dashboard
+        let daemon_config = config.clone();
+        let runtime = compute_daemon::runtime::DaemonRuntime::new(daemon_config);
+        let state_rx = runtime.state_receiver();
+
+        let daemon_handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime");
+
+            rt.block_on(async {
+                if let Err(e) = runtime.run().await {
+                    tracing::error!("Daemon error: {e}");
+                }
+            });
+        });
+
+        let mut dashboard = Dashboard::with_daemon_state(hw, state_rx);
         dashboard.run(terminal)?;
+
+        drop(daemon_handle);
     }
 
     Ok(())

@@ -37,9 +37,19 @@ pub struct Dashboard {
     uptime_start: Instant,
     active_tab: Tab,
     log_lines: Vec<String>,
+    daemon_state_rx: Option<tokio::sync::watch::Receiver<compute_daemon::runtime::DaemonState>>,
 }
 
 impl Dashboard {
+    pub fn with_daemon_state(
+        hardware: HardwareInfo,
+        rx: tokio::sync::watch::Receiver<compute_daemon::runtime::DaemonState>,
+    ) -> Self {
+        let mut d = Self::new(hardware);
+        d.daemon_state_rx = Some(rx);
+        d
+    }
+
     pub fn new(hardware: HardwareInfo) -> Self {
         let mut globe = Globe::new();
 
@@ -73,6 +83,7 @@ impl Dashboard {
             uptime_start: Instant::now(),
             active_tab: Tab::Overview,
             log_lines,
+            daemon_state_rx: None,
         }
     }
 
@@ -125,10 +136,39 @@ impl Dashboard {
     fn tick(&mut self) {
         self.globe.tick();
 
-        // Update live metrics every 2 seconds
-        if self.last_metrics_update.elapsed() > Duration::from_secs(2) {
-            self.live_metrics = hardware::collect_live_metrics(&mut self.sys);
-            self.last_metrics_update = Instant::now();
+        // Read from daemon state if available
+        if let Some(ref rx) = self.daemon_state_rx {
+            let state = rx.borrow().clone();
+            self.live_metrics = state.live_metrics;
+            self.earnings.pending = state.earnings.pending;
+
+            // Update throughput from pipeline tokens/sec
+            if self.throughput_history.len() > 60 {
+                self.throughput_history.remove(0);
+            }
+            let tps = if state.pipeline.active {
+                state.pipeline.tokens_per_sec as u64
+            } else {
+                0
+            };
+            self.throughput_history.push(tps);
+
+            self.pipeline = state.pipeline;
+        } else {
+            // No daemon state — use local metrics collection
+            if self.last_metrics_update.elapsed() > Duration::from_secs(2) {
+                self.live_metrics = hardware::collect_live_metrics(&mut self.sys);
+                self.last_metrics_update = Instant::now();
+            }
+
+            // Simulated throughput
+            if self.throughput_history.len() > 60 {
+                self.throughput_history.remove(0);
+            }
+            let last = *self.throughput_history.last().unwrap_or(&40);
+            let jitter = (rand_simple() * 10.0 - 5.0) as i64;
+            let new_val = (last as i64 + jitter).clamp(10, 80) as u64;
+            self.throughput_history.push(new_val);
         }
 
         // Refresh network stats and nodes from Supabase every 60 seconds
@@ -140,15 +180,6 @@ impl Dashboard {
             }
             self.last_network_update = Instant::now();
         }
-
-        // Simulate throughput changes
-        if self.throughput_history.len() > 60 {
-            self.throughput_history.remove(0);
-        }
-        let last = *self.throughput_history.last().unwrap_or(&40);
-        let jitter = (rand_simple() * 10.0 - 5.0) as i64;
-        let new_val = (last as i64 + jitter).clamp(10, 80) as u64;
-        self.throughput_history.push(new_val);
     }
 
     fn draw(&self, frame: &mut Frame) {
