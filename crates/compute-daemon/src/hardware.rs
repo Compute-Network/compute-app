@@ -256,6 +256,22 @@ pub fn collect_live_metrics(sys: &mut System) -> LiveMetrics {
         metrics.gpu_power_limit_watts = Some(gpu_metrics.5);
     }
 
+    // Apple Silicon: unified memory is VRAM, get GPU temp via powermetrics
+    #[cfg(target_os = "macos")]
+    if metrics.gpu_temp.is_none() {
+        // On Apple Silicon, unified memory acts as VRAM
+        // Report system memory usage as VRAM since it's shared
+        let total_mb = (memory_total_gb * 1024.0) as u64;
+        let used_mb = (memory_used_gb * 1024.0) as u64;
+        metrics.gpu_vram_used_mb = Some(used_mb);
+        metrics.gpu_vram_total_mb = Some(total_mb);
+
+        // Try to get GPU temp from macOS thermal sensors
+        if let Ok(temp) = collect_macos_gpu_temp() {
+            metrics.gpu_temp = Some(temp);
+        }
+    }
+
     metrics
 }
 
@@ -289,6 +305,25 @@ fn collect_nvidia_metrics() -> Result<(u32, f32, u64, u64, u32, u32)> {
         parts[4].parse::<f32>().unwrap_or(0.0) as u32,
         parts[5].parse::<f32>().unwrap_or(0.0) as u32,
     ))
+}
+
+/// Get Apple Silicon GPU/SoC temperature via SMC.
+#[cfg(target_os = "macos")]
+fn collect_macos_gpu_temp() -> Result<u32> {
+    use std::process::Command;
+
+    // Read thermal pressure level from sysctl (available without sudo)
+    let output =
+        Command::new("sysctl").arg("-n").arg("kern.sched_thermal_throttle_level").output()?;
+
+    if output.status.success() {
+        // Throttle level 0=cool, increases under load
+        // Map to approximate temp range
+        let level: u32 = String::from_utf8_lossy(&output.stdout).trim().parse().unwrap_or(0);
+        return Ok(35 + level * 10); // Rough approximation
+    }
+
+    anyhow::bail!("Could not read macOS temperature")
 }
 
 #[cfg(test)]

@@ -610,12 +610,12 @@ impl Dashboard {
         };
 
         let temp_line =
-            self.live_metrics.gpu_temp.map(|t| format!("{t}°C")).unwrap_or_else(|| "--".into());
+            self.live_metrics.gpu_temp.map(|t| format!("{t}°C")).unwrap_or_else(|| "N/A".into());
 
         let power_line =
             match (self.live_metrics.gpu_power_watts, self.live_metrics.gpu_power_limit_watts) {
                 (Some(p), Some(l)) => format!("{p}W / {l}W"),
-                _ => "--".into(),
+                _ => "N/A".into(),
             };
 
         let lines = vec![
