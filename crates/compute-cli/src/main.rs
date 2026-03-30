@@ -816,15 +816,49 @@ fn current_target() -> String {
 }
 
 fn cmd_uninstall() -> Result<()> {
-    println!("To uninstall Compute:");
-    println!();
-    println!("  1. Stop the daemon:  compute stop");
-    println!("  2. Remove the binary: rm $(which compute)");
+    use std::io::{self, Write};
+
+    println!("\n  UNINSTALL COMPUTE\n");
+    println!("  This will remove:");
     if let Some(dir) = config::config_dir() {
-        println!("  3. Remove config:    rm -rf {}", dir.display());
+        println!("    - Config & data:  {}", dir.display());
     }
+    println!("    - System service (if installed)");
     println!();
-    println!("Your wallet and earnings are safe — they're on-chain.");
+    println!("  Your wallet and earnings are safe — they're on-chain.");
+    println!();
+    print!("  Continue? [y/N] ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    if !input.trim().eq_ignore_ascii_case("y") {
+        println!("  Cancelled.");
+        return Ok(());
+    }
+
+    // Stop daemon if running
+    println!("  Stopping daemon...");
+    let _ = cmd_stop();
+
+    // Uninstall service if installed
+    if compute_daemon::service::is_service_installed() {
+        println!("  Removing system service...");
+        let _ = compute_daemon::service::uninstall_service();
+    }
+
+    // Remove ~/.compute directory
+    if let Some(dir) = config::config_dir() {
+        if dir.exists() {
+            println!("  Removing {}...", dir.display());
+            std::fs::remove_dir_all(&dir)?;
+        }
+    }
+
+    println!();
+    println!("  Compute uninstalled.");
+    println!("  To also remove the binary: rm $(which compute)");
+    println!();
     Ok(())
 }
 
