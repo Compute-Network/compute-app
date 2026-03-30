@@ -212,7 +212,7 @@ impl DaemonRuntime {
                 let has_pipeline = node.pipeline_id.is_some();
                 let pending = node.pending_compute.unwrap_or(0.0);
 
-                let tps = node.tokens_per_second.unwrap_or(0.0);
+                let _tps = node.tokens_per_second.unwrap_or(0.0);
                 let served = node.requests_served.unwrap_or(0) as u64;
 
                 self.update_state(|state| {
@@ -221,7 +221,7 @@ impl DaemonRuntime {
                         state.pipeline.stage = node.pipeline_stage.map(|s| s as u32);
                         state.pipeline.total_stages = node.pipeline_total_stages.map(|s| s as u32);
                         state.pipeline.model = node.model_name.clone();
-                        state.pipeline.tokens_per_sec = tps;
+                        // Don't set tokens_per_sec here — it comes from the relay in real time
                         state.pipeline.requests_served = served;
                     } else {
                         state.pipeline.active = false;
