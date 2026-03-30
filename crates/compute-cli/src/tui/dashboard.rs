@@ -50,7 +50,7 @@ const CONFIG_ITEMS: &[ConfigItem] = &[
         kind: ConfigItemKind::Toggle,
     },
     ConfigItem {
-        label: "Pause on Fullscreen",
+        label: "Pause on Gaming",
         key: "node.pause_on_fullscreen",
         kind: ConfigItemKind::Toggle,
     },
@@ -59,7 +59,6 @@ const CONFIG_ITEMS: &[ConfigItem] = &[
         key: "service.autostart",
         kind: ConfigItemKind::Toggle,
     },
-    ConfigItem { label: "Region", key: "network.region", kind: ConfigItemKind::Text },
     ConfigItem { label: "Log Level", key: "logging.level", kind: ConfigItemKind::Choice },
 ];
 
