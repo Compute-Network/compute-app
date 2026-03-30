@@ -206,8 +206,57 @@ export async function adminAuth(c: Context, next: Next) {
 }
 
 /**
+ * Verify wallet ownership — returns a Response if unauthorized, null if OK.
+ * Call at the start of any protected handler.
+ */
+export function verifyWalletRequest(c: Context): Response | null {
+  const signatureB64 = c.req.header("X-Wallet-Signature");
+  const publicKeyB58 = c.req.header("X-Wallet-Public-Key");
+
+  if (!signatureB64 || !publicKeyB58) {
+    return c.json({ error: { message: "Missing auth headers", type: "authentication_error" } }, 401);
+  }
+
+  let pubkey: PublicKey;
+  try { pubkey = new PublicKey(publicKeyB58); } catch {
+    return c.json({ error: { message: "Invalid public key", type: "authentication_error" } }, 401);
+  }
+
+  let signatureBytes: Uint8Array;
+  try { signatureBytes = Uint8Array.from(Buffer.from(signatureB64, "base64")); } catch {
+    return c.json({ error: { message: "Invalid signature", type: "authentication_error" } }, 401);
+  }
+
+  const message = new TextEncoder().encode(pubkey.toBase58());
+  const valid = nacl.sign.detached.verify(message, signatureBytes, pubkey.toBytes());
+  if (!valid) {
+    return c.json({ error: { message: "Invalid wallet signature", type: "authentication_error" } }, 401);
+  }
+
+  const walletParam = c.req.param("wallet");
+  if (walletParam && pubkey.toBase58() !== walletParam) {
+    return c.json({ error: { message: "Public key does not match wallet", type: "authorization_error" } }, 403);
+  }
+
+  // Rate limit check
+  const wallet = walletParam || pubkey.toBase58();
+  const now = Date.now();
+  let entry = claimRateLimits.get(wallet);
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    claimRateLimits.set(wallet, entry);
+  }
+  entry.count++;
+  if (entry.count > MAX_CLAIMS_PER_HOUR) {
+    return c.json({ error: { message: "Rate limit exceeded. Max 5 claims per hour.", type: "rate_limit_error" } }, 429);
+  }
+
+  return null;
+}
+
+/**
  * Synchronous admin auth check — returns a Response if unauthorized, null if OK.
- * Use this inside route handlers where Hono .use() can't target a single HTTP method.
+ * Call at the start of any admin-only handler.
  */
 export function verifyAdminRequest(c: Context): Response | null {
   const signatureB64 = c.req.header("X-Wallet-Signature");

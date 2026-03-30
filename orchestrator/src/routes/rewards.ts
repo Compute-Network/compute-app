@@ -9,17 +9,11 @@ import {
   verifyClaimTransaction,
 } from "../services/solana.js";
 import {
-  walletAuth,
+  verifyWalletRequest,
   verifyAdminRequest,
-  claimRateLimit,
 } from "../middleware/walletAuth.js";
 
 export const rewardsRouter = new Hono();
-
-// ── Apply auth middleware to protected routes ──────────────────────
-// Hono .use() with parameterized paths needs wildcard: /*/claim matches /:wallet/claim
-rewardsRouter.use("/*/claim", walletAuth, claimRateLimit);
-rewardsRouter.use("/*/confirm", walletAuth, claimRateLimit);
 
 // ── Public read-only endpoints ────────────────────────────────────
 
@@ -54,7 +48,7 @@ rewardsRouter.get("/:wallet/history", async (c) => {
   }
 });
 
-// Get reward config (public read-only — GET is not blocked by adminAuth)
+// Get reward config
 rewardsRouter.get("/config", (c) => {
   return c.json(rewards.getRewardConfig());
 });
@@ -77,29 +71,27 @@ rewardsRouter.get("/", async (c) => {
   }
 });
 
-// ── Protected endpoints ───────────────────────────────────────────
+// ── Protected endpoints (wallet signature + rate limiting) ────────
 
-// Build claim transaction — wallet auth + rate limited
+// Build claim transaction
 rewardsRouter.post("/:wallet/claim", async (c) => {
+  const authError = verifyWalletRequest(c);
+  if (authError) return authError;
+
   const wallet = c.req.param("wallet")!;
 
   try {
-    // Get pending rewards from DB
     const pending = await rewards.getPendingRewards(wallet);
     if (pending.total <= 0) {
       return c.json({ error: "No pending rewards to claim" }, 400);
     }
 
-    // Get pending event IDs and mark them as "claiming" atomically
     const eventIds = await rewards.markEventsAsClaiming(wallet);
     if (eventIds.length === 0) {
       return c.json({ error: "No pending rewards to claim" }, 400);
     }
 
-    // Recalculate total from the events that were just locked
     const claimingTotal = await rewards.getClaimingTotal(wallet, eventIds);
-
-    // Build partially-signed transaction via Anchor program
     const result = await buildClaimTransaction(wallet, claimingTotal);
 
     return c.json({
@@ -121,8 +113,11 @@ rewardsRouter.post("/:wallet/claim", async (c) => {
   }
 });
 
-// Confirm claim — wallet auth + rate limited
+// Confirm claim
 rewardsRouter.post("/:wallet/confirm", async (c) => {
+  const authError = verifyWalletRequest(c);
+  if (authError) return authError;
+
   const wallet = c.req.param("wallet")!;
 
   let body: { signature: string; event_ids: string[] };
@@ -142,13 +137,11 @@ rewardsRouter.post("/:wallet/confirm", async (c) => {
   }
 
   try {
-    // Verify the Solana transaction on-chain before marking as claimed
     const txValid = await verifyClaimTransaction(signature, wallet);
     if (!txValid) {
       return c.json({ error: "Transaction not found or not valid" }, 400);
     }
 
-    // Only mark the specific event IDs as claimed (must be in "claiming" status)
     const result = await rewards.markRewardsClaimed(wallet, event_ids);
 
     return c.json({
@@ -164,7 +157,6 @@ rewardsRouter.post("/:wallet/confirm", async (c) => {
 });
 
 // Update reward config — admin only
-// We check admin auth inside the PATCH handler since .use("/config") would block GET too
 rewardsRouter.patch("/config", async (c) => {
   const authError = verifyAdminRequest(c);
   if (authError) return authError;
