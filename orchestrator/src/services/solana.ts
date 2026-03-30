@@ -38,6 +38,9 @@ const DECIMALS = 6;
 const MINT_SUPPLY = 1_000_000_000; // 1B tokens for devnet
 const CONFIG_PATH = path.resolve(process.cwd(), ".compute-token.json");
 
+// Max tokens per single distribute_rewards transaction (10,000 $COMPUTE)
+const MAX_DISTRIBUTE_PER_TX = BigInt(10_000) * BigInt(10 ** DECIMALS);
+
 // Instruction discriminators from IDL
 const IX_INITIALIZE_POOL = Buffer.from([95, 180, 10, 172, 84, 174, 232, 40]);
 const IX_REGISTER_NODE = Buffer.from([102, 85, 117, 114, 194, 188, 211, 168]);
@@ -50,6 +53,17 @@ const IX_CLAIM_REWARDS = Buffer.from([4, 144, 132, 71, 116, 23, 151, 80]);
 const NODE_ACCOUNT_DISCRIMINATOR = Buffer.from([
   125, 166, 18, 146, 195, 127, 86, 220,
 ]);
+
+// ── NodeAccount layout ─────────────────────────────────────────────
+// Defines the on-chain NodeAccount struct fields and their byte sizes.
+// Used to safely calculate offsets instead of hardcoding magic numbers.
+const NODE_ACCOUNT_LAYOUT = {
+  discriminator: { offset: 0, size: 8 },
+  owner: { offset: 8, size: 32 },
+  total_earned: { offset: 40, size: 8 },
+  total_claimed: { offset: 48, size: 8 },
+  pending_rewards: { offset: 56, size: 8 },
+} as const;
 
 // ── Module state ────────────────────────────────────────────────────
 let connection: Connection;
@@ -113,7 +127,9 @@ function saveConfig(config: TokenConfig) {
 async function ensureDevnetSol(pubkey: PublicKey, minSol = 0.5) {
   const balance = await connection.getBalance(pubkey);
   if (balance < minSol * LAMPORTS_PER_SOL) {
-    console.log(`[solana] Requesting devnet airdrop for ${pubkey.toBase58().slice(0, 8)}...`);
+    console.log(
+      `[solana] Requesting devnet airdrop for ${pubkey.toBase58().slice(0, 8)}...`
+    );
     try {
       const sig = await connection.requestAirdrop(
         pubkey,
@@ -239,9 +255,7 @@ async function initializePool(): Promise<void> {
 
   const tx = new Transaction().add(ix);
   tx.feePayer = authority.publicKey;
-  tx.recentBlockhash = (
-    await connection.getLatestBlockhash()
-  ).blockhash;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
   tx.sign(authority);
 
   const sig = await connection.sendRawTransaction(tx.serialize());
@@ -284,6 +298,13 @@ export async function nodeExistsOnChain(
   return account !== null;
 }
 
+// ── Validate NodeAccount discriminator ──────────────────────────────
+function validateNodeAccountDiscriminator(data: Buffer): boolean {
+  if (data.length < NODE_ACCOUNT_LAYOUT.discriminator.size) return false;
+  const disc = data.subarray(0, NODE_ACCOUNT_LAYOUT.discriminator.size);
+  return disc.equals(NODE_ACCOUNT_DISCRIMINATOR);
+}
+
 // ── Distribute rewards (orchestrator calls after inference) ─────────
 export async function distributeRewardsOnChain(
   nodeOwnerWallet: string,
@@ -304,7 +325,15 @@ export async function distributeRewardsOnChain(
     return null;
   }
 
-  const rawAmount = BigInt(Math.round(amount * 10 ** DECIMALS));
+  let rawAmount = BigInt(Math.round(amount * 10 ** DECIMALS));
+
+  // Enforce per-distribution cap
+  if (rawAmount > MAX_DISTRIBUTE_PER_TX) {
+    console.warn(
+      `[solana] Distribution of ${amount} $COMPUTE exceeds cap of ${Number(MAX_DISTRIBUTE_PER_TX) / 10 ** DECIMALS}. Capping.`
+    );
+    rawAmount = MAX_DISTRIBUTE_PER_TX;
+  }
 
   const data = Buffer.concat([
     IX_DISTRIBUTE_REWARDS,
@@ -326,9 +355,7 @@ export async function distributeRewardsOnChain(
 
   const tx = new Transaction().add(ix);
   tx.feePayer = authority.publicKey;
-  tx.recentBlockhash = (
-    await connection.getLatestBlockhash()
-  ).blockhash;
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
   tx.sign(authority);
 
   try {
@@ -341,6 +368,86 @@ export async function distributeRewardsOnChain(
   } catch (e: any) {
     console.error(`[solana] distribute_rewards failed:`, e.message);
     return null;
+  }
+}
+
+// ── Verify claim transaction on-chain ───────────────────────────────
+/**
+ * Verifies a claim transaction exists on Solana and is valid:
+ * - Transaction is confirmed and succeeded (no errors)
+ * - Transaction includes the correct program ID in its instructions
+ * - Transaction involves the expected wallet
+ */
+export async function verifyClaimTransaction(
+  signature: string,
+  wallet: string
+): Promise<boolean> {
+  try {
+    const tx = await connection.getTransaction(signature, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+
+    if (!tx) {
+      console.warn(
+        `[solana] Claim verification: tx ${signature} not found`
+      );
+      return false;
+    }
+
+    // Check transaction succeeded (no error)
+    if (tx.meta?.err) {
+      console.warn(
+        `[solana] Claim verification: tx ${signature} has error:`,
+        tx.meta.err
+      );
+      return false;
+    }
+
+    // Check the transaction includes our program ID
+    const accountKeys = tx.transaction.message.getAccountKeys();
+    const programIdStr = PROGRAM_ID.toBase58();
+    let programFound = false;
+
+    for (let i = 0; i < accountKeys.length; i++) {
+      if (accountKeys.get(i)?.toBase58() === programIdStr) {
+        programFound = true;
+        break;
+      }
+    }
+
+    if (!programFound) {
+      console.warn(
+        `[solana] Claim verification: tx ${signature} does not include program ${programIdStr}`
+      );
+      return false;
+    }
+
+    // Check the transaction involves the expected wallet
+    const walletPubkey = new PublicKey(wallet);
+    let walletFound = false;
+
+    for (let i = 0; i < accountKeys.length; i++) {
+      if (accountKeys.get(i)?.equals(walletPubkey)) {
+        walletFound = true;
+        break;
+      }
+    }
+
+    if (!walletFound) {
+      console.warn(
+        `[solana] Claim verification: tx ${signature} does not involve wallet ${wallet}`
+      );
+      return false;
+    }
+
+    return true;
+  } catch (e: any) {
+    console.error(
+      `[solana] Claim verification error for ${signature}:`,
+      e.message
+    );
+    return false;
   }
 }
 
@@ -362,7 +469,24 @@ export async function buildClaimTransaction(
 }> {
   const owner = new PublicKey(recipientWallet);
   const [nodePDA, nodeBump] = deriveNodePDA(owner);
-  const rawAmount = BigInt(Math.round(pendingAmount * 10 ** DECIMALS));
+  let rawAmount = BigInt(Math.round(pendingAmount * 10 ** DECIMALS));
+
+  // Enforce per-distribution cap on the claim transaction
+  if (rawAmount > MAX_DISTRIBUTE_PER_TX) {
+    console.warn(
+      `[solana] Claim of ${pendingAmount} $COMPUTE exceeds cap of ${Number(MAX_DISTRIBUTE_PER_TX) / 10 ** DECIMALS}. Capping.`
+    );
+    rawAmount = MAX_DISTRIBUTE_PER_TX;
+  }
+
+  // Verify vault balance before building the transaction
+  const vaultBalance = await getVaultBalance();
+  const claimAmountHuman = Number(rawAmount) / 10 ** DECIMALS;
+  if (vaultBalance < claimAmountHuman) {
+    throw new Error(
+      `Insufficient vault balance: ${vaultBalance.toFixed(4)} $COMPUTE available, ${claimAmountHuman.toFixed(4)} requested`
+    );
+  }
 
   const instructions: TransactionInstruction[] = [];
   let message = "";
@@ -395,17 +519,36 @@ export async function buildClaimTransaction(
   //    (rewards already distributed in real-time after inference shouldn't be doubled)
   let onChainPending = 0n;
   if (nodeAccount) {
-    // NodeAccount layout: 8 (discriminator) + 32 (owner) + 8 (total_earned) + 8 (total_claimed) + 8 (pending_rewards)
-    const pendingOffset = 8 + 32 + 8 + 8;
+    // Validate account discriminator before reading data
+    if (!validateNodeAccountDiscriminator(nodeAccount.data)) {
+      throw new Error(
+        "Invalid NodeAccount discriminator — account data does not match expected format"
+      );
+    }
+
+    const pendingOffset = NODE_ACCOUNT_LAYOUT.pending_rewards.offset;
     onChainPending = nodeAccount.data.readBigUInt64LE(pendingOffset);
   }
 
-  const distributeAmount = rawAmount > onChainPending ? rawAmount - onChainPending : 0n;
-  if (distributeAmount > 0n) {
-    const humanAmount = Number(distributeAmount) / 10 ** DECIMALS;
+  const distributeAmount =
+    rawAmount > onChainPending ? rawAmount - onChainPending : 0n;
+
+  // Cap the distribute amount too
+  const cappedDistributeAmount =
+    distributeAmount > MAX_DISTRIBUTE_PER_TX
+      ? MAX_DISTRIBUTE_PER_TX
+      : distributeAmount;
+
+  if (cappedDistributeAmount > 0n) {
+    if (cappedDistributeAmount < distributeAmount) {
+      console.warn(
+        `[solana] Distribute in claim capped from ${Number(distributeAmount) / 10 ** DECIMALS} to ${Number(cappedDistributeAmount) / 10 ** DECIMALS}`
+      );
+    }
+    const humanAmount = Number(cappedDistributeAmount) / 10 ** DECIMALS;
     const distributeData = Buffer.concat([
       IX_DISTRIBUTE_REWARDS,
-      encodeU64(distributeAmount),
+      encodeU64(cappedDistributeAmount),
       encodeU32(1), // layers_served
       encodeU32(1), // total_layers
       encodeU32(0), // tokens_generated (aggregate)
@@ -463,7 +606,7 @@ export async function buildClaimTransaction(
     })
   );
   // The actual claim amount = on-chain pending + any new distribution
-  const totalClaimRaw = onChainPending + distributeAmount;
+  const totalClaimRaw = onChainPending + cappedDistributeAmount;
   const totalClaimHuman = Number(totalClaimRaw) / 10 ** DECIMALS;
   message += `Claiming ${totalClaimHuman.toFixed(4)} $COMPUTE.`;
 

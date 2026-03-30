@@ -2,6 +2,9 @@ import { supabase } from "./db.js";
 import type { Pipeline, PipelineStage } from "../types/pipeline.js";
 import { distributeRewardsOnChain } from "./solana.js";
 
+// Maximum reward per single inference request (in $COMPUTE)
+const MAX_REWARD_PER_REQUEST = 100;
+
 // Reward rate configuration — all server-controlled, easily adjustable.
 const REWARD_CONFIG = {
   // Base reward per token per layer (in $COMPUTE)
@@ -33,6 +36,17 @@ export async function recordRequestReward(
   const totalTokens = tokensGenerated + tokensPrompt;
   if (totalTokens === 0) return;
 
+  // Check for duplicate reward events for this pipeline
+  // NOTE: A DB unique constraint on (pipeline_id, node_id) should be added
+  // via migration: ALTER TABLE reward_events ADD CONSTRAINT unique_pipeline_node
+  //   UNIQUE (pipeline_id, node_id);
+  const { data: existing } = await supabase
+    .from("reward_events")
+    .select("id, node_id")
+    .eq("pipeline_id", pipeline.id);
+
+  const existingNodeIds = new Set((existing ?? []).map((e) => e.node_id));
+
   // Calculate total request reward
   const totalRequestReward =
     totalTokens *
@@ -41,36 +55,51 @@ export async function recordRequestReward(
     REWARD_CONFIG.busyHourMultiplier;
 
   // Distribute across stages
-  const events = pipeline.stages.map((stage) => {
-    const layersServed = stage.end_layer - stage.start_layer + 1;
-    const layerProportion = layersServed / pipeline.total_layers;
+  const events = pipeline.stages
+    .filter((stage) => !existingNodeIds.has(stage.node_id))
+    .map((stage) => {
+      const layersServed = stage.end_layer - stage.start_layer + 1;
+      const layerProportion = layersServed / pipeline.total_layers;
 
-    // Proportional reward
-    let reward = totalRequestReward * layerProportion;
+      // Proportional reward
+      let reward = totalRequestReward * layerProportion;
 
-    // Apply floor rate
-    const floorReward =
-      totalTokens * REWARD_CONFIG.floorRatePerToken;
-    reward = Math.max(reward, floorReward);
+      // Apply floor rate
+      const floorReward = totalTokens * REWARD_CONFIG.floorRatePerToken;
+      reward = Math.max(reward, floorReward);
 
-    // Apply multipliers
-    reward *= REWARD_CONFIG.uptimeMultiplier;
+      // Apply multipliers
+      reward *= REWARD_CONFIG.uptimeMultiplier;
 
-    return {
-      node_id: stage.node_id,
-      wallet_address: stage.wallet_address,
-      pipeline_id: pipeline.id,
-      model_id: pipeline.model_id,
-      layers_served: layersServed,
-      total_layers: pipeline.total_layers,
-      tokens_generated: tokensGenerated,
-      tokens_prompt: tokensPrompt,
-      base_reward: totalRequestReward * layerProportion,
-      multiplier: REWARD_CONFIG.uptimeMultiplier * REWARD_CONFIG.busyHourMultiplier,
-      final_reward: reward,
-      status: "pending",
-    };
-  });
+      // Apply per-request cap
+      if (reward > MAX_REWARD_PER_REQUEST) {
+        console.warn(
+          `[rewards] Capping reward for node ${stage.node_id} from ${reward.toFixed(4)} to ${MAX_REWARD_PER_REQUEST} $COMPUTE`
+        );
+        reward = MAX_REWARD_PER_REQUEST;
+      }
+
+      return {
+        node_id: stage.node_id,
+        wallet_address: stage.wallet_address,
+        pipeline_id: pipeline.id,
+        model_id: pipeline.model_id,
+        layers_served: layersServed,
+        total_layers: pipeline.total_layers,
+        tokens_generated: tokensGenerated,
+        tokens_prompt: tokensPrompt,
+        base_reward: totalRequestReward * layerProportion,
+        multiplier:
+          REWARD_CONFIG.uptimeMultiplier * REWARD_CONFIG.busyHourMultiplier,
+        final_reward: reward,
+        status: "pending",
+      };
+    });
+
+  if (events.length === 0) {
+    // All stages already have reward events for this pipeline
+    return;
+  }
 
   // Batch insert reward events
   const { error } = await supabase.from("reward_events").insert(events);
@@ -131,7 +160,64 @@ export async function getRewardHistory(
 }
 
 /**
+ * Mark pending events for a wallet as "claiming" to prevent double-claims.
+ * Returns the event IDs that were marked.
+ *
+ * TODO: Add a cleanup job that reverts "claiming" events back to "pending"
+ * if they aren't confirmed within 5 minutes. This prevents permanently
+ * locked events if the user abandons the claim flow.
+ */
+export async function markEventsAsClaiming(
+  walletAddress: string
+): Promise<string[]> {
+  const { data, error } = await supabase
+    .from("reward_events")
+    .update({ status: "claiming" })
+    .eq("wallet_address", walletAddress)
+    .eq("status", "pending")
+    .select("id");
+
+  if (error) throw new Error(`Failed to mark as claiming: ${error.message}`);
+  return (data ?? []).map((e) => e.id);
+}
+
+/**
+ * Get the total reward amount for specific claiming events.
+ */
+export async function getClaimingTotal(
+  walletAddress: string,
+  eventIds: string[]
+): Promise<number> {
+  const { data, error } = await supabase
+    .from("reward_events")
+    .select("final_reward")
+    .eq("wallet_address", walletAddress)
+    .eq("status", "claiming")
+    .in("id", eventIds);
+
+  if (error) throw new Error(`Failed to get claiming total: ${error.message}`);
+  return (data ?? []).reduce((sum, r) => sum + r.final_reward, 0);
+}
+
+/**
+ * Revert "claiming" events back to "pending" (e.g., on claim build failure).
+ */
+export async function revertClaimingEvents(
+  walletAddress: string
+): Promise<void> {
+  const { error } = await supabase
+    .from("reward_events")
+    .update({ status: "pending" })
+    .eq("wallet_address", walletAddress)
+    .eq("status", "claiming");
+
+  if (error)
+    console.error(`Failed to revert claiming events: ${error.message}`);
+}
+
+/**
  * Mark rewards as claimed (called after Solana transaction confirmed).
+ * Only marks events that are in "claiming" status with the given IDs.
  */
 export async function markRewardsClaimed(
   walletAddress: string,
@@ -142,7 +228,7 @@ export async function markRewardsClaimed(
     .update({ status: "claimed" })
     .eq("wallet_address", walletAddress)
     .in("id", eventIds)
-    .eq("status", "pending")
+    .eq("status", "claiming")
     .select("final_reward");
 
   if (error) throw new Error(`Failed to mark claimed: ${error.message}`);
