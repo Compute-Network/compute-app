@@ -60,10 +60,13 @@ app.route("/v1/billing", billingRouter);
 // Public pricing endpoint (no auth)
 app.get("/v1/pricing", async (c) => {
   const { PRICING } = await import("./services/billing.js");
+  const { getComputePrice } = await import("./services/pricefeed.js");
+  const computePrice = await getComputePrice();
   return c.json({
     credits_per_dollar: PRICING.creditsPerDollar,
     credits_per_token: PRICING.creditsPerToken,
     compute_token_bonus: PRICING.computeTokenBonus,
+    compute_price_usd: computePrice,
     volume_tiers: PRICING.volumeTiers,
     min_topup_dollars: PRICING.minTopupDollars,
   });
@@ -117,6 +120,10 @@ setInterval(async () => {
     console.error("[crypto] Deposit check failed:", e);
   }
 }, 30_000);
+
+// Start $COMPUTE price feed (DexScreener)
+import { startPriceFeed } from "./services/pricefeed.js";
+startPriceFeed();
 
 // Start server
 const port = parseInt(process.env.PORT ?? "3000", 10);
