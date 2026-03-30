@@ -115,12 +115,21 @@ export async function recordRequestReward(
 
       if (totalCredits <= 0) continue;
 
-      // Find account by wallet
-      const { data: account } = await supabase
+      // Find or create account by wallet
+      let { data: account } = await supabase
         .from("accounts")
         .select("id")
         .eq("wallet_address", event.wallet_address)
         .single();
+
+      if (!account) {
+        const { data: newAccount } = await supabase
+          .from("accounts")
+          .insert({ account_type: "wallet", wallet_address: event.wallet_address })
+          .select("id")
+          .single();
+        account = newAccount;
+      }
 
       if (account) {
         await topUpCredits(
@@ -128,7 +137,7 @@ export async function recordRequestReward(
           totalCredits,
           "bonus",
           `${event.final_reward.toFixed(4)} $COMPUTE reward auto-credited`
-        ).catch(() => {});
+        ).catch((err) => console.debug("[rewards] Auto-credit topup failed:", err.message));
       }
     }
   } catch (e: any) {

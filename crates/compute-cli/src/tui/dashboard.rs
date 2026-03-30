@@ -560,21 +560,6 @@ impl Dashboard {
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  Pending    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{:.1} $COMPUTE", e.pending),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled("  [c]laim", Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled("  All Time   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{:.0} $COMPUTE", e.all_time),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            Line::from(vec![
                 Span::styled("  This Week  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{:.1} $COMPUTE", e.this_week),
@@ -584,6 +569,21 @@ impl Dashboard {
                     format!("    ≈ ${:.2}", e.this_week * e.usd_rate),
                     Style::default().fg(Color::DarkGray),
                 ),
+            ]),
+            Line::from(vec![
+                Span::styled("  All Time   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:.0} $COMPUTE", e.all_time),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Pending    ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:.1} $COMPUTE", e.pending),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled("  [c]laim", Style::default().fg(Color::DarkGray)),
             ]),
         ];
 
