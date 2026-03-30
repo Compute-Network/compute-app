@@ -36,17 +36,6 @@ export async function recordRequestReward(
   const totalTokens = tokensGenerated + tokensPrompt;
   if (totalTokens === 0) return;
 
-  // Check for duplicate reward events for this pipeline
-  // NOTE: A DB unique constraint on (pipeline_id, node_id) should be added
-  // via migration: ALTER TABLE reward_events ADD CONSTRAINT unique_pipeline_node
-  //   UNIQUE (pipeline_id, node_id);
-  const { data: existing } = await supabase
-    .from("reward_events")
-    .select("id, node_id")
-    .eq("pipeline_id", pipeline.id);
-
-  const existingNodeIds = new Set((existing ?? []).map((e) => e.node_id));
-
   // Calculate total request reward
   const totalRequestReward =
     totalTokens *
@@ -54,10 +43,8 @@ export async function recordRequestReward(
     REWARD_CONFIG.baseRatePerTokenLayer *
     REWARD_CONFIG.busyHourMultiplier;
 
-  // Distribute across stages
-  const events = pipeline.stages
-    .filter((stage) => !existingNodeIds.has(stage.node_id))
-    .map((stage) => {
+  // Distribute across stages (one event per stage per request)
+  const events = pipeline.stages.map((stage) => {
       const layersServed = stage.end_layer - stage.start_layer + 1;
       const layerProportion = layersServed / pipeline.total_layers;
 
@@ -95,11 +82,6 @@ export async function recordRequestReward(
         status: "pending",
       };
     });
-
-  if (events.length === 0) {
-    // All stages already have reward events for this pipeline
-    return;
-  }
 
   // Batch insert reward events
   const { error } = await supabase.from("reward_events").insert(events);
