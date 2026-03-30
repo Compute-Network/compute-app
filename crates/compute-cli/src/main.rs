@@ -409,22 +409,20 @@ fn cmd_earnings() -> Result<()> {
     }
 
     let rt = tokio::runtime::Runtime::new()?;
-    let node = rt.block_on(async {
+    let earnings = rt.block_on(async {
         let client = SupabaseClient::new();
-        client.get_own_node(wallet).await
+        client.get_earnings(wallet).await
     });
 
-    match node {
-        Ok(Some(n)) => {
-            let pending = n.pending_compute.unwrap_or(0.0);
-            let earned = n.total_earned_compute.unwrap_or(0.0);
-            println!("  Earned      {:.2} $COMPUTE", earned);
-            println!("  Pending     {:.2} $COMPUTE", pending);
+    match earnings {
+        Ok(e) => {
+            println!("  Today       {:.2} $COMPUTE", e.today);
+            println!("  This Week   {:.2} $COMPUTE", e.this_week);
+            println!("  This Month  {:.2} $COMPUTE", e.this_month);
+            println!("  All Time    {:.2} $COMPUTE", e.all_time);
+            println!("  Pending     {:.2} $COMPUTE", e.pending);
             println!();
             println!("  Claim at: https://computenetwork.sh/dashboard/claim");
-        }
-        Ok(None) => {
-            println!("  Node not registered. Start the daemon to register.");
         }
         Err(e) => {
             println!("  Could not fetch earnings: {e}");

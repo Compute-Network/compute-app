@@ -356,6 +356,7 @@ name = "compute-network"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "quinn",
  "rcgen",
  "reqwest",

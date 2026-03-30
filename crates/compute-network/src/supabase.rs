@@ -114,6 +114,24 @@ pub struct OnlineNode {
     pub tflops_fp16: Option<f64>,
 }
 
+/// A single reward event from the reward_events table.
+#[derive(Debug, Clone, Deserialize)]
+struct RewardEvent {
+    pub final_reward: Option<f64>,
+    pub created_at: Option<String>,
+    pub status: Option<String>,
+}
+
+/// Earnings breakdown by time period.
+#[derive(Debug, Clone, Default)]
+pub struct EarningsData {
+    pub today: f64,
+    pub this_week: f64,
+    pub this_month: f64,
+    pub all_time: f64,
+    pub pending: f64,
+}
+
 /// Client for the Supabase REST API (PostgREST).
 pub struct SupabaseClient {
     client: reqwest::Client,
@@ -315,6 +333,61 @@ impl SupabaseClient {
 
         let rows: Vec<OwnNodeInfo> = resp.json().await?;
         Ok(rows.into_iter().next())
+    }
+
+    /// Fetch earnings breakdown from reward_events table.
+    pub async fn get_earnings(&self, wallet_address: &str) -> Result<EarningsData> {
+        // Fetch all reward events for this wallet
+        let resp = self
+            .client
+            .get(format!(
+                "{}/reward_events?select=final_reward,created_at,status&wallet_address=eq.{}&order=created_at.desc&limit=10000",
+                self.rest_url, wallet_address
+            ))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            anyhow::bail!("Failed to fetch earnings: {}", resp.status());
+        }
+
+        let events: Vec<RewardEvent> = resp.json().await?;
+
+        let now = chrono::Utc::now();
+        let today_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let week_start = (now - chrono::Duration::days(7)).naive_utc();
+        let month_start = (now - chrono::Duration::days(30)).naive_utc();
+
+        let mut today = 0.0;
+        let mut this_week = 0.0;
+        let mut this_month = 0.0;
+        let mut all_time = 0.0;
+        let mut pending = 0.0;
+
+        for event in &events {
+            let reward = event.final_reward.unwrap_or(0.0);
+            all_time += reward;
+
+            if event.status.as_deref() == Some("pending") {
+                pending += reward;
+            }
+
+            if let Some(ref ts) = event.created_at {
+                if let Ok(dt) = ts.parse::<chrono::DateTime<chrono::Utc>>() {
+                    if dt.naive_utc() >= today_start {
+                        today += reward;
+                    }
+                    if dt.naive_utc() >= week_start {
+                        this_week += reward;
+                    }
+                    if dt.naive_utc() >= month_start {
+                        this_month += reward;
+                    }
+                }
+            }
+        }
+
+        Ok(EarningsData { today, this_week, this_month, all_time, pending })
     }
 
     /// Check if Supabase is reachable.

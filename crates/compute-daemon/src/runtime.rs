@@ -226,6 +226,19 @@ impl DaemonRuntime {
                     state.earnings.pending = pending;
                 });
 
+                // Fetch earnings breakdown from reward_events
+                if let Ok(earnings) = client.get_earnings(wallet).await {
+                    self.update_state(|state| {
+                        state.earnings.today = earnings.today;
+                        state.earnings.this_week = earnings.this_week;
+                        state.earnings.this_month = earnings.this_month;
+                        state.earnings.all_time = earnings.all_time;
+                        if earnings.pending > 0.0 {
+                            state.earnings.pending = earnings.pending;
+                        }
+                    });
+                }
+
                 // Tell inference manager about the assignment
                 inference_mgr
                     .check_assignment(node.pipeline_id.as_deref(), node.model_name.as_deref());

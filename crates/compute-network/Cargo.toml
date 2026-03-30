@@ -21,6 +21,9 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
+# Time
+chrono = "0.4"
+
 # QUIC transport
 quinn = { workspace = true }
 rustls = { workspace = true }
