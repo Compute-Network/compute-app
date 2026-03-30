@@ -270,12 +270,15 @@ async function postProcess(
       recordUsage(apiKeyId, totalTokens).catch(console.error);
     }
 
-    // Deduct credits
+    // Deduct credits (awaited — ensures billing consistency)
     if (accountId && apiKeyId) {
-      const { deductCredits } = await import("../services/billing.js");
-      deductCredits(accountId, totalTokens, apiKeyId, modelId).catch((err) =>
-        console.warn("[billing] Deduction failed:", err.message)
-      );
+      try {
+        const { deductCredits } = await import("../services/billing.js");
+        await deductCredits(accountId, totalTokens, apiKeyId, modelId);
+      } catch (err: any) {
+        // Log as error, not warning — billing failures need attention
+        console.error(`[billing] DEDUCTION FAILED: account=${accountId} tokens=${totalTokens} error=${err.message}`);
+      }
     }
   }
 

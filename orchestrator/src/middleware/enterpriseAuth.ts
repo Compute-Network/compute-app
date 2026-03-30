@@ -4,7 +4,14 @@ import { PublicKey } from "@solana/web3.js";
 import nacl from "tweetnacl";
 import { supabase } from "../services/db.js";
 
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+const JWT_SECRET: string = (() => {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    console.error("FATAL: JWT_SECRET environment variable is required");
+    process.exit(1);
+  }
+  return secret;
+})();
 
 export interface JwtPayload {
   accountId: string;
@@ -29,7 +36,7 @@ export function signJwt(accountId: string, email?: string): string {
  */
 export function verifyJwt(token: string): JwtPayload | null {
   try {
-    return jwt.verify(token, JWT_SECRET) as JwtPayload;
+    return jwt.verify(token, JWT_SECRET) as unknown as JwtPayload;
   } catch {
     return null;
   }
@@ -112,23 +119,12 @@ export async function accountAuth(c: Context, next: Next) {
       return next();
     }
 
-    // Auto-create wallet account
-    const { data: newAccount, error } = await supabase
-      .from("accounts")
-      .insert({ account_type: "wallet", wallet_address: walletAddress })
-      .select("id")
-      .single();
-
-    if (error || !newAccount) {
-      return c.json(
-        { error: { message: "Failed to create account", type: "server_error" } },
-        500
-      );
-    }
-
-    (c as any).set("accountId", newAccount.id);
-    (c as any).set("accountType", "wallet");
-    return next();
+    // No auto-creation — wallet must have an account already
+    // (created via API key generation or explicit registration)
+    return c.json(
+      { error: { message: "No account found for this wallet. Generate an API key first.", type: "authentication_error" } },
+      401
+    );
   }
 
   return c.json(

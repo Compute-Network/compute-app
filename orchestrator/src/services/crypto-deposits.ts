@@ -6,12 +6,16 @@ import { topUpCredits, calculateCredits, PRICING } from "./billing.js";
 const USDC_MINT = process.env.USDC_MINT || "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"; // devnet USDC
 const COMPUTE_MINT = process.env.COMPUTE_MINT || "7Jun2ULc2mRTBh6M5nPyzGHj7ziFianr3y1x4MSLiiK1";
 
-// Price feeds (hardcoded for devnet; in production, use an oracle)
+// Price feeds — configurable via env vars, with devnet defaults.
+// In production, these should be updated by a cron job or oracle integration.
 const TOKEN_PRICES_USD: Record<string, number> = {
-  SOL: 150, // approximate
-  USDC: 1,
-  COMPUTE: 0.001, // placeholder
+  SOL: parseFloat(process.env.PRICE_SOL_USD || "150"),
+  USDC: 1, // Stablecoin — always 1
+  COMPUTE: parseFloat(process.env.PRICE_COMPUTE_USD || "0.001"),
 };
+
+// Log prices at startup so operators can verify
+console.log("[crypto-deposits] Token prices:", TOKEN_PRICES_USD);
 
 let lastSignature: string | undefined;
 

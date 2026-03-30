@@ -8,8 +8,38 @@ import nacl from "tweetnacl";
 
 export const authRouter = new Hono();
 
+// ── Rate limiting for auth endpoints ────────────────────────────────
+const authRateLimits = new Map<string, { count: number; resetAt: number }>();
+const AUTH_MAX_PER_WINDOW = 10; // 10 attempts per window
+const AUTH_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
+function checkAuthRateLimit(key: string): boolean {
+  const now = Date.now();
+  let entry = authRateLimits.get(key);
+  if (!entry || now >= entry.resetAt) {
+    entry = { count: 0, resetAt: now + AUTH_WINDOW_MS };
+    authRateLimits.set(key, entry);
+  }
+  entry.count++;
+  return entry.count <= AUTH_MAX_PER_WINDOW;
+}
+
+// Cleanup every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of authRateLimits) {
+    if (now >= v.resetAt) authRateLimits.delete(k);
+  }
+}, 10 * 60 * 1000);
+
 // Enterprise signup
 authRouter.post("/signup", async (c) => {
+  // Rate limit by IP
+  const ip = c.req.header("x-forwarded-for") || "unknown";
+  if (!checkAuthRateLimit(`signup:${ip}`)) {
+    return c.json({ error: { message: "Too many signup attempts. Try again later.", type: "rate_limit_error" } }, 429);
+  }
+
   let body: { email: string; password: string };
   try {
     body = await c.req.json();
@@ -54,6 +84,11 @@ authRouter.post("/signup", async (c) => {
 
 // Enterprise login
 authRouter.post("/login", async (c) => {
+  const ip = c.req.header("x-forwarded-for") || "unknown";
+  if (!checkAuthRateLimit(`login:${ip}`)) {
+    return c.json({ error: { message: "Too many login attempts. Try again later.", type: "rate_limit_error" } }, 429);
+  }
+
   let body: { email: string; password: string };
   try {
     body = await c.req.json();
@@ -64,6 +99,11 @@ authRouter.post("/login", async (c) => {
   const { email, password } = body;
   if (!email || !password) {
     return c.json({ error: { message: "Email and password required", type: "invalid_request_error" } }, 400);
+  }
+
+  // Also rate limit per email to prevent targeted brute force
+  if (!checkAuthRateLimit(`login:email:${email.toLowerCase()}`)) {
+    return c.json({ error: { message: "Too many login attempts for this account. Try again later.", type: "rate_limit_error" } }, 429);
   }
 
   const account = await getAccountByEmail(email);

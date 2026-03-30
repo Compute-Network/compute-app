@@ -113,13 +113,28 @@ export async function handleWebhook(
   if (event.type === "checkout.session.completed") {
     const session = event.data.object as Stripe.Checkout.Session;
     const accountId = session.metadata?.account_id;
-    const credits = parseInt(session.metadata?.credits ?? "0", 10);
-    const amountDollars = session.metadata?.amount_dollars ?? "0";
 
-    if (!accountId || credits <= 0) {
-      console.warn("[stripe] Checkout completed but missing metadata:", session.id);
+    if (!accountId) {
+      console.warn("[stripe] Checkout completed but missing account_id:", session.id);
       return { handled: false, event: event.type };
     }
+
+    // Verify payment was actually completed
+    if (session.payment_status !== "paid") {
+      console.warn("[stripe] Session not paid:", session.id, session.payment_status);
+      return { handled: false, event: event.type };
+    }
+
+    // SECURITY: Recalculate credits from the actual payment amount, NOT metadata.
+    // Metadata is set at session creation time and could be tampered with in transit.
+    const amountCents = session.amount_total ?? 0;
+    if (amountCents <= 0) {
+      console.warn("[stripe] Zero amount session:", session.id);
+      return { handled: false, event: event.type };
+    }
+
+    const amountDollars = amountCents / 100;
+    const { totalCredits } = calculateCredits(amountDollars);
 
     // Idempotency: check if we already processed this session
     const { data: existing } = await supabase
@@ -135,13 +150,13 @@ export async function handleWebhook(
 
     await topUpCredits(
       accountId,
-      credits,
+      totalCredits,
       "stripe_topup",
-      `$${amountDollars} top-up via Stripe`,
+      `$${amountDollars.toFixed(2)} top-up via Stripe`,
       session.id
     );
 
-    console.log(`[stripe] Credited ${credits} to account ${accountId} (session: ${session.id})`);
+    console.log(`[stripe] Credited ${totalCredits} to account ${accountId} ($${amountDollars.toFixed(2)}, session: ${session.id})`);
     return { handled: true, event: event.type };
   }
 

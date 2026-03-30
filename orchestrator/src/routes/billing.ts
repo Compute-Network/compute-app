@@ -12,9 +12,19 @@ import { createCheckoutSession } from "../services/stripe.js";
 
 export const billingRouter = new Hono();
 
+function requireAccountId(c: any): string | null {
+  const id = (c as any).get("accountId");
+  if (!id) {
+    c.json({ error: { message: "Unauthorized", type: "authentication_error" } }, 401);
+    return null;
+  }
+  return id as string;
+}
+
 // Get credits balance
 billingRouter.get("/balance", async (c) => {
-  const accountId = (c as any).get("accountId") as string;
+  const accountId = requireAccountId(c);
+  if (!accountId) return c.res;
   try {
     const balance = await getBalance(accountId);
     return c.json({ credits_balance: balance });
@@ -26,7 +36,8 @@ billingRouter.get("/balance", async (c) => {
 
 // Get transaction history (paginated)
 billingRouter.get("/transactions", async (c) => {
-  const accountId = (c as any).get("accountId") as string;
+  const accountId = requireAccountId(c);
+  if (!accountId) return c.res;
   const limit = parseInt(c.req.query("limit") ?? "50", 10);
   const offset = parseInt(c.req.query("offset") ?? "0", 10);
 
@@ -41,7 +52,8 @@ billingRouter.get("/transactions", async (c) => {
 
 // Get daily usage analytics
 billingRouter.get("/usage", async (c) => {
-  const accountId = (c as any).get("accountId") as string;
+  const accountId = requireAccountId(c);
+  if (!accountId) return c.res;
   const days = parseInt(c.req.query("days") ?? "30", 10);
 
   try {
@@ -55,7 +67,8 @@ billingRouter.get("/usage", async (c) => {
 
 // Get usage summary (this month vs last month)
 billingRouter.get("/usage/summary", async (c) => {
-  const accountId = (c as any).get("accountId") as string;
+  const accountId = requireAccountId(c);
+  if (!accountId) return c.res;
   try {
     const summary = await getUsageSummary(accountId);
     return c.json(summary);
@@ -67,7 +80,8 @@ billingRouter.get("/usage/summary", async (c) => {
 
 // Create Stripe Checkout session for top-up
 billingRouter.post("/topup/stripe", async (c) => {
-  const accountId = (c as any).get("accountId") as string;
+  const accountId = requireAccountId(c);
+  if (!accountId) return c.res;
 
   let body: { amount: number; success_url?: string; cancel_url?: string };
   try {
@@ -77,7 +91,7 @@ billingRouter.post("/topup/stripe", async (c) => {
   }
 
   const { amount, success_url, cancel_url } = body;
-  if (!amount || amount < PRICING.minTopupDollars) {
+  if (!amount || typeof amount !== "number" || amount < PRICING.minTopupDollars || amount > 100_000) {
     return c.json({
       error: {
         message: `Minimum top-up is $${PRICING.minTopupDollars}`,
@@ -114,7 +128,8 @@ billingRouter.post("/topup/stripe", async (c) => {
 
 // Create crypto deposit intent
 billingRouter.post("/topup/crypto", async (c) => {
-  const accountId = (c as any).get("accountId") as string;
+  const accountId = requireAccountId(c);
+  if (!accountId) return c.res;
 
   let body: { token: string; amount_usd?: number };
   try {
