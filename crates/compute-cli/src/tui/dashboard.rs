@@ -615,6 +615,7 @@ impl Dashboard {
         let power_line =
             match (self.live_metrics.gpu_power_watts, self.live_metrics.gpu_power_limit_watts) {
                 (Some(p), Some(l)) => format!("{p}W / {l}W"),
+                (Some(p), None) => format!("{p}W"),
                 _ => "N/A".into(),
             };
 

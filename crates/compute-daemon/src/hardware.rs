@@ -256,19 +256,18 @@ pub fn collect_live_metrics(sys: &mut System) -> LiveMetrics {
         metrics.gpu_power_limit_watts = Some(gpu_metrics.5);
     }
 
-    // Apple Silicon: unified memory is VRAM, get GPU temp via powermetrics
+    // Apple Silicon: unified memory is VRAM, read temp/power from ioreg
     #[cfg(target_os = "macos")]
     if metrics.gpu_temp.is_none() {
-        // On Apple Silicon, unified memory acts as VRAM
-        // Report system memory usage as VRAM since it's shared
         let total_mb = (memory_total_gb * 1024.0) as u64;
         let used_mb = (memory_used_gb * 1024.0) as u64;
         metrics.gpu_vram_used_mb = Some(used_mb);
         metrics.gpu_vram_total_mb = Some(total_mb);
 
-        // Try to get GPU temp from macOS thermal sensors
-        if let Ok(temp) = collect_macos_gpu_temp() {
-            metrics.gpu_temp = Some(temp);
+        let (temp, power) = collect_macos_metrics();
+        metrics.gpu_temp = temp;
+        if let Some(w) = power {
+            metrics.gpu_power_watts = Some(w);
         }
     }
 
@@ -307,23 +306,48 @@ fn collect_nvidia_metrics() -> Result<(u32, f32, u64, u64, u32, u32)> {
     ))
 }
 
-/// Get Apple Silicon GPU/SoC temperature via SMC.
+/// Read macOS system temp and power from AppleSmartBattery via ioreg.
+/// Returns (temperature_celsius, power_watts).
 #[cfg(target_os = "macos")]
-fn collect_macos_gpu_temp() -> Result<u32> {
+fn collect_macos_metrics() -> (Option<u32>, Option<u32>) {
     use std::process::Command;
 
-    // Read thermal pressure level from sysctl (available without sudo)
-    let output =
-        Command::new("sysctl").arg("-n").arg("kern.sched_thermal_throttle_level").output()?;
+    let output = match Command::new("ioreg").args(["-r", "-n", "AppleSmartBattery"]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return (None, None),
+    };
 
-    if output.status.success() {
-        // Throttle level 0=cool, increases under load
-        // Map to approximate temp range
-        let level: u32 = String::from_utf8_lossy(&output.stdout).trim().parse().unwrap_or(0);
-        return Ok(35 + level * 10); // Rough approximation
-    }
+    // Temperature: stored as centi-Kelvin (e.g. 3055 = 305.5K = 32.4°C)
+    let temp = output
+        .lines()
+        .find(|l| l.contains("\"Temperature\""))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|ck| ((ck as f64 / 10.0) - 273.15) as u32);
 
-    anyhow::bail!("Could not read macOS temperature")
+    // Power: voltage × current
+    let voltage_mv = output
+        .lines()
+        .find(|l| l.contains("\"AppleRawBatteryVoltage\""))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let power = output
+        .lines()
+        .find(|l| l.contains("\"InstantAmperage\""))
+        .and_then(|l| l.split('=').nth(1))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|raw| {
+            let current_ma = if raw > (1u64 << 63) {
+                (raw.wrapping_neg()) as u64 // absolute value of negative
+            } else {
+                raw
+            };
+            ((voltage_mv * current_ma) / 1_000_000) as u32
+        });
+
+    (temp, power)
 }
 
 #[cfg(test)]
