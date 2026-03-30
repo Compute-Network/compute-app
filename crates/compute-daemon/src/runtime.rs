@@ -233,21 +233,25 @@ impl DaemonRuntime {
                     state.earnings.pending = pending;
                 });
 
-                // Fetch earnings breakdown from reward_events
-                match client.get_earnings(wallet).await {
-                    Err(e) => tracing::warn!("Failed to fetch earnings: {e}"),
-                    Ok(earnings) => {
-                        self.update_state(|state| {
-                            state.earnings.today = earnings.today;
-                            state.earnings.this_week = earnings.this_week;
-                            state.earnings.this_month = earnings.this_month;
-                            state.earnings.all_time = earnings.all_time;
-                            if earnings.pending > 0.0 {
-                                state.earnings.pending = earnings.pending;
-                            }
-                        });
+                // Fetch time-bucketed earnings from reward_events
+                let wallet_owned = wallet.to_string();
+                let state_tx = self.state_tx.clone();
+                tokio::spawn(async move {
+                    let client = compute_network::supabase::SupabaseClient::new();
+                    match client.get_earnings(&wallet_owned).await {
+                        Ok(e) => {
+                            state_tx.send_modify(|state| {
+                                state.earnings.today = e.today;
+                                state.earnings.this_week = e.this_week;
+                                state.earnings.this_month = e.this_month;
+                                state.earnings.all_time = e.all_time;
+                            });
+                        }
+                        Err(err) => {
+                            tracing::debug!("Earnings fetch failed: {err}");
+                        }
                     }
-                }
+                });
 
                 // Tell inference manager about the assignment
                 inference_mgr
