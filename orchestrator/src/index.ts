@@ -124,6 +124,7 @@ setInterval(async () => {
 // Start $COMPUTE price feed (DexScreener)
 import { startPriceFeed } from "./services/pricefeed.js";
 startPriceFeed();
+// creditsPerToken stays fixed at 40 — pricefeed adjusts the reward rate instead
 
 // Start server
 const port = parseInt(process.env.PORT ?? "3000", 10);
