@@ -181,8 +181,24 @@ impl RelayClient {
                             let start = std::time::Instant::now();
                             let response =
                                 handle_inference_request(&http_client, inference_port, &req).await;
-                            let latency = start.elapsed().as_millis() as u64;
-                            self.last_latency_ms.store(latency, Ordering::Relaxed);
+                            let total_ms = start.elapsed().as_millis() as u64;
+
+                            // Latency = total time - inference time (prompt + generation)
+                            let inference_ms = response
+                                .body
+                                .get("timings")
+                                .map(|t| {
+                                    let prompt =
+                                        t.get("prompt_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    let predicted = t
+                                        .get("predicted_ms")
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0);
+                                    (prompt + predicted) as u64
+                                })
+                                .unwrap_or(0);
+                            let network_latency = total_ms.saturating_sub(inference_ms);
+                            self.last_latency_ms.store(network_latency, Ordering::Relaxed);
 
                             // Extract real tps from response body
                             if let Some(tps) = response
