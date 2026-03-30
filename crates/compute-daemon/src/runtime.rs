@@ -92,6 +92,8 @@ impl DaemonRuntime {
         // Start WebSocket relay to orchestrator
         let relay = RelayClient::new(&self.config, self.shutdown.clone());
         let relay_latency = relay.last_latency_ms();
+        let relay_tps = relay.last_tps();
+        let relay_active = relay.active_since();
         let relay_handle = tokio::spawn(async move {
             if let Err(e) = relay.run().await {
                 tracing::error!("[relay] Fatal error: {e}");
@@ -122,19 +124,18 @@ impl DaemonRuntime {
                     let uptime = start_time.elapsed().as_secs();
                     let inf_status = inference_mgr.status().to_string();
 
-                    // Poll llama-server /slots for live throughput
-                    let inf_metrics = inference_mgr.get_metrics().await;
-                    let is_processing = inf_metrics
-                        .as_ref()
-                        .map(|m| m.slots_processing > 0)
-                        .unwrap_or(false);
-                    let slots_active = inf_metrics
-                        .as_ref()
-                        .map(|m| m.slots_processing)
-                        .unwrap_or(0);
-
-                    // Read latest relay latency
+                    // Read latest relay metrics
                     let latency = relay_latency.load(std::sync::atomic::Ordering::Relaxed);
+                    let active_since = relay_active.load(std::sync::atomic::Ordering::Relaxed);
+                    let last_tps_bits = relay_tps.load(std::sync::atomic::Ordering::Relaxed);
+                    let last_tps = f64::from_bits(last_tps_bits);
+
+                    // Check if relay is actively processing a request right now
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    let is_relay_active = active_since > 0 && (now_ms - active_since) < 30_000;
 
                     self.update_state(|state| {
                         state.live_metrics = metrics;
@@ -143,13 +144,12 @@ impl DaemonRuntime {
                         if latency > 0 {
                             state.pipeline.avg_latency_ms = latency as f64;
                         }
-                        if is_processing {
-                            // Base ~140 tok/s with gentle variation
-                            let base = 140.0 * slots_active as f64;
-                            let jitter = ((uptime as f64 * 0.5).sin() * 8.0)
-                                + ((uptime as f64 * 0.3).cos() * 5.0);
-                            state.pipeline.tokens_per_sec = (base + jitter).max(80.0);
-                        } else if state.pipeline.active {
+                        if is_relay_active {
+                            // Actively processing — show real tps from last completed request
+                            if last_tps > 0.0 {
+                                state.pipeline.tokens_per_sec = last_tps;
+                            }
+                        } else {
                             state.pipeline.tokens_per_sec = 0.0;
                         }
                     });

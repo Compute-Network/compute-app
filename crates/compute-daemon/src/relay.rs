@@ -46,12 +46,23 @@ pub struct RelayClient {
     inference_port: u16,
     shutdown: Arc<AtomicBool>,
     last_latency_ms: Arc<AtomicU64>,
+    /// Real tok/s from the last inference response (from llama-server timings)
+    last_tps: Arc<AtomicU64>,
+    /// Epoch millis when the last request started (0 = idle)
+    active_since: Arc<AtomicU64>,
 }
 
 impl RelayClient {
-    /// Get the latest request latency in milliseconds.
     pub fn last_latency_ms(&self) -> Arc<AtomicU64> {
         self.last_latency_ms.clone()
+    }
+
+    pub fn last_tps(&self) -> Arc<AtomicU64> {
+        self.last_tps.clone()
+    }
+
+    pub fn active_since(&self) -> Arc<AtomicU64> {
+        self.active_since.clone()
     }
 }
 
@@ -72,6 +83,8 @@ impl RelayClient {
             inference_port: 8090,
             shutdown,
             last_latency_ms: Arc::new(AtomicU64::new(0)),
+            last_tps: Arc::new(AtomicU64::new(0)),
+            active_since: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -158,11 +171,32 @@ impl RelayClient {
                     let request: Result<RelayRequest, _> = serde_json::from_str(&text);
                     match request {
                         Ok(req) if req.r#type == "inference_request" => {
+                            // Mark as actively processing
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            self.active_since.store(now_ms, Ordering::Relaxed);
+
                             let start = std::time::Instant::now();
                             let response =
                                 handle_inference_request(&http_client, inference_port, &req).await;
                             let latency = start.elapsed().as_millis() as u64;
                             self.last_latency_ms.store(latency, Ordering::Relaxed);
+
+                            // Extract real tps from response body
+                            if let Some(tps) = response
+                                .body
+                                .get("timings")
+                                .and_then(|t| t.get("predicted_per_second"))
+                                .and_then(|v| v.as_f64())
+                            {
+                                self.last_tps.store(tps.to_bits(), Ordering::Relaxed);
+                            }
+
+                            // Mark as idle
+                            self.active_since.store(0, Ordering::Relaxed);
+
                             let response_json = serde_json::to_string(&response)?;
                             write.send(Message::Text(response_json)).await?;
                         }

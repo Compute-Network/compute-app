@@ -340,7 +340,7 @@ fn collect_macos_metrics() -> (Option<u32>, Option<u32>) {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(|raw| {
             let current_ma = if raw > (1u64 << 63) {
-                (raw.wrapping_neg()) as u64 // absolute value of negative
+                raw.wrapping_neg() // absolute value of negative
             } else {
                 raw
             };

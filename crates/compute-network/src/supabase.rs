@@ -372,17 +372,17 @@ impl SupabaseClient {
                 pending += reward;
             }
 
-            if let Some(ref ts) = event.created_at {
-                if let Ok(dt) = ts.parse::<chrono::DateTime<chrono::Utc>>() {
-                    if dt.naive_utc() >= today_start {
-                        today += reward;
-                    }
-                    if dt.naive_utc() >= week_start {
-                        this_week += reward;
-                    }
-                    if dt.naive_utc() >= month_start {
-                        this_month += reward;
-                    }
+            if let Some(ref ts) = event.created_at
+                && let Ok(dt) = ts.parse::<chrono::DateTime<chrono::Utc>>()
+            {
+                if dt.naive_utc() >= today_start {
+                    today += reward;
+                }
+                if dt.naive_utc() >= week_start {
+                    this_week += reward;
+                }
+                if dt.naive_utc() >= month_start {
+                    this_month += reward;
                 }
             }
         }
