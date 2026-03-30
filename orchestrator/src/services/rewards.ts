@@ -162,10 +162,6 @@ export async function getRewardHistory(
 /**
  * Mark pending events for a wallet as "claiming" to prevent double-claims.
  * Returns the event IDs that were marked.
- *
- * TODO: Add a cleanup job that reverts "claiming" events back to "pending"
- * if they aren't confirmed within 5 minutes. This prevents permanently
- * locked events if the user abandons the claim flow.
  */
 export async function markEventsAsClaiming(
   walletAddress: string
@@ -290,3 +286,35 @@ export function updateRewardConfig(
 export function getRewardConfig(): typeof REWARD_CONFIG {
   return { ...REWARD_CONFIG };
 }
+
+/**
+ * Revert any "claiming" events older than 5 minutes back to "pending".
+ * Prevents permanently locked events when users abandon the claim flow.
+ */
+export async function revertStaleClaimingEvents(): Promise<number> {
+  const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from("reward_events")
+    .update({ status: "pending" })
+    .eq("status", "claiming")
+    .lt("updated_at", fiveMinAgo)
+    .select("id");
+
+  if (error) {
+    console.error("[rewards] Failed to revert stale claiming events:", error.message);
+    return 0;
+  }
+  const count = data?.length ?? 0;
+  if (count > 0) {
+    console.log(`[rewards] Reverted ${count} stale claiming events back to pending`);
+  }
+  return count;
+}
+
+// Revert stale claiming events every 2 minutes
+setInterval(() => {
+  revertStaleClaimingEvents().catch(() => {});
+}, 2 * 60 * 1000);
+
+// Also revert on startup
+revertStaleClaimingEvents().catch(() => {});
