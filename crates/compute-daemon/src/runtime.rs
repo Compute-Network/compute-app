@@ -93,7 +93,7 @@ impl DaemonRuntime {
         let relay = RelayClient::new(&self.config, self.shutdown.clone());
         let relay_latency = relay.last_latency_ms();
         let relay_tps = relay.last_tps();
-        let relay_active = relay.active_since();
+        let relay_last_req = relay.last_request_at();
         let relay_handle = tokio::spawn(async move {
             if let Err(e) = relay.run().await {
                 tracing::error!("[relay] Fatal error: {e}");
@@ -126,16 +126,16 @@ impl DaemonRuntime {
 
                     // Read latest relay metrics
                     let latency = relay_latency.load(std::sync::atomic::Ordering::Relaxed);
-                    let active_since = relay_active.load(std::sync::atomic::Ordering::Relaxed);
+                    let last_req_at = relay_last_req.load(std::sync::atomic::Ordering::Relaxed);
                     let last_tps_bits = relay_tps.load(std::sync::atomic::Ordering::Relaxed);
                     let last_tps = f64::from_bits(last_tps_bits);
 
-                    // Check if relay is actively processing a request right now
+                    // Show tps for 5 seconds after a request completes, then fade out
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as u64;
-                    let is_relay_active = active_since > 0 && (now_ms - active_since) < 30_000;
+                    let since_last_req = if last_req_at > 0 { now_ms - last_req_at } else { u64::MAX };
 
                     self.update_state(|state| {
                         state.live_metrics = metrics;
@@ -144,11 +144,9 @@ impl DaemonRuntime {
                         if latency > 0 {
                             state.pipeline.avg_latency_ms = latency as f64;
                         }
-                        if is_relay_active {
-                            // Actively processing — show real tps from last completed request
-                            if last_tps > 0.0 {
-                                state.pipeline.tokens_per_sec = last_tps;
-                            }
+                        if since_last_req < 5_000 && last_tps > 0.0 {
+                            // Recent request — show real tps
+                            state.pipeline.tokens_per_sec = last_tps;
                         } else {
                             state.pipeline.tokens_per_sec = 0.0;
                         }
