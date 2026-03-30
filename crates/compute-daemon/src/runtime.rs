@@ -31,7 +31,7 @@ impl Default for DaemonState {
         Self {
             running: false,
             idle_state: IdleState::Idle,
-            hardware: hardware::detect(),
+            hardware: hardware::HardwareInfo::empty(),
             live_metrics: hardware::LiveMetrics::default(),
             earnings: Earnings::default(),
             pipeline: PipelineStatus::default(),
@@ -45,6 +45,7 @@ impl Default for DaemonState {
 /// The daemon runtime — runs the background event loop.
 pub struct DaemonRuntime {
     config: Config,
+    hardware: hardware::HardwareInfo,
     shutdown: Arc<AtomicBool>,
     state_tx: watch::Sender<DaemonState>,
     state_rx: watch::Receiver<DaemonState>,
@@ -53,7 +54,25 @@ pub struct DaemonRuntime {
 impl DaemonRuntime {
     pub fn new(config: Config) -> Self {
         let (state_tx, state_rx) = watch::channel(DaemonState::default());
-        Self { config, shutdown: Arc::new(AtomicBool::new(false)), state_tx, state_rx }
+        Self {
+            config,
+            hardware: hardware::HardwareInfo::empty(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            state_tx,
+            state_rx,
+        }
+    }
+
+    /// Create with pre-detected hardware to avoid redundant detection.
+    pub fn with_hardware(config: Config, hw: hardware::HardwareInfo) -> Self {
+        let (state_tx, state_rx) = watch::channel(DaemonState::default());
+        Self {
+            config,
+            hardware: hw,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            state_tx,
+            state_rx,
+        }
     }
 
     /// Get a receiver for the daemon state (for the TUI to subscribe to).
@@ -75,8 +94,12 @@ impl DaemonRuntime {
         let mut sys = sysinfo::System::new_all();
         let start_time = std::time::Instant::now();
 
-        // Initial state
-        let hw = hardware::detect();
+        // Initial state — use pre-detected hardware if available, else detect now
+        let hw = if self.hardware.cpu.cores > 0 {
+            self.hardware.clone()
+        } else {
+            hardware::detect()
+        };
         self.update_state(|state| {
             state.running = true;
             state.hardware = hw;

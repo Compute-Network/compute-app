@@ -1177,9 +1177,9 @@ fn open_claim_page() {
     let wallet = &config.wallet.public_address;
 
     let url = if wallet.is_empty() {
-        "https://computenetwork.sh/dashboard/claim".to_string()
+        "https://computenetwork.sh/?connect=true".to_string()
     } else {
-        format!("https://computenetwork.sh/dashboard/claim?wallet={wallet}")
+        format!("https://computenetwork.sh/?connect=true&wallet={wallet}")
     };
 
     #[cfg(target_os = "macos")]

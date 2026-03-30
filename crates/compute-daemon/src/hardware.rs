@@ -69,6 +69,20 @@ pub struct DockerStatus {
     pub version: Option<String>,
 }
 
+impl HardwareInfo {
+    /// Lightweight placeholder — no system calls. Used for initial state before detection runs.
+    pub fn empty() -> Self {
+        Self {
+            cpu: CpuInfo { brand: String::new(), cores: 0, threads: 0, frequency_mhz: 0 },
+            memory: MemoryInfo { total_gb: 0.0, available_gb: 0.0 },
+            gpus: vec![],
+            disk: DiskInfo { total_gb: 0.0, available_gb: 0.0 },
+            os: OsInfo { name: String::new(), version: String::new(), arch: String::new() },
+            docker: DockerStatus { available: false, version: None },
+        }
+    }
+}
+
 /// Detect all hardware information.
 pub fn detect() -> HardwareInfo {
     let mut sys = System::new_all();
