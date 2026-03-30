@@ -206,6 +206,42 @@ export async function adminAuth(c: Context, next: Next) {
 }
 
 /**
+ * Synchronous admin auth check — returns a Response if unauthorized, null if OK.
+ * Use this inside route handlers where Hono .use() can't target a single HTTP method.
+ */
+export function verifyAdminRequest(c: Context): Response | null {
+  const signatureB64 = c.req.header("X-Wallet-Signature");
+  const publicKeyB58 = c.req.header("X-Wallet-Public-Key");
+
+  if (!signatureB64 || !publicKeyB58) {
+    return c.json({ error: { message: "Missing auth headers", type: "authentication_error" } }, 401);
+  }
+
+  let pubkey: PublicKey;
+  try { pubkey = new PublicKey(publicKeyB58); } catch {
+    return c.json({ error: { message: "Invalid public key", type: "authentication_error" } }, 401);
+  }
+
+  let signatureBytes: Uint8Array;
+  try { signatureBytes = Uint8Array.from(Buffer.from(signatureB64, "base64")); } catch {
+    return c.json({ error: { message: "Invalid signature", type: "authentication_error" } }, 401);
+  }
+
+  const message = new TextEncoder().encode(pubkey.toBase58());
+  const valid = nacl.sign.detached.verify(message, signatureBytes, pubkey.toBytes());
+  if (!valid) {
+    return c.json({ error: { message: "Invalid wallet signature", type: "authentication_error" } }, 401);
+  }
+
+  const adminWallet = getAdminWallet();
+  if (!adminWallet || pubkey.toBase58() !== adminWallet) {
+    return c.json({ error: { message: "Unauthorized: not admin", type: "authorization_error" } }, 403);
+  }
+
+  return null; // Auth passed
+}
+
+/**
  * Returns the admin wallet address from ADMIN_WALLET env var,
  * or derives it from SOLANA_KEYPAIR if available.
  */

@@ -10,15 +10,16 @@ import {
 } from "../services/solana.js";
 import {
   walletAuth,
-  adminAuth,
+  verifyAdminRequest,
   claimRateLimit,
 } from "../middleware/walletAuth.js";
 
 export const rewardsRouter = new Hono();
 
 // ── Apply auth middleware to protected routes ──────────────────────
-rewardsRouter.use("/:wallet/claim", walletAuth, claimRateLimit);
-rewardsRouter.use("/:wallet/confirm", walletAuth, claimRateLimit);
+// Hono .use() with parameterized paths needs wildcard: /*/claim matches /:wallet/claim
+rewardsRouter.use("/*/claim", walletAuth, claimRateLimit);
+rewardsRouter.use("/*/confirm", walletAuth, claimRateLimit);
 
 // ── Public read-only endpoints ────────────────────────────────────
 
@@ -162,9 +163,12 @@ rewardsRouter.post("/:wallet/confirm", async (c) => {
   }
 });
 
-// Update reward config — admin only (apply auth via .on() to avoid blocking GET)
-rewardsRouter.on("PATCH", "/config", adminAuth);
+// Update reward config — admin only
+// We check admin auth inside the PATCH handler since .use("/config") would block GET too
 rewardsRouter.patch("/config", async (c) => {
+  const authError = verifyAdminRequest(c);
+  if (authError) return authError;
+
   try {
     const updates = await c.req.json();
     rewards.updateRewardConfig(updates);
