@@ -14,6 +14,17 @@ use compute_network::supabase::SupabaseClient;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> Result<()> {
+    // Ensure terminal is restored on panic (raw mode + alternate screen)
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(
+            std::io::stderr(),
+            crossterm::terminal::LeaveAlternateScreen
+        );
+        let _ = crossterm::terminal::disable_raw_mode();
+        default_panic(info);
+    }));
+
     let cli = Cli::parse();
 
     match cli.command {
