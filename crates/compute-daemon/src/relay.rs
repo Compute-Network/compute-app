@@ -39,6 +39,13 @@ struct RelayResponse {
     body: serde_json::Value,
 }
 
+#[derive(Serialize)]
+struct RelayStreamChunk {
+    id: String,
+    r#type: String,
+    chunk: String,
+}
+
 pub struct RelayClient {
     ws_url: String,
     node_id: String,
@@ -173,42 +180,63 @@ impl RelayClient {
                         Ok(req) if req.r#type == "inference_request" => {
                             self.is_active.store(true, Ordering::Relaxed);
 
+                            let is_stream = req.body.get("stream")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+
                             let start = std::time::Instant::now();
-                            let response =
-                                handle_inference_request(&http_client, inference_port, &req).await;
-                            let total_ms = start.elapsed().as_millis() as u64;
 
-                            self.is_active.store(false, Ordering::Relaxed);
+                            if is_stream {
+                                // Stream SSE chunks over WebSocket
+                                let final_response = handle_streaming_request(
+                                    &http_client,
+                                    inference_port,
+                                    &req,
+                                    &mut write,
+                                ).await;
+                                let total_ms = start.elapsed().as_millis() as u64;
+                                self.is_active.store(false, Ordering::Relaxed);
+                                self.last_latency_ms.store(total_ms.min(50), Ordering::Relaxed);
 
-                            // Latency = total time - inference time
-                            let inference_ms = response
-                                .body
-                                .get("timings")
-                                .map(|t| {
-                                    let prompt =
-                                        t.get("prompt_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                    let predicted = t
-                                        .get("predicted_ms")
-                                        .and_then(|v| v.as_f64())
-                                        .unwrap_or(0.0);
-                                    (prompt + predicted) as u64
-                                })
-                                .unwrap_or(0);
-                            let network_latency = total_ms.saturating_sub(inference_ms);
-                            self.last_latency_ms.store(network_latency, Ordering::Relaxed);
+                                let response_json = serde_json::to_string(&final_response)?;
+                                write.send(Message::Text(response_json)).await?;
+                            } else {
+                                let response =
+                                    handle_inference_request(&http_client, inference_port, &req).await;
+                                let total_ms = start.elapsed().as_millis() as u64;
 
-                            // Store real tps from response
-                            if let Some(tps) = response
-                                .body
-                                .get("timings")
-                                .and_then(|t| t.get("predicted_per_second"))
-                                .and_then(|v| v.as_f64())
-                            {
-                                self.last_tps.store(tps.to_bits(), Ordering::Relaxed);
+                                self.is_active.store(false, Ordering::Relaxed);
+
+                                // Latency = total time - inference time
+                                let inference_ms = response
+                                    .body
+                                    .get("timings")
+                                    .map(|t| {
+                                        let prompt =
+                                            t.get("prompt_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                        let predicted = t
+                                            .get("predicted_ms")
+                                            .and_then(|v| v.as_f64())
+                                            .unwrap_or(0.0);
+                                        (prompt + predicted) as u64
+                                    })
+                                    .unwrap_or(0);
+                                let network_latency = total_ms.saturating_sub(inference_ms);
+                                self.last_latency_ms.store(network_latency, Ordering::Relaxed);
+
+                                // Store real tps from response
+                                if let Some(tps) = response
+                                    .body
+                                    .get("timings")
+                                    .and_then(|t| t.get("predicted_per_second"))
+                                    .and_then(|v| v.as_f64())
+                                {
+                                    self.last_tps.store(tps.to_bits(), Ordering::Relaxed);
+                                }
+
+                                let response_json = serde_json::to_string(&response)?;
+                                write.send(Message::Text(response_json)).await?;
                             }
-
-                            let response_json = serde_json::to_string(&response)?;
-                            write.send(Message::Text(response_json)).await?;
                         }
                         Ok(msg) => {
                             // identified, pong, etc — ignore
@@ -228,6 +256,138 @@ impl RelayClient {
                 _ => {}
             }
         }
+    }
+}
+
+/// Handle a streaming inference request: forward SSE chunks from llama-server
+/// over the WebSocket as individual `inference_stream_chunk` messages, then
+/// send a final `inference_response` with aggregated usage.
+async fn handle_streaming_request<S>(
+    client: &reqwest::Client,
+    port: u16,
+    request: &RelayRequest,
+    write: &mut S,
+) -> RelayResponse
+where
+    S: SinkExt<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let url = format!("http://127.0.0.1:{port}{}", request.path);
+    info!("[relay] Streaming {} {}", request.method, request.path);
+
+    let resp = match client
+        .post(&url)
+        .json(&request.body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return RelayResponse {
+                id: request.id.clone(),
+                r#type: "inference_response".into(),
+                status: 502,
+                body: serde_json::json!({"error": format!("Failed to reach llama-server: {e}")}),
+            };
+        }
+    };
+
+    let status = resp.status().as_u16();
+    if status != 200 {
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_default();
+        return RelayResponse {
+            id: request.id.clone(),
+            r#type: "inference_response".into(),
+            status,
+            body: serde_json::json!({"error": body}),
+        };
+    }
+
+    // Read SSE stream using reqwest's bytes_stream (returns futures::Stream)
+    let mut byte_stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    let mut completion_tokens = 0u64;
+    let mut prompt_tokens = 0u64;
+    let mut last_usage: Option<serde_json::Value> = None;
+
+    while let Some(chunk_result) = byte_stream.next().await {
+        let chunk = match chunk_result {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("[relay] Stream read error: {e}");
+                break;
+            }
+        };
+
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // Process complete SSE lines
+        while let Some(pos) = buffer.find('\n') {
+            let line = buffer[..pos].trim_end().to_string();
+            buffer = buffer[pos + 1..].to_string();
+
+            if !line.starts_with("data: ") {
+                continue;
+            }
+
+            let data = &line[6..];
+
+            // Forward every SSE chunk to orchestrator via WebSocket
+            let stream_chunk = RelayStreamChunk {
+                id: request.id.clone(),
+                r#type: "inference_stream_chunk".into(),
+                chunk: line.clone() + "\n\n",
+            };
+            let _ = write
+                .send(Message::Text(serde_json::to_string(&stream_chunk).unwrap_or_default()))
+                .await;
+
+            if data == "[DONE]" {
+                break;
+            }
+
+            // Parse for usage tracking
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(usage) = parsed.get("usage") {
+                    last_usage = Some(usage.clone());
+                    prompt_tokens = usage
+                        .get("prompt_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(prompt_tokens);
+                    completion_tokens = usage
+                        .get("completion_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(completion_tokens);
+                }
+                if parsed.get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .is_some()
+                {
+                    completion_tokens += 1;
+                }
+            }
+        }
+    }
+
+    // Return aggregated final response
+    RelayResponse {
+        id: request.id.clone(),
+        r#type: "inference_response".into(),
+        status: 200,
+        body: serde_json::json!({
+            "stream_complete": true,
+            "usage": last_usage.unwrap_or(serde_json::json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            })),
+        }),
     }
 }
 

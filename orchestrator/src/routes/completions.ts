@@ -1,8 +1,11 @@
 import { Hono } from "hono";
+import { stream as honoStream } from "hono/streaming";
 import { CompletionRequest } from "../types/pipeline.js";
-import type { CompletionResponse } from "../types/pipeline.js";
+import type { Pipeline } from "../types/pipeline.js";
 import * as scheduler from "../services/scheduler.js";
 import * as relay from "../services/relay.js";
+import { recordUsage } from "../services/apikeys.js";
+import type { RelayResponse } from "../services/relay.js";
 
 export const completionsRouter = new Hono();
 
@@ -34,7 +37,6 @@ completionsRouter.post("/chat/completions", async (c) => {
     );
   }
 
-  // Check for an active pipeline, or try to form one
   let pipelines = scheduler.listPipelines();
   let pipeline = pipelines.find((p) => p.model_id === req.model && p.status === "active");
 
@@ -55,6 +57,11 @@ completionsRouter.post("/chat/completions", async (c) => {
 
   const firstStage = pipeline.stages[0];
   const nodeId = firstStage.node_id;
+  // API key ID and account ID set by auth middleware
+  let apiKeyId: string | undefined;
+  let accountId: string | undefined;
+  try { apiKeyId = (c as any).get("apiKeyId"); } catch {}
+  try { accountId = (c as any).get("accountId"); } catch {}
 
   // Build the inference request payload
   const inferenceBody = {
@@ -67,26 +74,25 @@ completionsRouter.post("/chat/completions", async (c) => {
     stream: req.stream,
   };
 
+  // ── Streaming path ──────────────────────────────────────────────
+  if (req.stream) {
+    return handleStreamingRequest(c, pipeline, nodeId, inferenceBody, apiKeyId, accountId, req.model);
+  }
+
+  // ── Non-streaming path ──────────────────────────────────────────
   try {
     let result: any;
 
     if (relay.isConnected(nodeId)) {
-      // Route through WebSocket relay
       const response = await relay.sendRequest(nodeId, inferenceBody);
       if (response.status !== 200) {
         return c.json(
-          {
-            error: {
-              message: `Inference failed: ${JSON.stringify(response.body)}`,
-              type: "server_error",
-            },
-          },
+          { error: { message: "Inference failed", type: "server_error" } },
           502
         );
       }
       result = response.body;
     } else {
-      // Fallback: direct HTTP (only works when orchestrator and node are co-located)
       const inferenceUrl = `http://127.0.0.1:8090/v1/chat/completions`;
       const inferenceResp = await fetch(inferenceUrl, {
         method: "POST",
@@ -95,14 +101,8 @@ completionsRouter.post("/chat/completions", async (c) => {
       });
 
       if (!inferenceResp.ok) {
-        const text = await inferenceResp.text();
         return c.json(
-          {
-            error: {
-              message: `Inference failed: ${text}`,
-              type: "server_error",
-            },
-          },
+          { error: { message: "Inference failed", type: "server_error" } },
           502
         );
       }
@@ -110,54 +110,197 @@ completionsRouter.post("/chat/completions", async (c) => {
       result = await inferenceResp.json();
     }
 
-    // Record rewards and update node throughput
-    const { recordRequestReward } = await import("../services/rewards.js");
-    const usage = result.usage;
-    const timings = result.timings;
-    if (usage) {
-      await recordRequestReward(
-        pipeline,
-        usage.completion_tokens ?? 0,
-        usage.prompt_tokens ?? 0
-      ).catch(console.error);
-    }
-
-    // Write tokens_per_second and requests_served to node in Supabase
-    if (timings) {
-      const tps = timings.predicted_per_second ?? 0;
-      const { supabase } = await import("../services/db.js");
-      try {
-        const current = await supabase
-          .from("nodes")
-          .select("requests_served")
-          .eq("id", firstStage.node_id)
-          .single();
-
-        await supabase
-          .from("nodes")
-          .update({
-            tokens_per_second: Math.round(tps * 10) / 10,
-            requests_served: (current.data?.requests_served ?? 0) + 1,
-          })
-          .eq("id", firstStage.node_id);
-      } catch (e) {
-        console.error("Failed to update node metrics:", e);
-      }
-    }
+    // Post-processing: rewards + metrics + billing
+    await postProcess(pipeline, firstStage.node_id, result, apiKeyId, accountId, req.model);
 
     return c.json(result);
   } catch (e: any) {
     return c.json(
-      {
-        error: {
-          message: `Failed to reach inference node: ${e.message}`,
-          type: "server_error",
-        },
-      },
+      { error: { message: "Failed to reach inference node", type: "server_error" } },
       502
     );
   }
 });
+
+/**
+ * Handle SSE streaming response.
+ * Proxies the llama-server SSE stream back to the client.
+ */
+function handleStreamingRequest(
+  c: any,
+  pipeline: Pipeline,
+  nodeId: string,
+  inferenceBody: any,
+  apiKeyId: string | undefined,
+  accountId: string | undefined,
+  modelId: string
+) {
+  c.header("Content-Type", "text/event-stream");
+  c.header("Cache-Control", "no-cache");
+  c.header("Connection", "keep-alive");
+
+  return honoStream(c, async (stream) => {
+    let totalCompletionTokens = 0;
+    let totalPromptTokens = 0;
+
+    try {
+      if (relay.isConnected(nodeId)) {
+        // Real WebSocket streaming: daemon sends SSE chunks as they arrive
+        const finalResponse: RelayResponse = await relay.sendStreamingRequest(
+          nodeId,
+          inferenceBody,
+          (chunk: string) => {
+            // Forward SSE chunk directly to client
+            stream.write(chunk).catch(() => {});
+          }
+        );
+
+        // Extract usage from final response
+        const usage = (finalResponse.body as any)?.usage;
+        if (usage) {
+          totalCompletionTokens = usage.completion_tokens ?? 0;
+          totalPromptTokens = usage.prompt_tokens ?? 0;
+        }
+
+        // Send [DONE] if daemon didn't already
+        await stream.write("data: [DONE]\n\n");
+
+      } else {
+        // Direct HTTP path: true SSE proxy from llama-server
+        const inferenceUrl = `http://127.0.0.1:8090/v1/chat/completions`;
+        const inferenceResp = await fetch(inferenceUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(inferenceBody),
+        });
+
+        if (!inferenceResp.ok || !inferenceResp.body) {
+          await stream.write(`data: ${JSON.stringify({ error: "Inference failed" })}\n\n`);
+          await stream.write("data: [DONE]\n\n");
+          return;
+        }
+
+        // Pipe llama-server SSE stream directly to client
+        const reader = inferenceResp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // Process complete SSE lines
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const line of lines) {
+            if (line.startsWith("data: ")) {
+              await stream.write(line + "\n\n");
+
+              // Parse for usage tracking
+              const payload = line.slice(6).trim();
+              if (payload !== "[DONE]") {
+                try {
+                  const chunk = JSON.parse(payload);
+                  if (chunk.usage) {
+                    totalCompletionTokens = chunk.usage.completion_tokens ?? totalCompletionTokens;
+                    totalPromptTokens = chunk.usage.prompt_tokens ?? totalPromptTokens;
+                  }
+                  // Count tokens from deltas
+                  if (chunk.choices?.[0]?.delta?.content) {
+                    totalCompletionTokens++;
+                  }
+                } catch {}
+              }
+            }
+          }
+        }
+
+        // Flush remaining buffer
+        if (buffer.trim()) {
+          await stream.write(buffer + "\n\n");
+        }
+      }
+
+      // Post-process: rewards + API key usage + billing
+      const mockResult = {
+        usage: {
+          completion_tokens: totalCompletionTokens,
+          prompt_tokens: totalPromptTokens,
+        },
+      };
+      await postProcess(pipeline, pipeline.stages[0].node_id, mockResult, apiKeyId, accountId, modelId);
+
+    } catch (e: any) {
+      console.error("[stream] Error:", e.message);
+      await stream.write(`data: ${JSON.stringify({ error: "Stream failed" })}\n\n`);
+      await stream.write("data: [DONE]\n\n");
+    }
+  });
+}
+
+/**
+ * Post-process: record rewards, update node metrics, track API key usage.
+ */
+async function postProcess(
+  pipeline: Pipeline,
+  nodeId: string,
+  result: any,
+  apiKeyId: string | undefined,
+  accountId: string | undefined,
+  modelId: string
+): Promise<void> {
+  const { recordRequestReward } = await import("../services/rewards.js");
+  const usage = result.usage;
+  const timings = result.timings;
+
+  if (usage) {
+    await recordRequestReward(
+      pipeline,
+      usage.completion_tokens ?? 0,
+      usage.prompt_tokens ?? 0
+    ).catch(console.error);
+
+    const totalTokens = (usage.completion_tokens ?? 0) + (usage.prompt_tokens ?? 0);
+
+    // Track API key usage
+    if (apiKeyId) {
+      recordUsage(apiKeyId, totalTokens).catch(console.error);
+    }
+
+    // Deduct credits
+    if (accountId && apiKeyId) {
+      const { deductCredits } = await import("../services/billing.js");
+      deductCredits(accountId, totalTokens, apiKeyId, modelId).catch((err) =>
+        console.warn("[billing] Deduction failed:", err.message)
+      );
+    }
+  }
+
+  if (timings) {
+    const tps = timings.predicted_per_second ?? 0;
+    const { supabase } = await import("../services/db.js");
+    try {
+      const current = await supabase
+        .from("nodes")
+        .select("requests_served")
+        .eq("id", nodeId)
+        .single();
+
+      await supabase
+        .from("nodes")
+        .update({
+          tokens_per_second: Math.round(tps * 10) / 10,
+          requests_served: (current.data?.requests_served ?? 0) + 1,
+        })
+        .eq("id", nodeId);
+    } catch (e) {
+      console.error("Failed to update node metrics:", e);
+    }
+  }
+}
 
 // List available models (OpenAI-compatible)
 completionsRouter.get("/models", (c) => {

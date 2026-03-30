@@ -28,6 +28,15 @@ export interface RelayResponse {
   body: unknown;
 }
 
+export interface RelayStreamChunk {
+  id: string;
+  type: "inference_stream_chunk";
+  chunk: string;
+}
+
+// Stream callbacks keyed by request ID
+const streamCallbacks = new Map<string, (chunk: string) => void>();
+
 let requestCounter = 0;
 
 function generateRequestId(): string {
@@ -65,6 +74,53 @@ export function isConnected(nodeId: string): boolean {
 
 export function getConnectedCount(): number {
   return connections.size;
+}
+
+/**
+ * Send a streaming inference request through the WebSocket relay.
+ * The onChunk callback receives raw SSE lines as they arrive.
+ * Returns the final aggregated response.
+ */
+export async function sendStreamingRequest(
+  nodeId: string,
+  body: unknown,
+  onChunk: (chunk: string) => void,
+  path: string = "/v1/chat/completions",
+  timeoutMs: number = 120_000
+): Promise<RelayResponse> {
+  const ws = connections.get(nodeId);
+  if (!ws) throw new Error(`Node ${nodeId} not connected`);
+
+  const id = generateRequestId();
+  const request: RelayRequest = {
+    id,
+    type: "inference_request",
+    method: "POST",
+    path,
+    body,
+  };
+
+  // Register stream callback
+  streamCallbacks.set(id, onChunk);
+
+  return new Promise<RelayResponse>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      streamCallbacks.delete(id);
+      reject(new Error(`Streaming request ${id} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    pending.set(id, { resolve, reject, timer });
+
+    try {
+      ws.send(JSON.stringify(request));
+    } catch (e: any) {
+      pending.delete(id);
+      streamCallbacks.delete(id);
+      clearTimeout(timer);
+      reject(new Error(`Failed to send to node ${nodeId}: ${e.message}`));
+    }
+  });
 }
 
 export async function sendRequest(
@@ -114,11 +170,17 @@ export function handleMessage(nodeId: string, data: string): void {
     return;
   }
 
-  if (msg.type === "inference_response") {
+  if (msg.type === "inference_stream_chunk") {
+    const callback = streamCallbacks.get(msg.id);
+    if (callback) {
+      callback(msg.chunk);
+    }
+  } else if (msg.type === "inference_response") {
     const entry = pending.get(msg.id);
     if (entry) {
       clearTimeout(entry.timer);
       pending.delete(msg.id);
+      streamCallbacks.delete(msg.id);
       entry.resolve(msg as RelayResponse);
     }
   } else if (msg.type === "pong") {
