@@ -391,11 +391,21 @@ export async function buildClaimTransaction(
     message += "Registering node on-chain. ";
   }
 
-  // 2. Distribute pending rewards on-chain (authority signs)
-  if (rawAmount > 0n) {
+  // 2. Distribute only the difference between DB pending and on-chain pending
+  //    (rewards already distributed in real-time after inference shouldn't be doubled)
+  let onChainPending = 0n;
+  if (nodeAccount) {
+    // NodeAccount layout: 8 (discriminator) + 32 (owner) + 8 (total_earned) + 8 (total_claimed) + 8 (pending_rewards)
+    const pendingOffset = 8 + 32 + 8 + 8;
+    onChainPending = nodeAccount.data.readBigUInt64LE(pendingOffset);
+  }
+
+  const distributeAmount = rawAmount > onChainPending ? rawAmount - onChainPending : 0n;
+  if (distributeAmount > 0n) {
+    const humanAmount = Number(distributeAmount) / 10 ** DECIMALS;
     const distributeData = Buffer.concat([
       IX_DISTRIBUTE_REWARDS,
-      encodeU64(rawAmount),
+      encodeU64(distributeAmount),
       encodeU32(1), // layers_served
       encodeU32(1), // total_layers
       encodeU32(0), // tokens_generated (aggregate)
@@ -412,7 +422,7 @@ export async function buildClaimTransaction(
         data: distributeData,
       })
     );
-    message += `Distributing ${pendingAmount.toFixed(4)} $COMPUTE. `;
+    message += `Distributing ${humanAmount.toFixed(4)} $COMPUTE. `;
   }
 
   // 3. Claim rewards (user signs)
@@ -452,7 +462,10 @@ export async function buildClaimTransaction(
       data: IX_CLAIM_REWARDS,
     })
   );
-  message += `Claiming ${pendingAmount.toFixed(4)} $COMPUTE.`;
+  // The actual claim amount = on-chain pending + any new distribution
+  const totalClaimRaw = onChainPending + distributeAmount;
+  const totalClaimHuman = Number(totalClaimRaw) / 10 ** DECIMALS;
+  message += `Claiming ${totalClaimHuman.toFixed(4)} $COMPUTE.`;
 
   // Build transaction — authority pays fees
   const tx = new Transaction();
@@ -473,7 +486,7 @@ export async function buildClaimTransaction(
 
   return {
     transaction: serialized,
-    amount: pendingAmount,
+    amount: totalClaimHuman,
     message,
   };
 }
