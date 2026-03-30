@@ -109,13 +109,45 @@ export async function linkWallet(accountId: string, walletAddress: string): Prom
 
 // ── Credits ────────────────────────────────────────────────────────
 
-export async function getBalance(accountId: string): Promise<number> {
-  const { data } = await supabase
+/**
+ * Get effective credits balance = purchased credits + pending $COMPUTE rewards as credits.
+ * Pending rewards act as spendable credits until claimed (withdrawn on-chain).
+ */
+export async function getBalance(accountId: string): Promise<{
+  total: number;
+  purchased: number;
+  from_rewards: number;
+  pending_compute: number;
+}> {
+  const { data: account } = await supabase
     .from("accounts")
-    .select("credits_balance")
+    .select("credits_balance, wallet_address")
     .eq("id", accountId)
     .single();
-  return data?.credits_balance ?? 0;
+
+  const purchased = account?.credits_balance ?? 0;
+
+  // Calculate credits from pending $COMPUTE rewards
+  let pendingCompute = 0;
+  let fromRewards = 0;
+  if (account?.wallet_address) {
+    const { data: pending } = await supabase
+      .from("reward_events")
+      .select("final_reward")
+      .eq("wallet_address", account.wallet_address)
+      .eq("status", "pending");
+
+    pendingCompute = (pending ?? []).reduce((sum, r) => sum + (r.final_reward ?? 0), 0);
+    const computeUsd = pendingCompute * parseFloat(process.env.PRICE_COMPUTE_USD || "0.001");
+    fromRewards = Math.floor(computeUsd * PRICING.creditsPerDollar * (1 + PRICING.computeTokenBonus));
+  }
+
+  return {
+    total: purchased + fromRewards,
+    purchased,
+    from_rewards: fromRewards,
+    pending_compute: pendingCompute,
+  };
 }
 
 export async function deductCredits(

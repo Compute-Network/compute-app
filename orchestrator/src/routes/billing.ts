@@ -27,7 +27,12 @@ billingRouter.get("/balance", async (c) => {
   if (!accountId) return c.res;
   try {
     const balance = await getBalance(accountId);
-    return c.json({ credits_balance: balance });
+    return c.json({
+      credits_balance: balance.total,
+      purchased_credits: balance.purchased,
+      reward_credits: balance.from_rewards,
+      pending_compute: balance.pending_compute,
+    });
   } catch (e: any) {
     console.error("[billing] Balance error:", e);
     return c.json({ error: { message: "Failed to get balance", type: "server_error" } }, 500);

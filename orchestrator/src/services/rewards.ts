@@ -104,45 +104,22 @@ export async function recordRequestReward(
     );
   }
 
-  // Auto-credit pending rewards to the provider's account balance
-  // $COMPUTE rewards count as credits with the 20% token bonus
-  try {
-    const { calculateCredits, topUpCredits } = await import("./billing.js");
-
-    for (const event of events) {
-      const usdValue = event.final_reward * parseFloat(process.env.PRICE_COMPUTE_USD || "0.001");
-      const { totalCredits } = calculateCredits(usdValue, "COMPUTE");
-
-      if (totalCredits <= 0) continue;
-
-      // Find or create account by wallet
-      let { data: account } = await supabase
+  // Ensure wallet has an account (for credit balance lookups)
+  const wallets = [...new Set(events.map((e) => e.wallet_address))];
+  for (const wallet of wallets) {
+    const { data } = await supabase
+      .from("accounts")
+      .select("id")
+      .eq("wallet_address", wallet)
+      .single();
+    if (!data) {
+      const { error } = await supabase
         .from("accounts")
+        .insert({ account_type: "wallet", wallet_address: wallet })
         .select("id")
-        .eq("wallet_address", event.wallet_address)
         .single();
-
-      if (!account) {
-        const { data: newAccount } = await supabase
-          .from("accounts")
-          .insert({ account_type: "wallet", wallet_address: event.wallet_address })
-          .select("id")
-          .single();
-        account = newAccount;
-      }
-
-      if (account) {
-        await topUpCredits(
-          account.id,
-          totalCredits,
-          "bonus",
-          `${event.final_reward.toFixed(4)} $COMPUTE reward auto-credited`
-        ).catch((err) => console.debug("[rewards] Auto-credit topup failed:", err.message));
-      }
+      if (error) console.debug("[rewards] Account creation skipped:", error.message);
     }
-  } catch (e: any) {
-    // Non-critical — don't block reward recording if billing fails
-    console.debug("[rewards] Auto-credit failed:", e.message);
   }
 }
 

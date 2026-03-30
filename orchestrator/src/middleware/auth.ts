@@ -71,7 +71,7 @@ export async function apiKeyAuth(c: Context, next: Next) {
     const isLegacyWallet = record.wallet_address && !PRICING.enforceCreditsForWalletUsers;
 
     if (!isLegacyWallet) {
-      const balance = await getBalance(record.account_id);
+      const { total: balance } = await getBalance(record.account_id);
       if (balance <= 0) {
         return c.json(
           {
