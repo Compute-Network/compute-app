@@ -112,6 +112,25 @@ setInterval(async () => {
   }
 }, STALE_CHECK_INTERVAL);
 
+// Revert stale "claiming" events back to "pending" (failed client-side claims)
+setInterval(async () => {
+  try {
+    const { supabase } = await import("./services/db.js");
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const { data } = await supabase
+      .from("reward_events")
+      .update({ status: "pending" })
+      .eq("status", "claiming")
+      .lt("created_at", fiveMinAgo)
+      .select("id");
+    if (data && data.length > 0) {
+      console.log(`[rewards] Reverted ${data.length} stale claiming events to pending`);
+    }
+  } catch (e) {
+    console.error("[rewards] Stale claim cleanup failed:", e);
+  }
+}, 60_000);
+
 // Check for crypto deposits every 30 seconds
 setInterval(async () => {
   try {
