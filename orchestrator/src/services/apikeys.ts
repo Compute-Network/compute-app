@@ -1,7 +1,7 @@
 import { supabase } from "./db.js";
 import { createHash, randomBytes } from "crypto";
 
-const KEY_PREFIX = "cp_";
+const KEY_PREFIX = "cpu_";
 
 /**
  * Generate a new API key.
@@ -74,7 +74,7 @@ export async function createApiKey(
  * Validate an API key. Returns the key record if valid, null otherwise.
  */
 export async function validateApiKey(key: string): Promise<ApiKeyRecord | null> {
-  if (!key.startsWith(KEY_PREFIX)) return null;
+  if (!key.startsWith(KEY_PREFIX) && !key.startsWith("cp_")) return null;
 
   const keyHash = hashKey(key);
 
