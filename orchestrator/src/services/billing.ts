@@ -7,7 +7,9 @@ export const PRICING = {
   creditsPerDollar: 1_000_000,
 
   // Cost per inference token in credits
-  creditsPerToken: 1,
+  // Priced so self-requesting with 20% $COMPUTE bonus yields ~5% loss
+  // (prevents infinite money loop while keeping API competitive)
+  creditsPerToken: 40,
 
   // $COMPUTE token bonus: 20% more credits
   computeTokenBonus: 0.20,
