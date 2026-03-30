@@ -236,7 +236,7 @@ impl Dashboard {
         if let Some(ref rx) = self.daemon_state_rx {
             let state = rx.borrow().clone();
             self.live_metrics = state.live_metrics;
-            self.earnings.pending = state.earnings.pending;
+            self.earnings = state.earnings;
 
             // Smooth toward target
             let target = state.pipeline.tokens_per_sec;
