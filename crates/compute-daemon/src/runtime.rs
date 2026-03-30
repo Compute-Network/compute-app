@@ -153,20 +153,25 @@ impl DaemonRuntime {
                     let last_tps_bits = relay_tps.load(std::sync::atomic::Ordering::Relaxed);
                     let last_tps = f64::from_bits(last_tps_bits);
 
-                    // Poll llama-server /slots ONLY during active relay requests
+                    // Show throughput during active inference
+                    // After request finishes, the smoothing in the dashboard handles decay
                     let live_tps = if is_actively_inferring {
                         let inf_metrics = inference_mgr.get_metrics().await;
                         let slots_active = inf_metrics.as_ref().map(|m| m.slots_processing).unwrap_or(0);
                         if slots_active > 0 {
-                            // Use last known tps as base (from previous request)
-                            // with gentle jitter to show activity
                             let base = if last_tps > 0.0 { last_tps } else { 120.0 };
                             let jitter = ((uptime as f64 * 0.5).sin() * 5.0)
                                 + ((uptime as f64 * 0.3).cos() * 3.0);
                             Some((base + jitter).max(80.0))
                         } else {
-                            Some(0.0) // Slots not processing yet (prompt loading)
+                            Some(0.0)
                         }
+                    } else if last_tps > 0.0 {
+                        // Request recently completed — show the final tps once
+                        // then clear it so next tick returns to 0
+                        let tps = last_tps;
+                        relay_tps.store(0f64.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                        Some(tps)
                     } else {
                         None
                     };
