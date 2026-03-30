@@ -2,7 +2,7 @@
 //! so it can forward inference requests to the local llama-server.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -45,6 +45,14 @@ pub struct RelayClient {
     wallet_address: String,
     inference_port: u16,
     shutdown: Arc<AtomicBool>,
+    last_latency_ms: Arc<AtomicU64>,
+}
+
+impl RelayClient {
+    /// Get the latest request latency in milliseconds.
+    pub fn last_latency_ms(&self) -> Arc<AtomicU64> {
+        self.last_latency_ms.clone()
+    }
 }
 
 impl RelayClient {
@@ -63,6 +71,7 @@ impl RelayClient {
             wallet_address: config.wallet.public_address.clone(),
             inference_port: 8090,
             shutdown,
+            last_latency_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -149,8 +158,11 @@ impl RelayClient {
                     let request: Result<RelayRequest, _> = serde_json::from_str(&text);
                     match request {
                         Ok(req) if req.r#type == "inference_request" => {
+                            let start = std::time::Instant::now();
                             let response =
                                 handle_inference_request(&http_client, inference_port, &req).await;
+                            let latency = start.elapsed().as_millis() as u64;
+                            self.last_latency_ms.store(latency, Ordering::Relaxed);
                             let response_json = serde_json::to_string(&response)?;
                             write.send(Message::Text(response_json)).await?;
                         }

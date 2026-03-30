@@ -91,6 +91,7 @@ impl DaemonRuntime {
 
         // Start WebSocket relay to orchestrator
         let relay = RelayClient::new(&self.config, self.shutdown.clone());
+        let relay_latency = relay.last_latency_ms();
         let relay_handle = tokio::spawn(async move {
             if let Err(e) = relay.run().await {
                 tracing::error!("[relay] Fatal error: {e}");
@@ -132,10 +133,16 @@ impl DaemonRuntime {
                         .map(|m| m.slots_processing)
                         .unwrap_or(0);
 
+                    // Read latest relay latency
+                    let latency = relay_latency.load(std::sync::atomic::Ordering::Relaxed);
+
                     self.update_state(|state| {
                         state.live_metrics = metrics;
                         state.uptime_secs = uptime;
                         state.inference_status = inf_status;
+                        if latency > 0 {
+                            state.pipeline.avg_latency_ms = latency as f64;
+                        }
                         if is_processing {
                             // Base ~140 tok/s with gentle variation
                             let base = 140.0 * slots_active as f64;
