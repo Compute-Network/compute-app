@@ -48,8 +48,8 @@ pub struct RelayClient {
     last_latency_ms: Arc<AtomicU64>,
     /// Real tok/s from the last inference response (stored as f64 bits)
     last_tps: Arc<AtomicU64>,
-    /// Epoch millis when the last request completed (0 = never)
-    last_request_at: Arc<AtomicU64>,
+    /// Whether a relay request is actively being processed
+    is_active: Arc<AtomicBool>,
 }
 
 impl RelayClient {
@@ -61,8 +61,8 @@ impl RelayClient {
         self.last_tps.clone()
     }
 
-    pub fn last_request_at(&self) -> Arc<AtomicU64> {
-        self.last_request_at.clone()
+    pub fn is_active(&self) -> Arc<AtomicBool> {
+        self.is_active.clone()
     }
 }
 
@@ -84,7 +84,7 @@ impl RelayClient {
             shutdown,
             last_latency_ms: Arc::new(AtomicU64::new(0)),
             last_tps: Arc::new(AtomicU64::new(0)),
-            last_request_at: Arc::new(AtomicU64::new(0)),
+            is_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -171,12 +171,16 @@ impl RelayClient {
                     let request: Result<RelayRequest, _> = serde_json::from_str(&text);
                     match request {
                         Ok(req) if req.r#type == "inference_request" => {
+                            self.is_active.store(true, Ordering::Relaxed);
+
                             let start = std::time::Instant::now();
                             let response =
                                 handle_inference_request(&http_client, inference_port, &req).await;
                             let total_ms = start.elapsed().as_millis() as u64;
 
-                            // Latency = total time - inference time (prompt + generation)
+                            self.is_active.store(false, Ordering::Relaxed);
+
+                            // Latency = total time - inference time
                             let inference_ms = response
                                 .body
                                 .get("timings")
@@ -193,7 +197,7 @@ impl RelayClient {
                             let network_latency = total_ms.saturating_sub(inference_ms);
                             self.last_latency_ms.store(network_latency, Ordering::Relaxed);
 
-                            // Extract real tps and mark completion time
+                            // Store real tps from response
                             if let Some(tps) = response
                                 .body
                                 .get("timings")
@@ -202,11 +206,6 @@ impl RelayClient {
                             {
                                 self.last_tps.store(tps.to_bits(), Ordering::Relaxed);
                             }
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
-                            self.last_request_at.store(now_ms, Ordering::Relaxed);
 
                             let response_json = serde_json::to_string(&response)?;
                             write.send(Message::Text(response_json)).await?;

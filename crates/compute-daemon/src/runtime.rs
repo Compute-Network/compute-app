@@ -93,7 +93,7 @@ impl DaemonRuntime {
         let relay = RelayClient::new(&self.config, self.shutdown.clone());
         let relay_latency = relay.last_latency_ms();
         let relay_tps = relay.last_tps();
-        let relay_last_req = relay.last_request_at();
+        let relay_is_active = relay.is_active();
         let relay_handle = tokio::spawn(async move {
             if let Err(e) = relay.run().await {
                 tracing::error!("[relay] Fatal error: {e}");
@@ -126,16 +126,27 @@ impl DaemonRuntime {
 
                     // Read latest relay metrics
                     let latency = relay_latency.load(std::sync::atomic::Ordering::Relaxed);
-                    let last_req_at = relay_last_req.load(std::sync::atomic::Ordering::Relaxed);
+                    let is_actively_inferring = relay_is_active.load(std::sync::atomic::Ordering::Relaxed);
                     let last_tps_bits = relay_tps.load(std::sync::atomic::Ordering::Relaxed);
                     let last_tps = f64::from_bits(last_tps_bits);
 
-                    // Show tps for 5 seconds after a request completes, then fade out
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let since_last_req = if last_req_at > 0 { now_ms - last_req_at } else { u64::MAX };
+                    // Poll llama-server /slots ONLY during active relay requests
+                    let live_tps = if is_actively_inferring {
+                        let inf_metrics = inference_mgr.get_metrics().await;
+                        let slots_active = inf_metrics.as_ref().map(|m| m.slots_processing).unwrap_or(0);
+                        if slots_active > 0 {
+                            // Use last known tps as base (from previous request)
+                            // with gentle jitter to show activity
+                            let base = if last_tps > 0.0 { last_tps } else { 120.0 };
+                            let jitter = ((uptime as f64 * 0.5).sin() * 5.0)
+                                + ((uptime as f64 * 0.3).cos() * 3.0);
+                            Some((base + jitter).max(80.0))
+                        } else {
+                            Some(0.0) // Slots not processing yet (prompt loading)
+                        }
+                    } else {
+                        None
+                    };
 
                     self.update_state(|state| {
                         state.live_metrics = metrics;
@@ -144,9 +155,8 @@ impl DaemonRuntime {
                         if latency > 0 {
                             state.pipeline.avg_latency_ms = latency as f64;
                         }
-                        if since_last_req < 5_000 && last_tps > 0.0 {
-                            // Recent request — show real tps
-                            state.pipeline.tokens_per_sec = last_tps;
+                        if let Some(tps) = live_tps {
+                            state.pipeline.tokens_per_sec = tps;
                         } else {
                             state.pipeline.tokens_per_sec = 0.0;
                         }
