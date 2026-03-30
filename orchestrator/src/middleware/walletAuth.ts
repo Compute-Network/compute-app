@@ -248,7 +248,7 @@ export function verifyWalletRequest(c: Context): Response | null {
   }
   entry.count++;
   if (entry.count > MAX_CLAIMS_PER_HOUR) {
-    return c.json({ error: { message: "Rate limit exceeded. Max 5 claims per hour.", type: "rate_limit_error" } }, 429);
+    return c.json({ error: { message: "Rate limit exceeded. Max 60 claims per hour.", type: "rate_limit_error" } }, 429);
   }
 
   return null;
@@ -323,7 +323,7 @@ interface RateLimitEntry {
 
 const claimRateLimits = new Map<string, RateLimitEntry>();
 
-const MAX_CLAIMS_PER_HOUR = 5;
+const MAX_CLAIMS_PER_HOUR = 60;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
 // Clean up expired entries every 10 minutes
@@ -338,7 +338,7 @@ setInterval(() => {
 
 /**
  * Rate limiting middleware for claim endpoints.
- * Max 5 claims per wallet per hour.
+ * Max 60 claims per wallet per hour.
  */
 export async function claimRateLimit(c: Context, next: Next) {
   const wallet = c.req.param("wallet");

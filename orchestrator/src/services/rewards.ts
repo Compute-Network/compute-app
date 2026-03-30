@@ -103,6 +103,38 @@ export async function recordRequestReward(
       console.warn(`[solana] On-chain distribute failed: ${e.message}`)
     );
   }
+
+  // Auto-credit pending rewards to the provider's account balance
+  // $COMPUTE rewards count as credits with the 20% token bonus
+  try {
+    const { calculateCredits, topUpCredits } = await import("./billing.js");
+
+    for (const event of events) {
+      const usdValue = event.final_reward * parseFloat(process.env.PRICE_COMPUTE_USD || "0.001");
+      const { totalCredits } = calculateCredits(usdValue, "COMPUTE");
+
+      if (totalCredits <= 0) continue;
+
+      // Find account by wallet
+      const { data: account } = await supabase
+        .from("accounts")
+        .select("id")
+        .eq("wallet_address", event.wallet_address)
+        .single();
+
+      if (account) {
+        await topUpCredits(
+          account.id,
+          totalCredits,
+          "bonus",
+          `${event.final_reward.toFixed(4)} $COMPUTE reward auto-credited`
+        ).catch(() => {});
+      }
+    }
+  } catch (e: any) {
+    // Non-critical — don't block reward recording if billing fails
+    console.debug("[rewards] Auto-credit failed:", e.message);
+  }
 }
 
 /**
