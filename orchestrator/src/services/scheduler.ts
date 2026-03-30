@@ -140,6 +140,28 @@ export async function formPipeline(
   if (!model) return null;
 
   const minVram = model.vram_per_layer_mb; // At least 1 layer must fit
+
+  // Clear stale pipeline assignments — nodes assigned to pipelines that no longer
+  // exist in memory (e.g. after orchestrator restart) get freed automatically
+  const activePipelineIds = new Set(activePipelines.keys());
+  const { supabase } = await import("./db.js");
+  const { data: staleNodes } = await supabase
+    .from("nodes")
+    .select("id, pipeline_id")
+    .in("status", ["online", "idle"])
+    .not("pipeline_id", "is", null);
+
+  const toFree = (staleNodes ?? []).filter(
+    (n) => !activePipelineIds.has(n.pipeline_id)
+  );
+  if (toFree.length > 0) {
+    await supabase
+      .from("nodes")
+      .update({ pipeline_id: null, model_name: null, pipeline_stage: null, pipeline_total_stages: null })
+      .in("id", toFree.map((n) => n.id));
+    console.log(`[scheduler] Freed ${toFree.length} nodes with stale pipeline assignments`);
+  }
+
   const available = await getAvailableNodes(minVram);
 
   if (available.length === 0) return null;
