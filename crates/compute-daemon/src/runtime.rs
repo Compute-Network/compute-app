@@ -234,16 +234,19 @@ impl DaemonRuntime {
                 });
 
                 // Fetch earnings breakdown from reward_events
-                if let Ok(earnings) = client.get_earnings(wallet).await {
-                    self.update_state(|state| {
-                        state.earnings.today = earnings.today;
-                        state.earnings.this_week = earnings.this_week;
-                        state.earnings.this_month = earnings.this_month;
-                        state.earnings.all_time = earnings.all_time;
-                        if earnings.pending > 0.0 {
-                            state.earnings.pending = earnings.pending;
-                        }
-                    });
+                match client.get_earnings(wallet).await {
+                    Err(e) => tracing::warn!("Failed to fetch earnings: {e}"),
+                    Ok(earnings) => {
+                        self.update_state(|state| {
+                            state.earnings.today = earnings.today;
+                            state.earnings.this_week = earnings.this_week;
+                            state.earnings.this_month = earnings.this_month;
+                            state.earnings.all_time = earnings.all_time;
+                            if earnings.pending > 0.0 {
+                                state.earnings.pending = earnings.pending;
+                            }
+                        });
+                    }
                 }
 
                 // Tell inference manager about the assignment
