@@ -13,6 +13,7 @@ import { createWsRoute, setUpgradeWebSocket } from "./routes/ws.js";
 import { apiKeyAuth } from "./middleware/auth.js";
 import { markStaleNodesOffline } from "./services/nodes.js";
 import { initScheduler } from "./services/scheduler.js";
+import { initSolana } from "./services/solana.js";
 
 const app = new Hono();
 
@@ -56,6 +57,9 @@ app.onError((err, c) => {
   console.error("Unhandled error:", err);
   return c.json({ error: "Internal server error" }, 500);
 });
+
+// Initialize Solana ($COMPUTE token on devnet)
+initSolana().catch((e) => console.error("[solana] Init failed:", e.message));
 
 // Initialize scheduler (load active pipelines from DB)
 initScheduler().catch(console.error);

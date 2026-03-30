@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import * as rewards from "../services/rewards.js";
+import { transferReward, getMintAddress, getTreasuryBalance } from "../services/solana.js";
 
 export const rewardsRouter = new Hono();
 
@@ -9,7 +10,7 @@ rewardsRouter.get("/:wallet", async (c) => {
 
   try {
     const pending = await rewards.getPendingRewards(wallet);
-    return c.json(pending);
+    return c.json({ ...pending, mint: getMintAddress() });
   } catch (e: any) {
     return c.json({ error: e.message }, 500);
   }
@@ -28,19 +29,42 @@ rewardsRouter.get("/:wallet/history", async (c) => {
   }
 });
 
-// Mark rewards as claimed (called after Solana tx confirmation)
+// Claim rewards — transfers $COMPUTE on Solana devnet, marks events as claimed in DB
 rewardsRouter.post("/:wallet/claim", async (c) => {
   const wallet = c.req.param("wallet");
-  const { event_ids } = await c.req.json<{ event_ids: string[] }>();
-
-  if (!event_ids?.length) {
-    return c.json({ error: "event_ids array is required" }, 400);
-  }
 
   try {
-    const result = await rewards.markRewardsClaimed(wallet, event_ids);
-    return c.json(result);
+    // Get all pending events for this wallet
+    const pending = await rewards.getPendingRewards(wallet);
+    if (pending.total <= 0) {
+      return c.json({ error: "No pending rewards to claim" }, 400);
+    }
+
+    // Get event IDs to mark as claimed
+    const history = await rewards.getRewardHistory(wallet, 10000);
+    const pendingEvents = history.filter((e) => e.status === "pending");
+    const eventIds = pendingEvents.map((e) => e.id);
+
+    if (eventIds.length === 0) {
+      return c.json({ error: "No pending reward events" }, 400);
+    }
+
+    // Transfer tokens on Solana
+    const signature = await transferReward(wallet, pending.total);
+
+    // Mark events as claimed in DB
+    const result = await rewards.markRewardsClaimed(wallet, eventIds);
+
+    return c.json({
+      success: true,
+      amount: pending.total,
+      signature,
+      mint: getMintAddress(),
+      events_claimed: eventIds.length,
+      ...result,
+    });
   } catch (e: any) {
+    console.error(`[claim] Failed for ${wallet}:`, e.message);
     return c.json({ error: e.message }, 500);
   }
 });
@@ -49,7 +73,8 @@ rewardsRouter.post("/:wallet/claim", async (c) => {
 rewardsRouter.get("/", async (c) => {
   try {
     const stats = await rewards.getRewardStats();
-    return c.json(stats);
+    const treasury = await getTreasuryBalance();
+    return c.json({ ...stats, mint: getMintAddress(), treasury });
   } catch (e: any) {
     return c.json({ error: e.message }, 500);
   }
