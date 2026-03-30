@@ -1,5 +1,6 @@
 import { supabase } from "./db.js";
 import type { Pipeline, PipelineStage } from "../types/pipeline.js";
+import { distributeRewardsOnChain } from "./solana.js";
 
 // Reward rate configuration — all server-controlled, easily adjustable.
 const REWARD_CONFIG = {
@@ -76,6 +77,20 @@ export async function recordRequestReward(
 
   if (error) {
     console.error("Failed to record rewards:", error.message);
+    return;
+  }
+
+  // Also distribute on-chain (best-effort, doesn't block if node not registered)
+  for (const event of events) {
+    distributeRewardsOnChain(
+      event.wallet_address,
+      event.final_reward,
+      event.layers_served,
+      event.total_layers,
+      event.tokens_generated
+    ).catch((e) =>
+      console.warn(`[solana] On-chain distribute failed: ${e.message}`)
+    );
   }
 }
 
