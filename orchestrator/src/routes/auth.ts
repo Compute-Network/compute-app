@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { randomBytes } from "crypto";
 import bcrypt from "bcryptjs";
 import { getOrCreateAccount, getAccountByEmail, getAccountById, linkWallet } from "../services/billing.js";
 import { signJwt } from "../middleware/enterpriseAuth.js";
@@ -7,6 +8,29 @@ import { PublicKey } from "@solana/web3.js";
 import nacl from "tweetnacl";
 
 export const authRouter = new Hono();
+
+// ── Device code flow for CLI auth ──────────────────────────────────
+// 1. CLI calls POST /device/start → gets { device_code, auth_url }
+// 2. CLI opens browser to auth_url, polls GET /device/poll/:code
+// 3. User authenticates on web page
+// 4. Web page calls POST /device/complete with device_code + auth
+// 5. CLI poll returns { api_key }
+
+interface PendingDevice {
+  code: string;
+  createdAt: number;
+  apiKey: string | null;  // null = pending, string = completed
+}
+
+const pendingDevices = new Map<string, PendingDevice>();
+
+// Cleanup expired device codes every 60s
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, device] of pendingDevices) {
+    if (now - device.createdAt > 5 * 60 * 1000) pendingDevices.delete(code);
+  }
+}, 60_000);
 
 // ── Rate limiting for auth endpoints ────────────────────────────────
 const authRateLimits = new Map<string, { count: number; resetAt: number }>();
@@ -146,6 +170,81 @@ authRouter.get("/account", accountAuth, async (c) => {
     credits_balance: account.credits_balance,
     created_at: account.created_at,
   });
+});
+
+// ── Device code endpoints ──────────────────────────────────────────
+
+// CLI calls this to start the flow
+authRouter.post("/device/start", async (c) => {
+  const code = randomBytes(16).toString("hex");
+  pendingDevices.set(code, { code, createdAt: Date.now(), apiKey: null });
+  return c.json({
+    device_code: code,
+    auth_url: `https://computenetwork.sh/auth/code?device_code=${code}`,
+    expires_in: 300,
+    poll_interval: 2,
+  });
+});
+
+// CLI polls this until the user completes auth
+authRouter.get("/device/poll/:code", async (c) => {
+  const code = c.req.param("code")!;
+  const device = pendingDevices.get(code);
+
+  if (!device) {
+    return c.json({ error: { message: "Device code not found or expired", type: "not_found" } }, 404);
+  }
+
+  if (Date.now() - device.createdAt > 5 * 60 * 1000) {
+    pendingDevices.delete(code);
+    return c.json({ error: { message: "Device code expired", type: "expired" } }, 410);
+  }
+
+  if (!device.apiKey) {
+    return c.json({ status: "pending" }, 202);
+  }
+
+  // Auth completed — return key and clean up
+  const apiKey = device.apiKey;
+  pendingDevices.delete(code);
+  return c.json({ status: "complete", api_key: apiKey });
+});
+
+// Web page calls this after user authenticates
+authRouter.post("/device/complete", accountAuth, async (c) => {
+  const accountId = (c as any).get("accountId") as string;
+
+  let body: { device_code: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: { message: "Invalid request body", type: "invalid_request_error" } }, 400);
+  }
+
+  const { device_code } = body;
+  if (!device_code) {
+    return c.json({ error: { message: "device_code required", type: "invalid_request_error" } }, 400);
+  }
+
+  const device = pendingDevices.get(device_code);
+  if (!device) {
+    return c.json({ error: { message: "Device code not found or expired", type: "not_found" } }, 404);
+  }
+
+  if (device.apiKey) {
+    return c.json({ error: { message: "Device code already completed", type: "conflict_error" } }, 409);
+  }
+
+  try {
+    // Create an API key for this account
+    const { createApiKey } = await import("../services/apikeys.js");
+    const result = await createApiKey(null, "compute-code", accountId);
+    device.apiKey = result.key;
+    return c.json({ success: true, message: "API key created for CLI" });
+  } catch (e: any) {
+    console.error("[auth] Device complete error:", e);
+    return c.json({ error: { message: "Failed to create API key", type: "server_error" } }, 500);
+  }
 });
 
 // Link a Solana wallet to an enterprise account
