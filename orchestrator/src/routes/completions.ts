@@ -110,8 +110,8 @@ completionsRouter.post("/chat/completions", async (c) => {
       result = await inferenceResp.json();
     }
 
-    // Post-processing: rewards + metrics + billing
-    await postProcess(pipeline, firstStage.node_id, result, apiKeyId, accountId, req.model);
+    // Post-processing: rewards + metrics + billing (non-blocking — never fail the response)
+    postProcess(pipeline, firstStage.node_id, result, apiKeyId, accountId, req.model).catch(console.error);
 
     return c.json(result);
   } catch (e: any) {
