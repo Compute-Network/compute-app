@@ -253,24 +253,11 @@ impl SplashScreen {
                             return;
                         }
 
-                        // Step 4: verify model file exists (daemon handles server lifecycle)
-                        if self.current_step == 4 {
-                            if find_first_model().is_some() {
-                                self.model_loaded.store(true, Ordering::Relaxed);
-                                let model_name = find_first_model()
-                                    .and_then(|p| {
-                                        std::path::Path::new(&p)
-                                            .file_stem()
-                                            .and_then(|s| s.to_str())
-                                            .map(|s| s.to_string())
-                                    })
-                                    .unwrap_or_else(|| "unknown".into());
-                                self.steps[self.current_step].label =
-                                    format!("Model found: {model_name}");
-                            } else {
-                                self.steps[self.current_step].label =
-                                    "No model found in ~/.compute/models/".into();
-                            }
+                        // Step 4: wait for daemon's llama-server to be ready
+                        if self.current_step == 4 && !self.model_loaded.load(Ordering::Relaxed) {
+                            self.start_model_health_poll();
+                            self.phase = SplashPhase::LoadingModel;
+                            return;
                         }
 
                         self.steps[self.current_step].done = true;
@@ -363,9 +350,48 @@ impl SplashScreen {
         });
     }
 
+    fn start_model_health_poll(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.model_load_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let model_name = find_first_model()
+                .and_then(|p| {
+                    std::path::Path::new(&p)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "unknown".into());
+
+            // Poll llama-server /health until the daemon has it ready (120s timeout)
+            let start = Instant::now();
+            loop {
+                if start.elapsed() > Duration::from_secs(120) {
+                    let _ = tx.send(Err("Model load timed out (120s)".into()));
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+
+                let Ok(resp) = reqwest::blocking::Client::new()
+                    .get("http://127.0.0.1:8090/health")
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                else {
+                    continue;
+                };
+
+                if resp.status().is_success() {
+                    let _ = tx.send(Ok(model_name));
+                    return;
+                }
+            }
+        });
+    }
+
     fn skip_to_complete(&mut self) {
-        // Don't skip if we're in the middle of installing llama
-        if self.phase == SplashPhase::InstallingLlama {
+        // Don't skip if we're in the middle of installing llama or waiting for model
+        if self.phase == SplashPhase::InstallingLlama || self.phase == SplashPhase::LoadingModel {
             return;
         }
         for step in &mut self.steps {
