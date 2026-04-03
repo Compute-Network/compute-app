@@ -12,6 +12,12 @@ interface ModelDef {
 }
 
 const MODELS: Record<string, ModelDef> = {
+  "gemma-4-26b-a4b-q4": {
+    id: "gemma-4-26b-a4b-q4",
+    name: "Gemma 4 26B-A4B (Q4 MoE)",
+    total_layers: 48,
+    vram_per_layer_mb: 350,
+  },
   "llama-3.1-8b-q4": {
     id: "llama-3.1-8b-q4",
     name: "Llama 3.1 8B (Q4)",

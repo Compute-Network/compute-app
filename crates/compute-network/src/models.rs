@@ -80,6 +80,18 @@ impl ModelCatalog {
         Self {
             models: vec![
                 ModelDefinition {
+                    id: "gemma-4-26b-a4b-q4".into(),
+                    name: "Gemma 4 26B-A4B (Q4 MoE)".into(),
+                    family: ModelFamily::Other,
+                    total_layers: 48,
+                    vram_per_layer_mb: 350,
+                    total_size_mb: 16900,
+                    quantization: Quantization::Q4,
+                    min_total_vram_mb: 20000,
+                    recommended_stages: 1,
+                    source: "unsloth/gemma-4-26B-A4B-it-GGUF".into(),
+                },
+                ModelDefinition {
                     id: "llama-3.1-8b-q4".into(),
                     name: "Llama 3.1 8B (Q4)".into(),
                     family: ModelFamily::Llama,
