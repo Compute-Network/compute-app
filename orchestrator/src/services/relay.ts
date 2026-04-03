@@ -53,8 +53,10 @@ function acquireSlot(nodeId: string): Promise<void> {
   const q = getNodeQueue(nodeId);
   if (!q.busy) {
     q.busy = true;
+    console.log(`[relay-queue] ${nodeId.slice(0, 8)}: slot acquired (was free)`);
     return Promise.resolve();
   }
+  console.log(`[relay-queue] ${nodeId.slice(0, 8)}: queued (${q.queue.length + 1} waiting)`);
   return new Promise<void>((resolve) => {
     q.queue.push(resolve);
   });
@@ -64,10 +66,11 @@ function releaseSlot(nodeId: string): void {
   const q = getNodeQueue(nodeId);
   const next = q.queue.shift();
   if (next) {
-    // Hand off to next waiter (stays busy)
+    console.log(`[relay-queue] ${nodeId.slice(0, 8)}: slot handed to next (${q.queue.length} remaining)`);
     next();
   } else {
     q.busy = false;
+    console.log(`[relay-queue] ${nodeId.slice(0, 8)}: slot released (idle)`);
   }
 }
 
