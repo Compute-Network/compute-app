@@ -37,6 +37,40 @@ export interface RelayStreamChunk {
 // Stream callbacks keyed by request ID
 const streamCallbacks = new Map<string, (chunk: string) => void>();
 
+// Per-node request queue — serializes requests to avoid slot contention
+const nodeQueues = new Map<string, { busy: boolean; queue: Array<() => void> }>();
+
+function getNodeQueue(nodeId: string) {
+  let q = nodeQueues.get(nodeId);
+  if (!q) {
+    q = { busy: false, queue: [] };
+    nodeQueues.set(nodeId, q);
+  }
+  return q;
+}
+
+function acquireSlot(nodeId: string): Promise<void> {
+  const q = getNodeQueue(nodeId);
+  if (!q.busy) {
+    q.busy = true;
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    q.queue.push(resolve);
+  });
+}
+
+function releaseSlot(nodeId: string): void {
+  const q = getNodeQueue(nodeId);
+  const next = q.queue.shift();
+  if (next) {
+    // Hand off to next waiter (stays busy)
+    next();
+  } else {
+    q.busy = false;
+  }
+}
+
 let requestCounter = 0;
 
 function generateRequestId(): string {
@@ -88,39 +122,46 @@ export async function sendStreamingRequest(
   path: string = "/v1/chat/completions",
   timeoutMs: number = 120_000
 ): Promise<RelayResponse> {
-  const ws = connections.get(nodeId);
-  if (!ws) throw new Error(`Node ${nodeId} not connected`);
+  // Queue: wait for the node's slot to be free
+  await acquireSlot(nodeId);
 
-  const id = generateRequestId();
-  const request: RelayRequest = {
-    id,
-    type: "inference_request",
-    method: "POST",
-    path,
-    body,
-  };
+  try {
+    const ws = connections.get(nodeId);
+    if (!ws) throw new Error(`Node ${nodeId} not connected`);
 
-  // Register stream callback
-  streamCallbacks.set(id, onChunk);
+    const id = generateRequestId();
+    const request: RelayRequest = {
+      id,
+      type: "inference_request",
+      method: "POST",
+      path,
+      body,
+    };
 
-  return new Promise<RelayResponse>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      streamCallbacks.delete(id);
-      reject(new Error(`Streaming request ${id} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
+    // Register stream callback
+    streamCallbacks.set(id, onChunk);
 
-    pending.set(id, { resolve, reject, timer });
+    return await new Promise<RelayResponse>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        streamCallbacks.delete(id);
+        reject(new Error(`Streaming request ${id} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
 
-    try {
-      ws.send(JSON.stringify(request));
-    } catch (e: any) {
-      pending.delete(id);
-      streamCallbacks.delete(id);
-      clearTimeout(timer);
-      reject(new Error(`Failed to send to node ${nodeId}: ${e.message}`));
-    }
-  });
+      pending.set(id, { resolve, reject, timer });
+
+      try {
+        ws.send(JSON.stringify(request));
+      } catch (e: any) {
+        pending.delete(id);
+        streamCallbacks.delete(id);
+        clearTimeout(timer);
+        reject(new Error(`Failed to send to node ${nodeId}: ${e.message}`));
+      }
+    });
+  } finally {
+    releaseSlot(nodeId);
+  }
 }
 
 export async function sendRequest(
@@ -129,36 +170,43 @@ export async function sendRequest(
   path: string = "/v1/chat/completions",
   timeoutMs: number = 120_000
 ): Promise<RelayResponse> {
-  const ws = connections.get(nodeId);
-  if (!ws) {
-    throw new Error(`Node ${nodeId} not connected`);
-  }
+  // Queue: wait for the node's slot to be free
+  await acquireSlot(nodeId);
 
-  const id = generateRequestId();
-  const request: RelayRequest = {
-    id,
-    type: "inference_request",
-    method: "POST",
-    path,
-    body,
-  };
-
-  return new Promise<RelayResponse>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error(`Request ${id} to node ${nodeId} timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    pending.set(id, { resolve, reject, timer });
-
-    try {
-      ws.send(JSON.stringify(request));
-    } catch (e: any) {
-      pending.delete(id);
-      clearTimeout(timer);
-      reject(new Error(`Failed to send to node ${nodeId}: ${e.message}`));
+  try {
+    const ws = connections.get(nodeId);
+    if (!ws) {
+      throw new Error(`Node ${nodeId} not connected`);
     }
-  });
+
+    const id = generateRequestId();
+    const request: RelayRequest = {
+      id,
+      type: "inference_request",
+      method: "POST",
+      path,
+      body,
+    };
+
+    return await new Promise<RelayResponse>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`Request ${id} to node ${nodeId} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      pending.set(id, { resolve, reject, timer });
+
+      try {
+        ws.send(JSON.stringify(request));
+      } catch (e: any) {
+        pending.delete(id);
+        clearTimeout(timer);
+        reject(new Error(`Failed to send to node ${nodeId}: ${e.message}`));
+      }
+    });
+  } finally {
+    releaseSlot(nodeId);
+  }
 }
 
 export function handleMessage(nodeId: string, data: string): void {
