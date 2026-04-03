@@ -143,6 +143,20 @@ export async function listApiKeys(walletAddress: string): Promise<ApiKeyInfo[]> 
 }
 
 /**
+ * List API keys by account_id (for enterprise users).
+ */
+export async function listApiKeysByAccount(accountId: string): Promise<ApiKeyInfo[]> {
+  const { data, error } = await supabase
+    .from("api_keys")
+    .select("id, name, prefix, requests_total, tokens_total, rate_limit_per_min, active, created_at, last_used_at")
+    .eq("account_id", accountId)
+    .order("created_at", { ascending: false });
+
+  if (error) throw new Error(`Failed to list keys: ${error.message}`);
+  return (data ?? []) as ApiKeyInfo[];
+}
+
+/**
  * Revoke an API key.
  */
 export async function revokeApiKey(
@@ -154,6 +168,25 @@ export async function revokeApiKey(
     .update({ active: false })
     .eq("id", keyId)
     .eq("wallet_address", walletAddress)
+    .select("id")
+    .single();
+
+  if (error || !data) return false;
+  return true;
+}
+
+/**
+ * Revoke an API key by account_id (for enterprise users).
+ */
+export async function revokeApiKeyByAccount(
+  accountId: string,
+  keyId: string
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from("api_keys")
+    .update({ active: false })
+    .eq("id", keyId)
+    .eq("account_id", accountId)
     .select("id")
     .single();
 
