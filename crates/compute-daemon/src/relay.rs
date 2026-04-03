@@ -399,29 +399,46 @@ async fn handle_inference_request(
     let url = format!("http://127.0.0.1:{port}{}", request.path);
     info!("[relay] Proxying {} {}", request.method, request.path);
 
-    match client.post(&url).json(&request.body).timeout(Duration::from_secs(120)).send().await {
-        Ok(resp) => {
-            let status = resp.status().as_u16();
-            match resp.json::<serde_json::Value>().await {
-                Ok(body) => RelayResponse {
-                    id: request.id.clone(),
-                    r#type: "inference_response".into(),
-                    status,
-                    body,
-                },
-                Err(e) => RelayResponse {
+    // Retry on 503 (server busy) — llama-server single slot may still be cleaning up
+    let max_retries = 5;
+    for attempt in 0..=max_retries {
+        match client.post(&url).json(&request.body).timeout(Duration::from_secs(120)).send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 503 && attempt < max_retries {
+                    info!("[relay] llama-server busy (503), retry {}/{} in {}ms", attempt + 1, max_retries, 500 * (attempt + 1));
+                    tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                return match resp.json::<serde_json::Value>().await {
+                    Ok(body) => RelayResponse {
+                        id: request.id.clone(),
+                        r#type: "inference_response".into(),
+                        status,
+                        body,
+                    },
+                    Err(e) => RelayResponse {
+                        id: request.id.clone(),
+                        r#type: "inference_response".into(),
+                        status: 502,
+                        body: serde_json::json!({"error": format!("Failed to read response: {e}")}),
+                    },
+                };
+            }
+            Err(e) => {
+                if attempt < max_retries {
+                    info!("[relay] llama-server unreachable, retry {}/{}", attempt + 1, max_retries);
+                    tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
+                    continue;
+                }
+                return RelayResponse {
                     id: request.id.clone(),
                     r#type: "inference_response".into(),
                     status: 502,
-                    body: serde_json::json!({"error": format!("Failed to read response: {e}")}),
-                },
+                    body: serde_json::json!({"error": format!("Failed to reach llama-server: {e}")}),
+                };
             }
         }
-        Err(e) => RelayResponse {
-            id: request.id.clone(),
-            r#type: "inference_response".into(),
-            status: 502,
-            body: serde_json::json!({"error": format!("Failed to reach llama-server: {e}")}),
-        },
     }
+    unreachable!()
 }
