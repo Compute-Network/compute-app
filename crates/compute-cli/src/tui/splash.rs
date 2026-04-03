@@ -1,4 +1,6 @@
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -53,6 +55,10 @@ pub struct SplashScreen {
     spinner_frame: usize,
     /// Timer for spinner animation
     spinner_timer: Instant,
+    /// Tracks model loading progress
+    model_load_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    /// Whether model is loaded and serving
+    model_loaded: Arc<AtomicBool>,
 }
 
 #[derive(PartialEq)]
@@ -61,6 +67,8 @@ enum SplashPhase {
     StepsRunning,
     /// Waiting for llama-server install to complete
     InstallingLlama,
+    /// Waiting for model to load into llama-server
+    LoadingModel,
     Complete,
 }
 
@@ -106,6 +114,25 @@ impl SplashScreen {
             });
         }
 
+        // Detect model file
+        let model_file = find_first_model();
+        let model_label = model_file
+            .as_ref()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "no model found".into());
+
+        steps.push(StartupStep {
+            label: format!("Loading model: {}...", model_label),
+            done: false,
+            result: None,
+        });
+
         steps.push(StartupStep {
             label: "Connecting to network...".into(),
             done: false,
@@ -116,6 +143,8 @@ impl SplashScreen {
             done: false,
             result: None,
         });
+
+        let model_loaded = Arc::new(AtomicBool::new(false));
 
         Self {
             globe,
@@ -129,6 +158,8 @@ impl SplashScreen {
             llama_ready: llama_found,
             spinner_frame: 0,
             spinner_timer: Instant::now(),
+            model_load_rx: None,
+            model_loaded,
         }
     }
 
@@ -209,7 +240,8 @@ impl SplashScreen {
                         1 => Duration::from_millis(150),
                         2 => Duration::from_millis(300), // "Checking llama-server..."
                         3 => Duration::from_millis(200), // llama status
-                        4 => Duration::from_millis(400), // "Connecting to network..."
+                        4 => Duration::from_millis(100), // model loading — start immediately
+                        5 => Duration::from_millis(400), // "Connecting to network..."
                         _ => Duration::from_millis(200),
                     };
                     if self.step_timer.elapsed() > step_delay {
@@ -221,12 +253,44 @@ impl SplashScreen {
                             return;
                         }
 
+                        // Step 4: start loading model into llama-server
+                        if self.current_step == 4 && !self.model_loaded.load(Ordering::Relaxed) {
+                            self.start_model_load();
+                            self.phase = SplashPhase::LoadingModel;
+                            return;
+                        }
+
                         self.steps[self.current_step].done = true;
                         self.current_step += 1;
                         self.step_timer = Instant::now();
                     }
                 } else {
                     self.phase = SplashPhase::Complete;
+                }
+            }
+            SplashPhase::LoadingModel => {
+                if let Some(ref rx) = self.model_load_rx {
+                    if let Ok(result) = rx.try_recv() {
+                        match result {
+                            Ok(model_name) => {
+                                self.model_loaded.store(true, Ordering::Relaxed);
+                                self.steps[self.current_step].label =
+                                    format!("Model ready: {model_name}");
+                                self.steps[self.current_step].done = true;
+                                self.current_step += 1;
+                                self.step_timer = Instant::now();
+                                self.phase = SplashPhase::StepsRunning;
+                            }
+                            Err(e) => {
+                                self.steps[self.current_step].label =
+                                    format!("Model failed: {e}");
+                                self.steps[self.current_step].done = true;
+                                self.current_step += 1;
+                                self.step_timer = Instant::now();
+                                self.phase = SplashPhase::StepsRunning;
+                            }
+                        }
+                    }
                 }
             }
             SplashPhase::InstallingLlama => {
@@ -286,9 +350,74 @@ impl SplashScreen {
         });
     }
 
+    fn start_model_load(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.model_load_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            // Find the model file
+            let Some(model_path) = find_first_model() else {
+                let _ = tx.send(Err("No .gguf model found in ~/.compute/models/".into()));
+                return;
+            };
+
+            let model_name = std::path::Path::new(&model_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            // Kill any existing llama-server processes on our port
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "llama-server.*--port 8090"])
+                .status();
+            std::thread::sleep(Duration::from_millis(500));
+
+            // Start llama-server
+            let child = std::process::Command::new("llama-server")
+                .args([
+                    "--model", &model_path,
+                    "--port", "8090",
+                    "--ctx-size", "2048",
+                    "--n-gpu-layers", "999",
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+
+            let Ok(_child) = child else {
+                let _ = tx.send(Err("Failed to start llama-server".into()));
+                return;
+            };
+
+            // Poll /health until ready (timeout 120s for large models)
+            let start = Instant::now();
+            loop {
+                if start.elapsed() > Duration::from_secs(120) {
+                    let _ = tx.send(Err("Model load timed out (120s)".into()));
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+
+                let Ok(resp) = reqwest::blocking::Client::new()
+                    .get("http://127.0.0.1:8090/health")
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                else {
+                    continue;
+                };
+
+                if resp.status().is_success() {
+                    let _ = tx.send(Ok(model_name));
+                    return;
+                }
+            }
+        });
+    }
+
     fn skip_to_complete(&mut self) {
-        // Don't skip if we're in the middle of installing llama
-        if self.phase == SplashPhase::InstallingLlama {
+        // Don't skip if we're in the middle of installing llama or loading model
+        if self.phase == SplashPhase::InstallingLlama || self.phase == SplashPhase::LoadingModel {
             return;
         }
         for step in &mut self.steps {
@@ -465,6 +594,19 @@ fn fetch_node_count() -> u64 {
 }
 
 /// Check if llama-server is available on the system.
+/// Find the first .gguf model in ~/.compute/models/
+fn find_first_model() -> Option<String> {
+    let cache_dir = dirs::home_dir()?.join(".compute").join("models");
+    let entries = std::fs::read_dir(&cache_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".gguf") {
+            return Some(entry.path().to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
 fn find_llama_server() -> bool {
     if let Ok(output) = std::process::Command::new("which").arg("llama-server").output()
         && output.status.success()

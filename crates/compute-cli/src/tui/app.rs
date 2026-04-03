@@ -95,9 +95,19 @@ fn run_inner(
         dashboard.run(terminal)?;
     }
 
+    // Clean shutdown: kill any llama-server we started
+    kill_llama_server();
+
     drop(daemon_handle);
 
     Ok(())
+}
+
+/// Kill any llama-server processes we spawned on port 8090.
+fn kill_llama_server() {
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "llama-server.*--port 8090"])
+        .status();
 }
 
 /// Register the node with Supabase. Fires and forgets — non-blocking.
