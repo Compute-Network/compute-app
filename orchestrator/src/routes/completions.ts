@@ -63,6 +63,23 @@ completionsRouter.post("/chat/completions", async (c) => {
   try { apiKeyId = (c as any).get("apiKeyId"); } catch {}
   try { accountId = (c as any).get("accountId"); } catch {}
 
+  // Pre-flight credit check — reject if account has no credits
+  if (accountId) {
+    try {
+      const { getBalance } = await import("../services/billing.js");
+      const balance = await getBalance(accountId);
+      if (balance.total <= 0) {
+        return c.json(
+          { error: { message: "Insufficient credits. Top up at computenetwork.sh/dashboard", type: "insufficient_credits" } },
+          402
+        );
+      }
+    } catch (e: any) {
+      console.error("[billing] Pre-flight check failed:", e.message);
+      // Don't block on billing check failures — let inference proceed
+    }
+  }
+
   // Build the inference request payload
   const inferenceBody = {
     model: req.model,
