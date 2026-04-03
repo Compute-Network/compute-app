@@ -81,7 +81,7 @@ completionsRouter.post("/chat/completions", async (c) => {
   }
 
   // Build the inference request payload
-  const inferenceBody = {
+  const inferenceBody: Record<string, unknown> = {
     model: req.model,
     messages: req.messages,
     prompt: req.prompt,
@@ -90,6 +90,8 @@ completionsRouter.post("/chat/completions", async (c) => {
     top_p: req.top_p,
     stream: req.stream,
   };
+  if (req.tools) inferenceBody.tools = req.tools;
+  if (req.tool_choice) inferenceBody.tool_choice = req.tool_choice;
 
   // ── Streaming path ──────────────────────────────────────────────
   if (req.stream) {

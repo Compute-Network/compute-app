@@ -57,6 +57,8 @@ export const CompletionRequest = z.object({
   temperature: z.number().default(0.7),
   top_p: z.number().default(0.9),
   stream: z.boolean().default(false),
+  tools: z.array(z.any()).optional(),
+  tool_choice: z.any().optional(),
 });
 export type CompletionRequest = z.infer<typeof CompletionRequest>;
 
