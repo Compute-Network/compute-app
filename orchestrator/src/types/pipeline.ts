@@ -53,7 +53,7 @@ export const CompletionRequest = z.object({
       })
     )
     .optional(),
-  max_tokens: z.number().int().default(256),
+  max_tokens: z.number().int().default(4096),
   temperature: z.number().default(0.7),
   top_p: z.number().default(0.9),
   stream: z.boolean().default(false),
