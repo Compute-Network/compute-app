@@ -32,6 +32,16 @@ export interface PipelineAssignment {
   total_stages: number;
 }
 
+// Accept content as string or array of {type, text} blocks (OpenAI + Anthropic formats)
+const messageContent = z.union([
+  z.string(),
+  z.array(z.object({ type: z.string(), text: z.string().optional() }).passthrough()),
+]).transform((val) => {
+  if (typeof val === "string") return val;
+  // Flatten content blocks to plain string
+  return val.filter((b) => b.type === "text" && b.text).map((b) => b.text).join("\n");
+});
+
 export const CompletionRequest = z.object({
   model: z.string(),
   prompt: z.string().optional(),
@@ -39,7 +49,7 @@ export const CompletionRequest = z.object({
     .array(
       z.object({
         role: z.enum(["system", "user", "assistant"]),
-        content: z.string(),
+        content: messageContent,
       })
     )
     .optional(),
