@@ -398,6 +398,13 @@ async fn handle_inference_request(
 ) -> RelayResponse {
     let url = format!("http://127.0.0.1:{port}{}", request.path);
     info!("[relay] Proxying {} {}", request.method, request.path);
+    // Log request body for debugging (truncated)
+    let body_str = serde_json::to_string(&request.body).unwrap_or_default();
+    if body_str.len() > 2000 {
+        info!("[relay] Request body (truncated): {}...", &body_str[..2000]);
+    } else {
+        info!("[relay] Request body: {}", body_str);
+    }
 
     // Retry on 503 (server busy) — llama-server single slot may still be cleaning up
     let max_retries = 5;
@@ -405,12 +412,20 @@ async fn handle_inference_request(
         match client.post(&url).json(&request.body).timeout(Duration::from_secs(120)).send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
+                // Read body as text first so we can log errors
+                let body_text = resp.text().await.unwrap_or_default();
+
+                if status != 200 {
+                    warn!("[relay] llama-server responded {status}: {}", &body_text[..body_text.len().min(1000)]);
+                }
+
                 if status == 503 && attempt < max_retries {
                     info!("[relay] llama-server busy (503), retry {}/{} in {}ms", attempt + 1, max_retries, 500 * (attempt + 1));
                     tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
                     continue;
                 }
-                return match resp.json::<serde_json::Value>().await {
+
+                return match serde_json::from_str::<serde_json::Value>(&body_text) {
                     Ok(body) => RelayResponse {
                         id: request.id.clone(),
                         r#type: "inference_response".into(),
@@ -421,7 +436,7 @@ async fn handle_inference_request(
                         id: request.id.clone(),
                         r#type: "inference_response".into(),
                         status: 502,
-                        body: serde_json::json!({"error": format!("Failed to read response: {e}")}),
+                        body: serde_json::json!({"error": format!("Failed to parse response: {e}")}),
                     },
                 };
             }

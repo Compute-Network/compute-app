@@ -139,7 +139,7 @@ impl InferenceManager {
                 "--port",
                 &self.port.to_string(),
                 "--ctx-size",
-                "2048",
+                "16384",
                 "--n-gpu-layers",
                 "999",
             ])
