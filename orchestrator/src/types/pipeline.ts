@@ -46,12 +46,7 @@ export const CompletionRequest = z.object({
   model: z.string(),
   prompt: z.string().optional(),
   messages: z
-    .array(
-      z.object({
-        role: z.enum(["system", "user", "assistant"]),
-        content: messageContent,
-      })
-    )
+    .array(z.object({}).passthrough())
     .optional(),
   max_tokens: z.number().int().default(4096),
   temperature: z.number().default(0.7),
