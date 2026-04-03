@@ -253,11 +253,24 @@ impl SplashScreen {
                             return;
                         }
 
-                        // Step 4: start loading model into llama-server
-                        if self.current_step == 4 && !self.model_loaded.load(Ordering::Relaxed) {
-                            self.start_model_load();
-                            self.phase = SplashPhase::LoadingModel;
-                            return;
+                        // Step 4: verify model file exists (daemon handles server lifecycle)
+                        if self.current_step == 4 {
+                            if find_first_model().is_some() {
+                                self.model_loaded.store(true, Ordering::Relaxed);
+                                let model_name = find_first_model()
+                                    .and_then(|p| {
+                                        std::path::Path::new(&p)
+                                            .file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .map(|s| s.to_string())
+                                    })
+                                    .unwrap_or_else(|| "unknown".into());
+                                self.steps[self.current_step].label =
+                                    format!("Model found: {model_name}");
+                            } else {
+                                self.steps[self.current_step].label =
+                                    "No model found in ~/.compute/models/".into();
+                            }
                         }
 
                         self.steps[self.current_step].done = true;
@@ -350,74 +363,9 @@ impl SplashScreen {
         });
     }
 
-    fn start_model_load(&mut self) {
-        let (tx, rx) = mpsc::channel();
-        self.model_load_rx = Some(rx);
-
-        std::thread::spawn(move || {
-            // Find the model file
-            let Some(model_path) = find_first_model() else {
-                let _ = tx.send(Err("No .gguf model found in ~/.compute/models/".into()));
-                return;
-            };
-
-            let model_name = std::path::Path::new(&model_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
-            // Kill any existing llama-server processes on our port
-            let _ = std::process::Command::new("pkill")
-                .args(["-f", "llama-server.*--port 8090"])
-                .status();
-            std::thread::sleep(Duration::from_millis(500));
-
-            // Start llama-server
-            let child = std::process::Command::new("llama-server")
-                .args([
-                    "--model", &model_path,
-                    "--port", "8090",
-                    "--ctx-size", "2048",
-                    "--n-gpu-layers", "999",
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-
-            let Ok(_child) = child else {
-                let _ = tx.send(Err("Failed to start llama-server".into()));
-                return;
-            };
-
-            // Poll /health until ready (timeout 120s for large models)
-            let start = Instant::now();
-            loop {
-                if start.elapsed() > Duration::from_secs(120) {
-                    let _ = tx.send(Err("Model load timed out (120s)".into()));
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-
-                let Ok(resp) = reqwest::blocking::Client::new()
-                    .get("http://127.0.0.1:8090/health")
-                    .timeout(Duration::from_secs(2))
-                    .send()
-                else {
-                    continue;
-                };
-
-                if resp.status().is_success() {
-                    let _ = tx.send(Ok(model_name));
-                    return;
-                }
-            }
-        });
-    }
-
     fn skip_to_complete(&mut self) {
-        // Don't skip if we're in the middle of installing llama or loading model
-        if self.phase == SplashPhase::InstallingLlama || self.phase == SplashPhase::LoadingModel {
+        // Don't skip if we're in the middle of installing llama
+        if self.phase == SplashPhase::InstallingLlama {
             return;
         }
         for step in &mut self.steps {

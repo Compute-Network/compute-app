@@ -67,6 +67,9 @@ fn run_inner(
         }
     }
 
+    // Enable file logging so daemon output is captured
+    let _ = compute_daemon::logging::init(true);
+
     // Start daemon runtime in background DURING splash so there's no lag on transition
     let daemon_config = config.clone();
     let runtime =
