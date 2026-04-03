@@ -82,7 +82,7 @@ impl ModelCatalog {
                 ModelDefinition {
                     id: "gemma-4-26b-a4b-q4".into(),
                     name: "Gemma 4 26B-A4B (Q4 MoE)".into(),
-                    family: ModelFamily::Other,
+                    family: ModelFamily::Other("Gemma".into()),
                     total_layers: 48,
                     vram_per_layer_mb: 350,
                     total_size_mb: 16900,
