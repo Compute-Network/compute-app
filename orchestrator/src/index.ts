@@ -78,6 +78,7 @@ app.route("/v1/ws", createWsRoute());
 // OpenAI-compatible API (requires API key)
 app.use("/v1/chat/*", apiKeyAuth);
 app.use("/v1/models", apiKeyAuth);
+app.use("/v1/account/*", apiKeyAuth);
 app.route("/v1", completionsRouter);
 
 // 404 fallback
@@ -95,10 +96,17 @@ app.onError((err, c) => {
 initSolana().catch((e) => console.error("[solana] Init failed:", e.message));
 
 // Initialize scheduler (load active pipelines from DB)
+import { cleanupStalePipelines, reapIdlePipelines } from "./services/scheduler.js";
 initScheduler().catch(console.error);
 
 // Periodic tasks
 import { checkPendingDeposits } from "./services/crypto-deposits.js";
+
+// Clean up stale pipeline assignments every 30 seconds
+setInterval(() => cleanupStalePipelines().catch(console.error), 30_000);
+
+// Terminate pipelines idle for > 10 minutes (frees nodes for other work)
+setInterval(() => reapIdlePipelines().catch(console.error), 60_000);
 
 const STALE_CHECK_INTERVAL = 60_000; // 1 minute
 setInterval(async () => {

@@ -2,6 +2,7 @@ import type { Node } from "../types/node.js";
 import type { Pipeline, PipelineStage, PipelineAssignment } from "../types/pipeline.js";
 import { getAvailableNodes, assignPipeline, releasePipeline } from "./nodes.js";
 import { savePipeline, updatePipelineStatus, loadActivePipelines } from "./pipelines.js";
+import { isCircuitOpen } from "./relay.js";
 
 // Model definitions — mirrors crates/compute-network/src/models.rs
 interface ModelDef {
@@ -17,6 +18,12 @@ const MODELS: Record<string, ModelDef> = {
     name: "Gemma 4 26B-A4B (Q4 MoE)",
     total_layers: 48,
     vram_per_layer_mb: 350,
+  },
+  "gemma-4-e4b-q4": {
+    id: "gemma-4-e4b-q4",
+    name: "Gemma 4 E4B (Q4)",
+    total_layers: 28,
+    vram_per_layer_mb: 110,
   },
   "llama-3.1-8b-q4": {
     id: "llama-3.1-8b-q4",
@@ -56,8 +63,40 @@ const MODELS: Record<string, ModelDef> = {
   },
 };
 
+// Preferred model order for "auto" selection — try larger/smarter first
+const AUTO_MODEL_PRIORITY = [
+  "gemma-4-26b-a4b-q4",
+  "gemma-4-e4b-q4",
+  "llama-3.1-70b-q4",
+  "llama-3.1-8b-q4",
+  "qwen-2.5-72b-q4",
+  "mistral-7b-q4",
+];
+
 // Active pipelines in memory
 const activePipelines = new Map<string, Pipeline>();
+
+// Track last request time per pipeline for idle timeout
+const pipelineLastUsed = new Map<string, number>();
+const PIPELINE_IDLE_TIMEOUT = 10 * 60_000; // 10 minutes
+
+/** Mark a pipeline as recently used (call on each inference request). */
+export function touchPipeline(pipelineId: string): void {
+  pipelineLastUsed.set(pipelineId, Date.now());
+}
+
+/** Terminate pipelines that haven't served a request recently. */
+export async function reapIdlePipelines(): Promise<void> {
+  const now = Date.now();
+  for (const [id, pipeline] of activePipelines) {
+    const lastUsed = pipelineLastUsed.get(id) ?? 0;
+    if (now - lastUsed > PIPELINE_IDLE_TIMEOUT && pipeline.status === "active") {
+      console.log(`[scheduler] Terminating idle pipeline ${id} (model=${pipeline.model_id}, idle ${Math.round((now - lastUsed) / 1000)}s)`);
+      await terminatePipeline(id).catch(console.error);
+      pipelineLastUsed.delete(id);
+    }
+  }
+}
 
 export function getModel(modelId: string): ModelDef | undefined {
   return MODELS[modelId];
@@ -65,6 +104,59 @@ export function getModel(modelId: string): ModelDef | undefined {
 
 export function listModels(): ModelDef[] {
   return Object.values(MODELS);
+}
+
+/**
+ * Resolve "auto" model to a concrete model ID based on what nodes
+ * actually have downloaded. Picks the highest-priority model that
+ * at least one available node has.
+ */
+export async function resolveAutoModel(): Promise<string | null> {
+  const { supabase } = await import("./db.js");
+
+  // Get all available nodes with their downloaded_models
+  const { data: nodes } = await supabase
+    .from("nodes")
+    .select("id, downloaded_models, gpu_vram_mb, tflops_fp16")
+    .in("status", ["online", "idle"])
+    .is("pipeline_id", null);
+
+  if (!nodes || nodes.length === 0) return null;
+
+  // Build a set of all models available across the network
+  const networkModels = new Set<string>();
+  for (const node of nodes) {
+    if (node.downloaded_models) {
+      for (const m of node.downloaded_models.split(",")) {
+        const trimmed = m.trim();
+        if (trimmed && MODELS[trimmed]) networkModels.add(trimmed);
+      }
+    }
+  }
+
+  // Pick the highest-priority model that's available
+  for (const modelId of AUTO_MODEL_PRIORITY) {
+    if (networkModels.has(modelId)) return modelId;
+  }
+
+  // Fallback: if no downloaded_models data, default to gemma-4-26b
+  return "gemma-4-26b-a4b-q4";
+}
+
+/**
+ * Filter available nodes to only those that have the requested model downloaded
+ * AND are not circuit-broken (recently failed repeatedly).
+ */
+function filterNodesByModel(nodes: Node[], modelId: string): Node[] {
+  return nodes.filter((n) => {
+    // Skip circuit-broken nodes
+    if (isCircuitOpen(n.id)) return false;
+
+    // Check model availability
+    if (!n.downloaded_models) return true; // Legacy nodes without field — assume they have it
+    const models = n.downloaded_models.split(",").map((m: string) => m.trim());
+    return models.includes(modelId);
+  });
 }
 
 /**
@@ -135,11 +227,36 @@ function allocateLayers(
   return stages;
 }
 
+// In-flight pipeline formation locks — prevents two concurrent requests
+// from both creating pipelines for the same model simultaneously.
+const formationLocks = new Map<string, Promise<Pipeline | null>>();
+
 /**
  * Try to form a pipeline for the given model.
  * Finds available nodes, allocates layers, and assigns them.
+ * Deduplicates concurrent formation attempts for the same model.
  */
 export async function formPipeline(
+  modelId: string
+): Promise<Pipeline | null> {
+  // If another request is already forming a pipeline for this model, wait for it
+  const existing = formationLocks.get(modelId);
+  if (existing) {
+    console.log(`[scheduler] Pipeline formation for ${modelId} already in progress — waiting`);
+    return existing;
+  }
+
+  const promise = formPipelineImpl(modelId);
+  formationLocks.set(modelId, promise);
+
+  try {
+    return await promise;
+  } finally {
+    formationLocks.delete(modelId);
+  }
+}
+
+async function formPipelineImpl(
   modelId: string
 ): Promise<Pipeline | null> {
   const model = MODELS[modelId];
@@ -147,30 +264,17 @@ export async function formPipeline(
 
   const minVram = model.vram_per_layer_mb; // At least 1 layer must fit
 
-  // Clear stale pipeline assignments — nodes assigned to pipelines that no longer
-  // exist in memory (e.g. after orchestrator restart) get freed automatically
-  const activePipelineIds = new Set(activePipelines.keys());
-  const { supabase } = await import("./db.js");
-  const { data: staleNodes } = await supabase
-    .from("nodes")
-    .select("id, pipeline_id")
-    .in("status", ["online", "idle"])
-    .not("pipeline_id", "is", null);
+  // Stale cleanup runs periodically (see cleanupStalePipelines), not per-request
 
-  const toFree = (staleNodes ?? []).filter(
-    (n) => !activePipelineIds.has(n.pipeline_id)
-  );
-  if (toFree.length > 0) {
-    await supabase
-      .from("nodes")
-      .update({ pipeline_id: null, model_name: null, pipeline_stage: null, pipeline_total_stages: null })
-      .in("id", toFree.map((n) => n.id));
-    console.log(`[scheduler] Freed ${toFree.length} nodes with stale pipeline assignments`);
+  const allAvailable = await getAvailableNodes(minVram);
+
+  // Filter to nodes that actually have this model downloaded
+  const available = filterNodesByModel(allAvailable, modelId);
+
+  if (available.length === 0) {
+    console.log(`[scheduler] No nodes with model ${modelId} downloaded (${allAvailable.length} nodes available but none have the model)`);
+    return null;
   }
-
-  const available = await getAvailableNodes(minVram);
-
-  if (available.length === 0) return null;
 
   const stages = allocateLayers(available, model);
   if (!stages || stages.length === 0) return null;
@@ -212,6 +316,7 @@ export async function formPipeline(
   }
 
   activePipelines.set(pipelineId, pipeline);
+  pipelineLastUsed.set(pipelineId, Date.now()); // Set initial timestamp so idle reaper doesn't think it's 56 years old
 
   return pipeline;
 }
@@ -260,6 +365,35 @@ export async function terminatePipeline(pipelineId: string): Promise<void> {
   if (pipeline) {
     pipeline.status = "terminated";
     activePipelines.delete(pipelineId);
+  }
+}
+
+/**
+ * Clean up stale pipeline assignments — nodes pointing to pipelines
+ * that no longer exist in memory. Called periodically, not per-request.
+ */
+export async function cleanupStalePipelines(): Promise<void> {
+  try {
+    const activePipelineIds = new Set(activePipelines.keys());
+    const { supabase } = await import("./db.js");
+    const { data: staleNodes } = await supabase
+      .from("nodes")
+      .select("id, pipeline_id")
+      .in("status", ["online", "idle"])
+      .not("pipeline_id", "is", null);
+
+    const toFree = (staleNodes ?? []).filter(
+      (n) => !activePipelineIds.has(n.pipeline_id)
+    );
+    if (toFree.length > 0) {
+      await supabase
+        .from("nodes")
+        .update({ pipeline_id: null, model_name: null, pipeline_stage: null, pipeline_total_stages: null })
+        .in("id", toFree.map((n) => n.id));
+      console.log(`[scheduler] Freed ${toFree.length} nodes with stale pipeline assignments`);
+    }
+  } catch (e) {
+    console.error("[scheduler] Stale cleanup failed:", e);
   }
 }
 

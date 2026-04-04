@@ -35,6 +35,7 @@ export const HeartbeatPayload = z.object({
   pipeline_stage: z.number().int().optional(),
   requests_served: z.number().int().optional(),
   tokens_per_second: z.number().optional(),
+  downloaded_models: z.string().optional(),
 });
 export type HeartbeatPayload = z.infer<typeof HeartbeatPayload>;
 
@@ -67,6 +68,7 @@ export interface Node {
   model_name: string | null;
   requests_served: number;
   tokens_per_second: number | null;
+  downloaded_models: string | null;
   total_earned_compute: number;
   pending_compute: number;
   last_heartbeat: string | null;

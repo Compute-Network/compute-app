@@ -70,30 +70,74 @@ export async function createApiKey(
   return { key, id: data.id, prefix };
 }
 
+// ── API key validation cache ──────────────────────────────────────────
+// Caches validated keys for up to 60 seconds to avoid a Supabase roundtrip
+// on every single request. If Supabase is briefly unreachable, cached keys
+// continue working (graceful degradation).
+const KEY_CACHE_TTL = 60_000; // 60 seconds
+const keyCache = new Map<string, { record: ApiKeyRecord; expiresAt: number }>();
+
+// Evict expired entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [hash, entry] of keyCache) {
+    if (now > entry.expiresAt) keyCache.delete(hash);
+  }
+}, 5 * 60_000);
+
 /**
  * Validate an API key. Returns the key record if valid, null otherwise.
+ * Results are cached for 60s to reduce Supabase load and provide
+ * resilience during brief Supabase outages.
  */
 export async function validateApiKey(key: string): Promise<ApiKeyRecord | null> {
   if (!key.startsWith(KEY_PREFIX) && !key.startsWith("cp_")) return null;
 
   const keyHash = hashKey(key);
 
-  const { data, error } = await supabase
-    .from("api_keys")
-    .select("id, wallet_address, account_id, name, prefix, rate_limit_per_min, monthly_token_limit, tokens_total, active")
-    .eq("key_hash", keyHash)
-    .single();
+  // Check cache first
+  const cached = keyCache.get(keyHash);
+  if (cached && Date.now() < cached.expiresAt) {
+    return cached.record;
+  }
 
-  if (error || !data || !data.active) return null;
+  try {
+    const { data, error } = await supabase
+      .from("api_keys")
+      .select("id, wallet_address, account_id, name, prefix, rate_limit_per_min, monthly_token_limit, tokens_total, active")
+      .eq("key_hash", keyHash)
+      .single();
 
-  // Update last_used_at (fire-and-forget)
-  supabase
-    .from("api_keys")
-    .update({ last_used_at: new Date().toISOString() })
-    .eq("id", data.id)
-    .then(() => {});
+    if (error || !data || !data.active) {
+      keyCache.delete(keyHash); // Ensure revoked keys are evicted
+      return null;
+    }
 
-  return data as ApiKeyRecord;
+    const record = data as ApiKeyRecord;
+
+    // Cache the valid key
+    keyCache.set(keyHash, {
+      record,
+      expiresAt: Date.now() + KEY_CACHE_TTL,
+    });
+
+    // Update last_used_at (fire-and-forget)
+    supabase
+      .from("api_keys")
+      .update({ last_used_at: new Date().toISOString() })
+      .eq("id", data.id)
+      .then(() => {});
+
+    return record;
+  } catch (e: any) {
+    // Supabase unreachable — serve from cache if available (even if expired)
+    if (cached) {
+      console.warn(`[auth] Supabase unreachable, serving from stale cache for key ${key.slice(0, 8)}...`);
+      return cached.record;
+    }
+    console.error(`[auth] API key validation failed and no cache: ${e.message}`);
+    return null;
+  }
 }
 
 /**
