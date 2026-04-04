@@ -65,6 +65,8 @@ pub struct HeartbeatUpdate {
     pub requests_served: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_per_second: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub downloaded_models: Option<String>, // comma-separated model IDs
     pub last_heartbeat: String, // ISO 8601
 }
 
@@ -461,6 +463,7 @@ mod tests {
             pipeline_stage: None,
             requests_served: None,
             tokens_per_second: None,
+            downloaded_models: None,
             last_heartbeat: "2026-03-28T12:00:00Z".into(),
         };
 

@@ -21,6 +21,75 @@ enum Tab {
     Overview,
     Logs,
     Config,
+    Models,
+}
+
+struct ModelEntry {
+    id: &'static str,
+    label: &'static str,
+    desc: &'static str,
+    gguf_filename: &'static str,
+    hf_url: &'static str,
+}
+
+fn model_entries() -> Vec<ModelEntry> {
+    vec![
+        ModelEntry {
+            id: "auto",
+            label: "Auto",
+            desc: "Orchestrator selects the best model",
+            gguf_filename: "",
+            hf_url: "",
+        },
+        ModelEntry {
+            id: "gemma-4-26b-a4b-q4",
+            label: "Gemma4 — 18GB (med)",
+            desc: "MoE · 26B total, 4B active",
+            gguf_filename: "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+            hf_url: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+        },
+        ModelEntry {
+            id: "gemma-4-e4b-q4",
+            label: "Gemma4 — 3GB (small)",
+            desc: "Fast · 4B params, multimodal",
+            gguf_filename: "gemma-4-E4B-it-Q4_K_M.gguf",
+            hf_url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
+        },
+    ]
+}
+
+fn is_model_downloaded(model_id: &str) -> bool {
+    if model_id == "auto" {
+        return true;
+    }
+    let cache_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".compute")
+        .join("models");
+    for entry in model_entries() {
+        if entry.id == model_id && !entry.gguf_filename.is_empty() {
+            let path = cache_dir.join(entry.gguf_filename);
+            if !path.exists() {
+                return false;
+            }
+            // Check file is large enough to be a real model (> 100MB)
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() < 100 * 1024 * 1024 {
+                    return false;
+                }
+            }
+            // Verify GGUF magic header
+            if let Ok(mut f) = std::fs::File::open(&path) {
+                use std::io::Read;
+                let mut magic = [0u8; 4];
+                if f.read_exact(&mut magic).is_err() || magic != [0x47, 0x47, 0x55, 0x46] {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -85,6 +154,9 @@ pub struct Dashboard {
     config_edit_buffer: String,
     config_confirm: Option<String>, // "Are you sure?" for wallet changes
     daemon_state_rx: Option<tokio::sync::watch::Receiver<compute_daemon::runtime::DaemonState>>,
+    models_selected: usize,
+    models_downloading: Option<(String, f64)>, // (model_id, progress 0.0-1.0)
+    download_progress_rx: Option<std::sync::mpsc::Receiver<(String, f64)>>,
 }
 
 impl Dashboard {
@@ -136,6 +208,9 @@ impl Dashboard {
             config_edit_buffer: String::new(),
             config_confirm: None,
             daemon_state_rx: None,
+            models_selected: 0,
+            models_downloading: None,
+            download_progress_rx: None,
         }
     }
 
@@ -183,6 +258,7 @@ impl Dashboard {
                         self.log_lines = load_recent_logs(100);
                     }
                     KeyCode::Char('3') => self.active_tab = Tab::Config,
+                    KeyCode::Char('4') => self.active_tab = Tab::Models,
                     KeyCode::Char('c') => {
                         open_claim_page();
                     }
@@ -210,11 +286,25 @@ impl Dashboard {
                     KeyCode::Enter if self.active_tab == Tab::Config => {
                         self.start_config_edit();
                     }
+                    KeyCode::Up if self.active_tab == Tab::Models => {
+                        if self.models_selected > 0 {
+                            self.models_selected -= 1;
+                        }
+                    }
+                    KeyCode::Down if self.active_tab == Tab::Models => {
+                        if self.models_selected < 2 { // 3 items: auto, gemma-4, gemini-3.1
+                            self.models_selected += 1;
+                        }
+                    }
+                    KeyCode::Enter if self.active_tab == Tab::Models => {
+                        self.select_model();
+                    }
                     KeyCode::Tab => {
                         self.active_tab = match self.active_tab {
                             Tab::Overview => Tab::Logs,
                             Tab::Logs => Tab::Config,
-                            Tab::Config => Tab::Overview,
+                            Tab::Config => Tab::Models,
+                            Tab::Models => Tab::Overview,
                         };
                         if self.active_tab == Tab::Logs {
                             self.log_lines = load_recent_logs(500);
@@ -231,6 +321,23 @@ impl Dashboard {
 
     fn tick(&mut self) {
         self.globe.tick();
+
+        // Poll download progress
+        if let Some(ref rx) = self.download_progress_rx {
+            while let Ok((model_id, progress)) = rx.try_recv() {
+                if progress >= 1.0 || progress < 0.0 {
+                    // Done or failed
+                    self.models_downloading = if progress < 0.0 {
+                        Some((model_id, -1.0))
+                    } else {
+                        None
+                    };
+                    self.download_progress_rx = None;
+                    break;
+                }
+                self.models_downloading = Some((model_id, progress));
+            }
+        }
 
         // Read from daemon state if available
         if let Some(ref rx) = self.daemon_state_rx {
@@ -384,6 +491,7 @@ impl Dashboard {
             Tab::Overview => self.draw_overview_panel(frame, area),
             Tab::Logs => self.draw_logs_panel(frame, area),
             Tab::Config => self.draw_config_panel(frame, area),
+            Tab::Models => self.draw_models_panel(frame, area),
         }
     }
 
@@ -468,6 +576,8 @@ impl Dashboard {
                 Span::styled("[2] LOGS", tab_style(Tab::Logs)),
                 Span::raw("  "),
                 Span::styled("[3] CONFIG", tab_style(Tab::Config)),
+                Span::raw("  "),
+                Span::styled("[4] MODELS", tab_style(Tab::Models)),
             ]));
         } else {
             lines.push(Line::from(vec![
@@ -477,6 +587,8 @@ impl Dashboard {
                 Span::styled("[2]LOG", tab_style(Tab::Logs)),
                 Span::raw(" "),
                 Span::styled("[3]CFG", tab_style(Tab::Config)),
+                Span::raw(" "),
+                Span::styled("[4]MDL", tab_style(Tab::Models)),
             ]));
         }
 
@@ -730,7 +842,7 @@ impl Dashboard {
         if w >= 35 {
             spans.extend([
                 Span::styled("[1]", dim),
-                Span::styled("-[3]", dim),
+                Span::styled("-[4]", dim),
                 Span::styled(" tabs", dim),
             ]);
         }
@@ -1112,6 +1224,252 @@ impl Dashboard {
         frame.render_widget(config_widget, chunks[1]);
 
         self.draw_shortcuts(frame, chunks[2]);
+    }
+
+    fn select_model(&mut self) {
+        let models = model_entries();
+        let entry = match models.get(self.models_selected) {
+            Some(e) => e,
+            None => return,
+        };
+
+        // "auto" doesn't need a download
+        if entry.id == "auto" {
+            let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+            config.models.active_model = "auto".into();
+            let _ = config.save();
+            return;
+        }
+
+        // Already downloaded → just activate
+        if is_model_downloaded(entry.id) {
+            let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+            config.models.active_model = entry.id.into();
+            let _ = config.save();
+            return;
+        }
+
+        // Not downloaded → start download in background
+        if self.models_downloading.is_some() {
+            return; // already downloading
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.download_progress_rx = Some(rx);
+        self.models_downloading = Some((entry.id.into(), 0.0));
+
+        let url = entry.hf_url.to_string();
+        let filename = entry.gguf_filename.to_string();
+        let model_id = entry.id.to_string();
+
+        std::thread::spawn(move || {
+            let cache_dir = dirs::home_dir()
+                .unwrap_or_default()
+                .join(".compute")
+                .join("models");
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let dest = cache_dir.join(&filename);
+            let tmp = dest.with_extension("tmp");
+
+            let client = match reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(7200))
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => {
+                    let _ = tx.send((model_id, -1.0));
+                    return;
+                }
+            };
+
+            let resp = match client.get(&url).send() {
+                Ok(r) if r.status().is_success() => r,
+                _ => {
+                    let _ = tx.send((model_id, -1.0));
+                    return;
+                }
+            };
+
+            let total = resp.content_length().unwrap_or(0);
+            let mut downloaded: u64 = 0;
+
+            let mut file = match std::fs::File::create(&tmp) {
+                Ok(f) => f,
+                Err(_) => {
+                    let _ = tx.send((model_id, -1.0));
+                    return;
+                }
+            };
+
+            use std::io::{Read, Write};
+            let mut reader = std::io::BufReader::with_capacity(1024 * 1024, resp);
+            let mut buf = vec![0u8; 256 * 1024]; // 256KB chunks
+
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                let _ = file.write_all(&buf[..n]);
+                downloaded += n as u64;
+
+                // Send progress every ~1MB
+                if total > 0 && downloaded % (1024 * 1024) < n as u64 {
+                    let pct = downloaded as f64 / total as f64;
+                    let _ = tx.send((model_id.clone(), pct));
+                }
+            }
+
+            let _ = file.flush();
+            drop(file);
+
+            // Verify download size matches expected
+            if total > 0 {
+                if let Ok(meta) = std::fs::metadata(&tmp) {
+                    if meta.len() != total {
+                        let _ = std::fs::remove_file(&tmp);
+                        let _ = tx.send((model_id, -1.0));
+                        return;
+                    }
+                }
+            }
+
+            // Verify GGUF magic header
+            {
+                use std::io::Read;
+                if let Ok(mut f) = std::fs::File::open(&tmp) {
+                    let mut magic = [0u8; 4];
+                    if f.read_exact(&mut magic).is_err() || magic != [0x47, 0x47, 0x55, 0x46] {
+                        let _ = std::fs::remove_file(&tmp);
+                        let _ = tx.send((model_id, -1.0));
+                        return;
+                    }
+                }
+            }
+
+            let _ = std::fs::rename(&tmp, &dest);
+
+            // Done — auto-activate
+            let _ = tx.send((model_id.clone(), 1.0));
+            let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+            config.models.active_model = model_id;
+            let _ = config.save();
+        });
+    }
+
+    fn draw_models_panel(&self, frame: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5), // Header (reuse shared header)
+                Constraint::Min(0),
+                Constraint::Length(2),
+            ])
+            .split(area);
+
+        self.draw_header(frame, chunks[0]);
+
+        // Model list
+        let config = compute_daemon::config::Config::load().unwrap_or_default();
+        let active = config.models.active_model;
+        let models = model_entries();
+
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            "  MODELS",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+
+        for (i, entry) in models.iter().enumerate() {
+            let is_selected = i == self.models_selected;
+            let is_active = entry.id == active.as_str();
+            let downloaded = is_model_downloaded(entry.id);
+
+            let arrow = if is_selected { "▸ " } else { "  " };
+
+            let check = if is_active {
+                " ●"
+            } else if !downloaded && entry.id != "auto" {
+                " ↓"
+            } else {
+                "  "
+            };
+
+            let style = if !downloaded && entry.id != "auto" {
+                // Grey out undownloaded models
+                if is_selected {
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                }
+            } else if is_selected {
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            let check_style = if is_active {
+                Style::default().fg(Color::Green)
+            } else if !downloaded && entry.id != "auto" {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(arrow, style),
+                Span::styled(entry.label, style),
+                Span::styled(check, check_style),
+            ]));
+
+            let desc_text = if !downloaded && entry.id != "auto" {
+                format!("{} · not downloaded", entry.desc)
+            } else {
+                entry.desc.to_string()
+            };
+            lines.push(Line::from(vec![
+                Span::raw("      "),
+                Span::styled(desc_text, Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
+        }
+
+        // Download progress
+        if let Some((ref model_id, progress)) = self.models_downloading {
+            let bar_width = 30;
+            if progress < 0.0 {
+                lines.push(Line::from(Span::styled(
+                    format!("  Download failed: {}", model_id),
+                    Style::default().fg(Color::Red),
+                )));
+            } else {
+                let filled = (progress * bar_width as f64) as usize;
+                let empty = bar_width - filled;
+                let pct = progress * 100.0;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  Downloading  [{}{}] {:.0}%", "█".repeat(filled), "░".repeat(empty), pct),
+                        Style::default().fg(Color::White),
+                    ),
+                ]));
+            }
+        }
+
+        let list = Paragraph::new(lines);
+        frame.render_widget(list, chunks[1]);
+
+        // Footer
+        let footer = Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("↑↓", Style::default().fg(Color::DarkGray)),
+            Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("↵", Style::default().fg(Color::DarkGray)),
+            Span::styled(" select", Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(footer, chunks[2]);
     }
 }
 

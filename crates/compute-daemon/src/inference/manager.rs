@@ -139,7 +139,7 @@ impl InferenceManager {
                 "--port",
                 &self.port.to_string(),
                 "--ctx-size",
-                "16384",
+                "300000",
                 "--n-gpu-layers",
                 "999",
             ])
@@ -243,6 +243,10 @@ pub struct InferenceMetrics {
 
 /// Find a model file in the local cache.
 /// Checks ~/.compute/models/ for GGUF files matching the model name.
+///
+/// Model ID to filename mapping:
+///   gemma-4-26b-a4b-q4 → gemma-4-26B-A4B-*.gguf
+///   gemma-4-e4b-q4     → gemma-4-E4B-*.gguf
 fn find_model_path(model_name: &str) -> Option<String> {
     let cache_dir = dirs::home_dir()?.join(".compute").join("models");
 
@@ -250,34 +254,71 @@ fn find_model_path(model_name: &str) -> Option<String> {
         return None;
     }
 
-    // Direct filename match
+    let lower_model = model_name.to_lowercase();
+
+    // Extract key segments from model ID for fuzzy matching
+    // "gemma-4-26b-a4b-q4" → ["gemma", "4", "26b", "a4b"]
+    // "gemma-4-e4b-q4" → ["gemma", "4", "e4b"]
+    let segments: Vec<&str> = lower_model
+        .split('-')
+        .filter(|s| *s != "q4" && *s != "q8" && *s != "fp16" && *s != "q2") // Skip quantization suffix
+        .collect();
+
+    let entries = std::fs::read_dir(&cache_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".gguf") {
+            continue;
+        }
+
+        let lower_name = name.to_lowercase();
+
+        // Check if all key segments appear in the filename
+        let all_match = segments.iter().all(|seg| lower_name.contains(seg));
+        if all_match && !segments.is_empty() {
+            let path = entry.path();
+            // Verify file is a valid GGUF and not too small (corrupt/partial)
+            if let Ok(meta) = std::fs::metadata(&path) {
+                if meta.len() < 100 * 1024 * 1024 {
+                    warn!("Skipping model {} — too small ({:.1} MB)", name, meta.len() as f64 / 1048576.0);
+                    continue;
+                }
+            }
+            if !verify_gguf_magic(&path) {
+                warn!("Skipping model {} — invalid GGUF header", name);
+                continue;
+            }
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    // Fallback: return the first valid GGUF file found (for single-model setups)
     let entries = std::fs::read_dir(&cache_dir).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.ends_with(".gguf") {
-            // Match by model name substring
-            let lower_name = name.to_lowercase();
-            let lower_model = model_name.to_lowercase();
-
-            // Try various matching strategies
-            if lower_name.contains(&lower_model)
-                || lower_model.contains(&lower_name.replace(".gguf", ""))
-            {
-                return Some(entry.path().to_string_lossy().to_string());
+            let path = entry.path();
+            if verify_gguf_magic(&path) {
+                return Some(path.to_string_lossy().to_string());
             }
         }
     }
 
-    // Fallback: return the first GGUF file found (for testing)
-    let entries = std::fs::read_dir(&cache_dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".gguf") {
-            return Some(entry.path().to_string_lossy().to_string());
-        }
-    }
-
     None
+}
+
+/// Quick check that a file starts with the GGUF magic bytes.
+fn verify_gguf_magic(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    magic == [0x47, 0x47, 0x55, 0x46]
 }
 
 #[cfg(test)]

@@ -92,6 +92,18 @@ impl ModelCatalog {
                     source: "unsloth/gemma-4-26B-A4B-it-GGUF".into(),
                 },
                 ModelDefinition {
+                    id: "gemma-4-e4b-q4".into(),
+                    name: "Gemma 4 E4B (Q4)".into(),
+                    family: ModelFamily::Other("Gemma".into()),
+                    total_layers: 28,
+                    vram_per_layer_mb: 110,
+                    total_size_mb: 3000,
+                    quantization: Quantization::Q4,
+                    min_total_vram_mb: 5000,
+                    recommended_stages: 1,
+                    source: "unsloth/gemma-4-E4B-it-GGUF".into(),
+                },
+                ModelDefinition {
                     id: "llama-3.1-8b-q4".into(),
                     name: "Llama 3.1 8B (Q4)".into(),
                     family: ModelFamily::Llama,

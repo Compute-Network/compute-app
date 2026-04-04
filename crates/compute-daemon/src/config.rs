@@ -9,6 +9,8 @@ pub struct Config {
     pub network: NetworkConfig,
     pub docker: DockerConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub models: ModelsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +49,35 @@ pub struct LoggingConfig {
     pub max_size_mb: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsConfig {
+    #[serde(default = "default_models_cache_dir")]
+    pub cache_dir: String,
+    #[serde(default = "default_active_model")]
+    pub active_model: String,
+}
+
+fn default_models_cache_dir() -> String {
+    config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.compute"))
+        .join("models")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn default_active_model() -> String {
+    "auto".into()
+}
+
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            cache_dir: default_models_cache_dir(),
+            active_model: default_active_model(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let compute_dir = config_dir().unwrap_or_else(|| PathBuf::from("~/.compute"));
@@ -72,6 +103,10 @@ impl Default for Config {
                 level: "info".into(),
                 file: compute_dir.join("logs").join("compute.log").to_string_lossy().into_owned(),
                 max_size_mb: 100,
+            },
+            models: ModelsConfig {
+                cache_dir: compute_dir.join("models").to_string_lossy().into_owned(),
+                active_model: "auto".into(),
             },
         }
     }
@@ -117,6 +152,7 @@ impl Config {
             "network.orchestrator_url" => Some(self.network.orchestrator_url.clone()),
             "network.region" => Some(self.network.region.clone()),
             "logging.level" => Some(self.logging.level.clone()),
+            "models.active_model" => Some(self.models.active_model.clone()),
             _ => None,
         }
     }
@@ -134,6 +170,7 @@ impl Config {
             "network.orchestrator_url" => self.network.orchestrator_url = value.to_string(),
             "network.region" => self.network.region = value.to_string(),
             "logging.level" => self.logging.level = value.to_string(),
+            "models.active_model" => self.models.active_model = value.to_string(),
             _ => anyhow::bail!("Unknown config key: {key}"),
         }
         Ok(())
@@ -198,6 +235,7 @@ pub fn ensure_dirs() -> Result<()> {
     if let Some(dir) = config_dir() {
         std::fs::create_dir_all(dir.join("logs"))?;
         std::fs::create_dir_all(dir.join("images"))?;
+        std::fs::create_dir_all(dir.join("models"))?;
     }
     Ok(())
 }

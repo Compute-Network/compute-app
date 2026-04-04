@@ -338,6 +338,7 @@ impl DaemonRuntime {
                 pipeline_stage,
                 requests_served: None,
                 tokens_per_second: None,
+                downloaded_models: Some(detect_downloaded_models()),
                 last_heartbeat: chrono::Utc::now().to_rfc3339(),
             };
 
@@ -354,4 +355,82 @@ impl DaemonRuntime {
     {
         self.state_tx.send_modify(f);
     }
+}
+
+/// Check if a file is a valid GGUF by reading the magic header.
+/// GGUF files start with the bytes "GGUF" (0x47475546).
+fn is_valid_gguf(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    // GGUF magic: "GGUF" in ASCII = [0x47, 0x47, 0x55, 0x46]
+    magic == [0x47, 0x47, 0x55, 0x46]
+}
+
+fn detect_downloaded_models() -> String {
+    let cache_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".compute")
+        .join("models");
+
+    // Clean up stale .tmp files from interrupted downloads
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".tmp") {
+                // If .tmp file is older than 1 hour, delete it
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if modified.elapsed().map_or(false, |d| d.as_secs() > 3600) {
+                            let _ = std::fs::remove_file(entry.path());
+                            tracing::info!("Cleaned up stale download: {name}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut models = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+
+            if !name.ends_with(".gguf") {
+                continue;
+            }
+
+            // Skip files that are too small to be valid models (< 100MB)
+            if let Ok(meta) = entry.metadata() {
+                if meta.len() < 100 * 1024 * 1024 {
+                    tracing::warn!("Skipping suspiciously small GGUF: {} ({:.1} MB)", name, meta.len() as f64 / 1048576.0);
+                    continue;
+                }
+            }
+
+            // Verify GGUF magic header
+            if !is_valid_gguf(&path) {
+                tracing::warn!("Skipping corrupt/invalid GGUF (bad magic): {}", name);
+                continue;
+            }
+
+            if name.contains("gemma-4-26b") {
+                if !models.contains(&"gemma-4-26b-a4b-q4".to_string()) {
+                    models.push("gemma-4-26b-a4b-q4".to_string());
+                }
+            } else if name.contains("gemma-4-e4b") {
+                if !models.contains(&"gemma-4-e4b-q4".to_string()) {
+                    models.push("gemma-4-e4b-q4".to_string());
+                }
+            }
+        }
+    }
+    models.join(",")
 }
