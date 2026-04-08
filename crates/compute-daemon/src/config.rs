@@ -10,6 +10,8 @@ pub struct Config {
     pub docker: DockerConfig,
     pub logging: LoggingConfig,
     #[serde(default)]
+    pub appearance: AppearanceConfig,
+    #[serde(default)]
     pub models: ModelsConfig,
     #[serde(default)]
     pub experimental: ExperimentalConfig,
@@ -54,6 +56,12 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppearanceConfig {
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelsConfig {
     #[serde(default = "default_models_cache_dir")]
     pub cache_dir: String,
@@ -87,11 +95,23 @@ fn default_active_model() -> String {
     "auto".into()
 }
 
+fn default_theme() -> String {
+    "dark".into()
+}
+
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
             cache_dir: default_models_cache_dir(),
             active_model: default_active_model(),
+        }
+    }
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
         }
     }
 }
@@ -145,6 +165,7 @@ impl Default for Config {
                 file: compute_dir.join("logs").join("compute.log").to_string_lossy().into_owned(),
                 max_size_mb: 100,
             },
+            appearance: AppearanceConfig::default(),
             models: ModelsConfig {
                 cache_dir: compute_dir.join("models").to_string_lossy().into_owned(),
                 active_model: "auto".into(),
@@ -202,6 +223,7 @@ impl Config {
             "network.orchestrator_url" => Some(self.network.orchestrator_url.clone()),
             "network.region" => Some(self.network.region.clone()),
             "logging.level" => Some(self.logging.level.clone()),
+            "appearance.theme" => Some(self.appearance.theme.clone()),
             "models.active_model" => Some(self.models.active_model.clone()),
             "experimental.stage_mode_enabled" => Some(self.experimental.stage_mode_enabled.to_string()),
             "experimental.stage_backend" => Some(self.experimental.stage_backend.clone()),
@@ -223,6 +245,7 @@ impl Config {
             "network.orchestrator_url" => self.network.orchestrator_url = value.to_string(),
             "network.region" => self.network.region = value.to_string(),
             "logging.level" => self.logging.level = value.to_string(),
+            "appearance.theme" => self.appearance.theme = value.to_string(),
             "models.active_model" => self.models.active_model = value.to_string(),
             "experimental.stage_mode_enabled" => self.experimental.stage_mode_enabled = value.parse()?,
             "experimental.stage_backend" => self.experimental.stage_backend = value.to_string(),

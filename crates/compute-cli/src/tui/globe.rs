@@ -1,7 +1,6 @@
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::Color,
     widgets::{
         Widget,
         canvas::{Canvas, Points},
@@ -9,6 +8,7 @@ use ratatui::{
 };
 
 use super::worldmap;
+use super::theme::Palette;
 
 /// A spinning ASCII globe rendered using braille unicode characters.
 pub struct Globe {
@@ -125,7 +125,7 @@ impl Globe {
     }
 
     /// Render the globe into a ratatui Canvas widget.
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, palette: Palette) {
         if area.width < 4 || area.height < 4 {
             return;
         }
@@ -174,10 +174,10 @@ impl Globe {
             .x_bounds([-x_extent, x_extent])
             .y_bounds([-y_extent, y_extent])
             .paint(move |ctx| {
-                ctx.draw(&Points { coords: &outline, color: Color::DarkGray });
-                ctx.draw(&Points { coords: &visible_continents, color: Color::White });
-                ctx.draw(&Points { coords: &visible_nodes, color: Color::Green });
-                ctx.draw(&Points { coords: &visible_me, color: Color::Yellow });
+                ctx.draw(&Points { coords: &outline, color: palette.globe_outline });
+                ctx.draw(&Points { coords: &visible_continents, color: palette.globe_land });
+                ctx.draw(&Points { coords: &visible_nodes, color: palette.globe_nodes });
+                ctx.draw(&Points { coords: &visible_me, color: palette.globe_me });
             })
             .marker(ratatui::symbols::Marker::Braille);
 

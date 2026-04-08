@@ -7,12 +7,13 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Paragraph},
 };
 
 use super::globe::Globe;
+use super::theme;
 
 // Main logo — compact block
 const LOGO_MAIN: &[&str] = &[
@@ -61,6 +62,8 @@ pub struct SplashScreen {
     model_loaded: Arc<AtomicBool>,
     /// Experimental stage mode skips local llama-server health gating.
     stage_mode_enabled: bool,
+    /// Whether a local model is present and worth waiting on.
+    has_local_model: bool,
 }
 
 #[derive(PartialEq)]
@@ -119,13 +122,17 @@ impl SplashScreen {
         // Show the model the daemon will actually pre-warm (from config), not just the first file
         let config = compute_daemon::config::Config::load().unwrap_or_default();
         let stage_mode_enabled = config.experimental.stage_mode_enabled;
+        let first_model_path = find_first_model();
+        let has_local_model = first_model_path.is_some();
         let model_label = if stage_mode_enabled {
             format!("stage backend ({})", config.experimental.stage_backend)
         } else if config.models.active_model != "auto" {
             config.models.active_model.clone()
+        } else if !has_local_model {
+            "no local model cached yet".into()
         } else {
             // Same logic as runtime.rs pre-warm: prefer small Gemma, then larger Gemma, then Qwen.
-            let downloaded = find_first_model()
+            let downloaded = first_model_path
                 .and_then(|p| std::path::Path::new(&p).file_stem()
                     .and_then(|s| s.to_str()).map(|s| s.to_string()))
                 .unwrap_or_default();
@@ -166,6 +173,7 @@ impl SplashScreen {
             model_load_rx: None,
             model_loaded,
             stage_mode_enabled,
+            has_local_model,
         }
     }
 
@@ -264,6 +272,16 @@ impl SplashScreen {
                             self.model_loaded.store(true, Ordering::Relaxed);
                             self.steps[self.current_step].label =
                                 "Stage backend ready".into();
+                            self.steps[self.current_step].done = true;
+                            self.current_step += 1;
+                            self.step_timer = Instant::now();
+                            return;
+                        }
+
+                        if self.current_step == 4 && !self.has_local_model {
+                            self.model_loaded.store(true, Ordering::Relaxed);
+                            self.steps[self.current_step].label =
+                                "No local model cached yet".into();
                             self.steps[self.current_step].done = true;
                             self.current_step += 1;
                             self.step_timer = Instant::now();
@@ -421,6 +439,11 @@ impl SplashScreen {
 
     fn draw(&self, frame: &mut Frame) {
         let full_area = frame.area();
+        let palette = theme::palette();
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.background)),
+            full_area,
+        );
 
         // Cap dimensions, align top-left
         let max_w: u16 = 160;
@@ -440,7 +463,7 @@ impl SplashScreen {
                 .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
                 .split(area);
 
-            self.globe.render(chunks[0], frame.buffer_mut());
+            self.globe.render(chunks[0], frame.buffer_mut(), palette);
             self.draw_splash_content(frame, chunks[1]);
         } else if area.width >= 50 {
             // Vertical: globe on top, content below
@@ -449,7 +472,7 @@ impl SplashScreen {
                 .constraints([Constraint::Length(12), Constraint::Min(8)])
                 .split(area);
 
-            self.globe.render(chunks[0], frame.buffer_mut());
+            self.globe.render(chunks[0], frame.buffer_mut(), palette);
             self.draw_splash_content(frame, chunks[1]);
         } else {
             // Narrow: content only
@@ -458,6 +481,7 @@ impl SplashScreen {
     }
 
     fn draw_splash_content(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
         let w = area.width as usize;
 
         // Pick logo variant based on available width
@@ -490,7 +514,7 @@ impl SplashScreen {
                 let visible_text: String = line.chars().take(line_visible).collect();
                 logo_lines.push(Line::from(Span::styled(
                     visible_text,
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default().fg(p.text).add_modifier(Modifier::BOLD),
                 )));
                 chars_shown += line.len();
             }
@@ -503,9 +527,9 @@ impl SplashScreen {
         let tagline = Paragraph::new(vec![
             Line::from(Span::styled(
                 "Decentralized GPU Infrastructure",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.dim),
             )),
-            Line::from(Span::styled(format!("v{VERSION}"), Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(format!("v{VERSION}"), Style::default().fg(p.dim))),
         ]);
         frame.render_widget(tagline, right_chunks[2]);
 
@@ -520,17 +544,17 @@ impl SplashScreen {
                 i == self.current_step && self.phase == SplashPhase::LoadingModel;
 
             let (icon, color) = if step.done {
-                ("  ✓ ".to_string(), Color::Green)
+                ("  ✓ ".to_string(), p.success)
             } else if is_installing || is_loading_model || (i == self.current_step && self.phase == SplashPhase::StepsRunning) {
-                (format!("  {spinner} "), Color::Yellow)
+                (format!("  {spinner} "), p.warning)
             } else {
-                ("    ".to_string(), Color::DarkGray)
+                ("    ".to_string(), p.dim)
             };
 
             if i <= self.current_step || step.done {
                 step_lines.push(Line::from(vec![
                     Span::styled(icon, Style::default().fg(color)),
-                    Span::styled(&step.label, Style::default().fg(Color::Gray)),
+                    Span::styled(&step.label, Style::default().fg(p.muted)),
                 ]));
             }
         }
@@ -542,11 +566,11 @@ impl SplashScreen {
             let msg = Paragraph::new(vec![
                 Line::from(Span::styled(
                     "  Daemon started. Earning $COMPUTE...",
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(p.success),
                 )),
                 Line::from(Span::styled(
                     "  [i] What is llama-server?",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(p.dim),
                 )),
             ]);
             frame.render_widget(msg, right_chunks[5]);
@@ -554,11 +578,23 @@ impl SplashScreen {
             let msg = Paragraph::new(vec![
                 Line::from(Span::styled(
                     "  Installing llama-server via Homebrew...",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(p.warning),
                 )),
                 Line::from(Span::styled(
                     "  [i] What is llama-server?",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(p.dim),
+                )),
+            ]);
+            frame.render_widget(msg, right_chunks[5]);
+        } else if !self.has_local_model && !self.stage_mode_enabled {
+            let msg = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  No model cached yet. Download one from Models after startup.",
+                    Style::default().fg(p.warning),
+                )),
+                Line::from(Span::styled(
+                    "  [i] What is llama-server?",
+                    Style::default().fg(p.dim),
                 )),
             ]);
             frame.render_widget(msg, right_chunks[5]);

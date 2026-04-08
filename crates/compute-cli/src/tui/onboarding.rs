@@ -7,7 +7,7 @@ use serde::{de::DeserializeOwned, Deserialize};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
@@ -15,6 +15,7 @@ use ratatui::{
 use compute_daemon::config::{self, Config};
 
 use super::globe::Globe;
+use super::theme::{self, ThemeMode};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const API_BASE: &str = "https://api.computenetwork.sh";
@@ -68,6 +69,7 @@ pub struct OnboardingScreen {
     install_status: Option<String>,
     auth_rx: Option<mpsc::Receiver<Result<WalletAuthResult, String>>>,
     auth_status: Option<String>,
+    theme_mode: ThemeMode,
 }
 
 #[derive(PartialEq)]
@@ -95,6 +97,7 @@ impl OnboardingScreen {
             install_status: None,
             auth_rx: None,
             auth_status: None,
+            theme_mode: theme::current_mode(),
         }
     }
 
@@ -135,6 +138,10 @@ impl OnboardingScreen {
                 match code {
                     KeyCode::Enter => {
                         self.step = OnboardingStep::WalletInput;
+                    }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char('t') | KeyCode::Char('T') => {
+                        self.theme_mode = self.theme_mode.toggle();
+                        self.persist_theme();
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => {
                         return Some(OnboardingResult::Skipped);
@@ -235,6 +242,13 @@ impl OnboardingScreen {
         None
     }
 
+    fn persist_theme(&self) {
+        let mut config = Config::load().unwrap_or_default();
+        config.appearance.theme = self.theme_mode.as_config_value().to_string();
+        let _ = config::ensure_dirs();
+        let _ = config.save();
+    }
+
     fn start_wallet_auth(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.auth_rx = Some(rx);
@@ -311,6 +325,11 @@ impl OnboardingScreen {
 
     fn draw(&self, frame: &mut Frame) {
         let full_area = frame.area();
+        let palette = theme::palette_for(self.theme_mode);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.background)),
+            full_area,
+        );
 
         let max_w: u16 = 160;
         let max_h: u16 = 45;
@@ -327,7 +346,7 @@ impl OnboardingScreen {
                 .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
                 .split(area);
 
-            self.globe.render(chunks[0], frame.buffer_mut());
+            self.globe.render(chunks[0], frame.buffer_mut(), palette);
             self.draw_content(frame, chunks[1]);
         } else if area.width >= 50 {
             let chunks = Layout::default()
@@ -335,7 +354,7 @@ impl OnboardingScreen {
                 .constraints([Constraint::Length(12), Constraint::Min(8)])
                 .split(area);
 
-            self.globe.render(chunks[0], frame.buffer_mut());
+            self.globe.render(chunks[0], frame.buffer_mut(), palette);
             self.draw_content(frame, chunks[1]);
         } else {
             self.draw_content(frame, area);
@@ -365,6 +384,7 @@ impl OnboardingScreen {
     }
 
     fn draw_content(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette_for(self.theme_mode);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -380,9 +400,9 @@ impl OnboardingScreen {
         let header = Paragraph::new(vec![
             Line::from(Span::styled(
                 "  SETUP",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )),
-            Line::from(Span::styled(format!("  v{VERSION}"), Style::default().fg(Color::DarkGray))),
+            Line::from(Span::styled(format!("  v{VERSION}"), Style::default().fg(p.dim))),
         ]);
         frame.render_widget(header, chunks[1]);
 
@@ -400,7 +420,7 @@ impl OnboardingScreen {
 
         // Bottom help
         let help_text = match self.step {
-            OnboardingStep::Welcome => "  [Enter] Continue  [S] Skip  [Esc] Quit",
+            OnboardingStep::Welcome => "  [←/→] Theme  [Enter] Continue  [S] Skip  [Esc] Quit",
             OnboardingStep::WalletInput => "  [Enter] Open wallet login  [S] Skip  [Esc] Quit",
             OnboardingStep::DependencyCheck => "  [Enter] Retry  [Esc] Quit",
             OnboardingStep::Installing => "  Installing...",
@@ -408,47 +428,53 @@ impl OnboardingScreen {
         };
         let help = Paragraph::new(Line::from(Span::styled(
             help_text,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(p.dim),
         )));
         frame.render_widget(help, chunks[4]);
     }
 
     fn draw_welcome(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette_for(self.theme_mode);
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "  Welcome to Compute",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  Decentralized GPU Infrastructure",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.dim),
             )),
             Line::from(""),
+            Line::from(Span::styled(
+                format!("  Theme: {}  [←/→ or T to switch]", self.theme_mode.label()),
+                Style::default().fg(p.warning),
+            )),
             Line::from(""),
             Line::from(Span::styled(
                 "  To start earning $COMPUTE, you need to connect",
-                Style::default().fg(Color::Gray),
+                Style::default().fg(p.muted),
             )),
             Line::from(Span::styled(
                 "  your Solana wallet in the browser. Compute will",
-                Style::default().fg(Color::Gray),
+                Style::default().fg(p.muted),
             )),
             Line::from(Span::styled(
                 "  create your wallet account and bind this node.",
-                Style::default().fg(Color::Gray),
+                Style::default().fg(p.muted),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "  No private keys touch the CLI.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.dim),
             )),
         ];
         frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn draw_wallet_input(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette_for(self.theme_mode);
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -462,16 +488,16 @@ impl OnboardingScreen {
         // Label
         let label = Paragraph::new(vec![Line::from(Span::styled(
             "  CONNECT WALLET",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         ))]);
         frame.render_widget(label, inner_chunks[0]);
 
         let border_color = if self.error_message.is_some() {
-            Color::Red
+            p.danger
         } else if self.success {
-            Color::Green
+            p.success
         } else {
-            Color::DarkGray
+            p.dim
         };
 
         let input_block =
@@ -481,11 +507,11 @@ impl OnboardingScreen {
         let input_text = Paragraph::new(vec![
             Line::from(Span::styled(
                 "  Compute uses wallet auth like compute-code.",
-                Style::default().fg(Color::Gray),
+                Style::default().fg(p.muted),
             )),
             Line::from(Span::styled(
                 format!("  {status}"),
-                Style::default().fg(Color::White),
+                Style::default().fg(p.text),
             )),
         ])
         .block(input_block);
@@ -497,24 +523,25 @@ impl OnboardingScreen {
         if let Some(ref err) = self.error_message {
             let err_msg = Paragraph::new(Line::from(Span::styled(
                 format!("  {err}"),
-                Style::default().fg(Color::Red),
+                Style::default().fg(p.danger),
             )));
             frame.render_widget(err_msg, msg_area);
         } else if self.success && !self.input.is_empty() {
             let ok_msg = Paragraph::new(Line::from(Span::styled(
                 format!("  Connected wallet: {}", self.input.trim()),
-                Style::default().fg(Color::Green),
+                Style::default().fg(p.success),
             )));
             frame.render_widget(ok_msg, msg_area);
         }
     }
 
     fn draw_dependency_check(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette_for(self.theme_mode);
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "  DEPENDENCIES",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
         ];
@@ -523,19 +550,19 @@ impl OnboardingScreen {
             let status = self.install_status.as_deref().unwrap_or("Installing...");
             lines.push(Line::from(Span::styled(
                 format!("  {status}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(p.warning),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  This may take a minute...",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.dim),
             )));
         } else {
             // Only shown after a failed install attempt
             if let Some(ref status) = self.install_status {
                 lines.push(Line::from(Span::styled(
                     format!("  {status}"),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(p.danger),
                 )));
                 lines.push(Line::from(""));
             }
@@ -543,20 +570,20 @@ impl OnboardingScreen {
             if cfg!(target_os = "macos") {
                 lines.push(Line::from(Span::styled(
                     "  Press [Enter] to retry, or install manually:",
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(p.muted),
                 )));
                 lines.push(Line::from(Span::styled(
                     "  brew install llama.cpp",
-                    Style::default().fg(Color::White),
+                    Style::default().fg(p.text),
                 )));
             } else {
                 lines.push(Line::from(Span::styled(
                     "  Install manually and restart:",
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(p.muted),
                 )));
                 lines.push(Line::from(Span::styled(
                     "  https://github.com/ggerganov/llama.cpp",
-                    Style::default().fg(Color::White),
+                    Style::default().fg(p.text),
                 )));
             }
         }
@@ -565,16 +592,17 @@ impl OnboardingScreen {
     }
 
     fn draw_done(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette_for(self.theme_mode);
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "  Node registered successfully",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.success).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 format!("  Wallet: {}", self.input.trim()),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(p.muted),
             )),
         ];
         frame.render_widget(Paragraph::new(lines), area);

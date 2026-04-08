@@ -3,4 +3,5 @@ pub mod dashboard;
 pub mod globe;
 pub mod onboarding;
 pub mod splash;
+pub mod theme;
 pub mod worldmap;

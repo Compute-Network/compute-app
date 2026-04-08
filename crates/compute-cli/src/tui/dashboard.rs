@@ -5,7 +5,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Sparkline},
 };
@@ -14,6 +14,7 @@ use compute_daemon::hardware::{self, HardwareInfo, LiveMetrics};
 use compute_daemon::metrics::{Earnings, NetworkStats, PipelineStatus};
 
 use super::globe::Globe;
+use super::theme;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -130,6 +131,17 @@ const CONFIG_ITEMS: &[ConfigItem] = &[
         label: "Auto-start on Login",
         key: "service.autostart",
         kind: ConfigItemKind::Toggle,
+    },
+    ConfigItem { label: "Theme", key: "appearance.theme", kind: ConfigItemKind::Choice },
+    ConfigItem {
+        label: "Experimental Stage Mode",
+        key: "experimental.stage_mode_enabled",
+        kind: ConfigItemKind::Toggle,
+    },
+    ConfigItem {
+        label: "Experimental Backend",
+        key: "experimental.stage_backend",
+        kind: ConfigItemKind::Choice,
     },
     ConfigItem { label: "Log Level", key: "logging.level", kind: ConfigItemKind::Choice },
 ];
@@ -407,6 +419,11 @@ impl Dashboard {
 
     fn draw(&self, frame: &mut Frame) {
         let full_area = frame.area();
+        let palette = theme::palette();
+        frame.render_widget(
+            Block::default().style(Style::default().bg(palette.background)),
+            full_area,
+        );
 
         // Cap dimensions, align top-left
         let max_w: u16 = 160;
@@ -439,7 +456,7 @@ impl Dashboard {
                 .split(area);
 
             // Globe centered in top section
-            self.globe.render(chunks[0], frame.buffer_mut());
+            self.globe.render(chunks[0], frame.buffer_mut(), palette);
             self.draw_right_panel(frame, chunks[1]);
         } else {
             // Narrow/mobile: content only, no globe
@@ -448,6 +465,7 @@ impl Dashboard {
     }
 
     fn draw_globe_panel(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -459,15 +477,15 @@ impl Dashboard {
         // Globe
         let globe_block = Block::default()
             .borders(Borders::RIGHT)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(p.dim));
         let inner = globe_block.inner(chunks[0]);
         frame.render_widget(globe_block, chunks[0]);
-        self.globe.render(inner, frame.buffer_mut());
+        self.globe.render(inner, frame.buffer_mut(), p);
 
         // Network stats below globe
         let stats_block = Block::default()
             .borders(Borders::RIGHT | Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(p.dim));
         let stats_inner = stats_block.inner(chunks[1]);
         frame.render_widget(stats_block, chunks[1]);
 
@@ -475,17 +493,17 @@ impl Dashboard {
             Line::from(vec![
                 Span::styled(
                     format!("  {:>6} ", format_number(self.network.total_nodes)),
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    Style::default().fg(p.text).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("nodes", Style::default().fg(Color::DarkGray)),
+                Span::styled("nodes", Style::default().fg(p.dim)),
             ]),
             Line::from(vec![
-                Span::styled("  ● ", Style::default().fg(Color::Green)),
+                Span::styled("  ● ", Style::default().fg(p.success)),
                 Span::styled(
                     format!("{:.0} PF", self.network.peak_petaflops),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(p.text),
                 ),
-                Span::styled(" peak", Style::default().fg(Color::DarkGray)),
+                Span::styled(" peak", Style::default().fg(p.dim)),
             ]),
         ]);
         frame.render_widget(stats, stats_inner);
@@ -522,21 +540,22 @@ impl Dashboard {
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
         let w = area.width as usize;
         let (status_color, status_text) =
             if self.pipeline.active && (self.pipeline.active_requests > 0 || self.pipeline.tokens_per_sec > 0.0) {
-                (Color::Green, "ACTIVE")
+                (p.success, "ACTIVE")
             } else if self.pipeline.active {
-                (Color::Green, "ONLINE")
+                (p.success, "ONLINE")
             } else {
-                (Color::DarkGray, "IDLE")
+                (p.dim, "IDLE")
             };
 
         let tab_style = |tab: Tab| {
             if tab == self.active_tab {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(p.dim)
             }
         };
 
@@ -546,7 +565,7 @@ impl Dashboard {
         // Title line — always fits
         lines.push(Line::from(vec![Span::styled(
             "  C O M P U T E",
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.text).add_modifier(Modifier::BOLD),
         )]));
 
         // Subtitle + status: combine on one line if wide enough, split if narrow
@@ -554,13 +573,13 @@ impl Dashboard {
             lines.push(Line::from(vec![
                 Span::styled(
                     "  Decentralized GPU Infrastructure",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(p.dim),
                 ),
                 Span::raw("  "),
                 Span::styled("● ", Style::default().fg(status_color)),
                 Span::styled(status_text, Style::default().fg(status_color)),
                 Span::raw("  "),
-                Span::styled(format!("v{VERSION}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("v{VERSION}"), Style::default().fg(p.dim)),
             ]));
         } else {
             lines.push(Line::from(vec![
@@ -568,7 +587,7 @@ impl Dashboard {
                 Span::styled("● ", Style::default().fg(status_color)),
                 Span::styled(status_text, Style::default().fg(status_color)),
                 Span::raw("  "),
-                Span::styled(format!("v{VERSION}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("v{VERSION}"), Style::default().fg(p.dim)),
             ]));
         }
 
@@ -600,12 +619,13 @@ impl Dashboard {
         let header = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(p.dim)),
         );
         frame.render_widget(header, area);
     }
 
     fn draw_node_info(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
         let gpu_name = self
             .hardware
             .gpus
@@ -627,27 +647,27 @@ impl Dashboard {
         let lines = vec![
             Line::from(Span::styled(
                 "  NODE",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  GPU     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&gpu_name, Style::default().fg(Color::White)),
+                Span::styled("  GPU     ", Style::default().fg(p.dim)),
+                Span::styled(&gpu_name, Style::default().fg(p.text)),
             ]),
             Line::from(vec![
-                Span::styled("  Stage   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&pipeline_stage, Style::default().fg(Color::White)),
+                Span::styled("  Stage   ", Style::default().fg(p.dim)),
+                Span::styled(&pipeline_stage, Style::default().fg(p.text)),
             ]),
             Line::from(vec![
-                Span::styled("  Uptime  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&uptime, Style::default().fg(Color::White)),
+                Span::styled("  Uptime  ", Style::default().fg(p.dim)),
+                Span::styled(&uptime, Style::default().fg(p.text)),
             ]),
             Line::from(vec![
-                Span::styled("  CPU     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&cpu_bar, Style::default().fg(Color::White)),
+                Span::styled("  CPU     ", Style::default().fg(p.dim)),
+                Span::styled(&cpu_bar, Style::default().fg(p.text)),
                 Span::styled(
                     format!(" {:.0}%", self.live_metrics.cpu_usage),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(p.dim),
                 ),
             ]),
         ];
@@ -655,65 +675,67 @@ impl Dashboard {
         let widget = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(p.dim)),
         );
         frame.render_widget(widget, area);
     }
 
     fn draw_earnings(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
         let e = &self.earnings;
         let lines = vec![
             Line::from(Span::styled(
                 "  EARNINGS",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Today      ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:.1} $COMPUTE", e.today), Style::default().fg(Color::White)),
+                Span::styled("  Today      ", Style::default().fg(p.dim)),
+                Span::styled(format!("{:.1} $COMPUTE", e.today), Style::default().fg(p.text)),
                 Span::styled(
                     format!("    ≈ ${:.2}", e.today * e.usd_rate),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(p.dim),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  This Week  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  This Week  ", Style::default().fg(p.dim)),
                 Span::styled(
                     format!("{:.1} $COMPUTE", e.this_week),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(p.text),
                 ),
                 Span::styled(
                     format!("    ≈ ${:.2}", e.this_week * e.usd_rate),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(p.dim),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  All Time   ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  All Time   ", Style::default().fg(p.dim)),
                 Span::styled(
                     format!("{:.0} $COMPUTE", e.all_time),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(p.text),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  Pending    ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Pending    ", Style::default().fg(p.dim)),
                 Span::styled(
                     format!("{:.1} $COMPUTE", e.pending),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(p.warning),
                 ),
-                Span::styled("  [c]laim", Style::default().fg(Color::DarkGray)),
+                Span::styled("  [c]laim", Style::default().fg(p.dim)),
             ]),
         ];
 
         let widget = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(p.dim)),
         );
         frame.render_widget(widget, area);
     }
 
     fn draw_workload(&self, frame: &mut Frame, area: Rect) {
         let p = &self.pipeline;
+        let theme = theme::palette();
         let model = p.model.as_deref().unwrap_or("None");
 
         let vram_line = if let (Some(used), Some(total)) =
@@ -739,53 +761,54 @@ impl Dashboard {
         let lines = vec![
             Line::from(Span::styled(
                 "  WORKLOAD",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.dim).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Model     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(model, Style::default().fg(Color::White)),
+                Span::styled("  Model     ", Style::default().fg(theme.dim)),
+                Span::styled(model, Style::default().fg(theme.text)),
             ]),
             Line::from(vec![
-                Span::styled("  Served    ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Served    ", Style::default().fg(theme.dim)),
                 Span::styled(
                     format!("{} requests", format_number(p.requests_served as u32)),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme.text),
                 ),
-                Span::styled("    Active  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("    Active  ", Style::default().fg(theme.dim)),
                 Span::styled(
                     format!("{}", p.active_requests),
-                    Style::default().fg(if p.active_requests > 0 { Color::Green } else { Color::White }),
+                    Style::default().fg(if p.active_requests > 0 { theme.success } else { theme.text }),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  Latency   ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Latency   ", Style::default().fg(theme.dim)),
                 Span::styled(
                     format!("{:.0}ms avg", p.avg_latency_ms),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme.text),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  VRAM      ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&vram_line, Style::default().fg(Color::White)),
+                Span::styled("  VRAM      ", Style::default().fg(theme.dim)),
+                Span::styled(&vram_line, Style::default().fg(theme.text)),
             ]),
             Line::from(vec![
-                Span::styled("  Temp      ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&temp_line, Style::default().fg(Color::White)),
-                Span::styled("    Power  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&power_line, Style::default().fg(Color::White)),
+                Span::styled("  Temp      ", Style::default().fg(theme.dim)),
+                Span::styled(&temp_line, Style::default().fg(theme.text)),
+                Span::styled("    Power  ", Style::default().fg(theme.dim)),
+                Span::styled(&power_line, Style::default().fg(theme.text)),
             ]),
         ];
 
         let widget = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme.dim)),
         );
         frame.render_widget(widget, area);
     }
 
     fn draw_throughput(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -798,7 +821,7 @@ impl Dashboard {
 
         let label = Paragraph::new(Line::from(Span::styled(
             "  THROUGHPUT",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
         )));
         frame.render_widget(label, chunks[0]);
 
@@ -808,7 +831,7 @@ impl Dashboard {
         let sparkline = Sparkline::default()
             .data(&display_data)
             .max(200)
-            .style(Style::default().fg(Color::White));
+            .style(Style::default().fg(p.text));
 
         let sparkline_area =
             Rect { x: chunks[2].x + 2, width: chunks[2].width.saturating_sub(4), ..chunks[2] };
@@ -820,7 +843,7 @@ impl Dashboard {
             Span::raw("  "),
             Span::styled(
                 format!("{current_tps} tok/s"),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD),
             ),
         ]))
         .alignment(Alignment::Right);
@@ -832,7 +855,7 @@ impl Dashboard {
 
     fn draw_shortcuts(&self, frame: &mut Frame, area: Rect) {
         let w = area.width as usize;
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = Style::default().fg(theme::palette().dim);
 
         let mut spans = vec![
             Span::styled(" [q]", dim),
@@ -862,6 +885,7 @@ impl Dashboard {
     }
 
     fn draw_logs_panel(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -880,7 +904,7 @@ impl Dashboard {
             let mut lines = vec![
                 Line::from(Span::styled(
                     "  LIVE STATUS",
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                    Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
             ];
@@ -894,22 +918,22 @@ impl Dashboard {
 
                 lines.push(Line::from(Span::styled(
                     format!("  [{h:02}:{m:02}:{s:02}] Daemon running"),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(p.success),
                 )));
                 lines.push(Line::from(Span::styled(
                     format!("  [{h:02}:{m:02}:{s:02}] Idle state: {}", state.idle_state),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(p.muted),
                 )));
                 lines.push(Line::from(Span::styled(
                     format!(
                         "  [{h:02}:{m:02}:{s:02}] CPU: {:.0}% | RAM: {:.1}GB",
                         state.live_metrics.cpu_usage, state.live_metrics.memory_used_gb
                     ),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(p.muted),
                 )));
                 lines.push(Line::from(Span::styled(
                     format!("  [{h:02}:{m:02}:{s:02}] Inference: {}", state.inference_status),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(p.muted),
                 )));
                 if state.pipeline.active {
                     lines.push(Line::from(Span::styled(
@@ -917,13 +941,13 @@ impl Dashboard {
                             "  [{h:02}:{m:02}:{s:02}] Pipeline active: {:.1} tok/s",
                             state.pipeline.tokens_per_sec
                         ),
-                        Style::default().fg(Color::Green),
+                        Style::default().fg(p.success),
                     )));
                 }
             } else {
                 lines.push(Line::from(Span::styled(
                     "  Daemon not connected",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(p.dim),
                 )));
             }
 
@@ -940,13 +964,13 @@ impl Dashboard {
                 .iter()
                 .map(|line| {
                     let color = if line.contains("ERROR") || line.contains("error") {
-                        Color::Red
+                        p.danger
                     } else if line.contains("WARN") || line.contains("warn") {
-                        Color::Yellow
+                        p.warning
                     } else if line.contains("INFO") || line.contains("info") {
-                        Color::Gray
+                        p.muted
                     } else {
-                        Color::DarkGray
+                        p.dim
                     };
                     Line::from(Span::styled(format!("  {line}"), Style::default().fg(color)))
                 })
@@ -961,7 +985,7 @@ impl Dashboard {
             let logs = Paragraph::new(visible_lines).block(
                 Block::default()
                     .borders(Borders::NONE)
-                    .title(Span::styled(scroll_indicator, Style::default().fg(Color::DarkGray))),
+                    .title(Span::styled(scroll_indicator, Style::default().fg(p.dim))),
             );
             frame.render_widget(logs, chunks[1]);
         }
@@ -995,6 +1019,17 @@ impl Dashboard {
                 if compute_daemon::service::is_service_installed() { "On" } else { "Off" }.into()
             }
             "network.region" => config.network.region.clone(),
+            "appearance.theme" => match config.appearance.theme.as_str() {
+                "light" => "Light".into(),
+                _ => "Dark".into(),
+            },
+            "experimental.stage_mode_enabled" => {
+                if config.experimental.stage_mode_enabled { "On" } else { "Off" }.into()
+            }
+            "experimental.stage_backend" => match config.experimental.stage_backend.as_str() {
+                "llamacpp" => "LlamaCpp".into(),
+                _ => "Prototype".into(),
+            },
             "logging.level" => config.logging.level.clone(),
             _ => "?".into(),
         }
@@ -1020,6 +1055,9 @@ impl Dashboard {
                             let _ = compute_daemon::service::install_service();
                         }
                         return; // Don't save config for service
+                    }
+                    "experimental.stage_mode_enabled" => {
+                        config.experimental.stage_mode_enabled = !config.experimental.stage_mode_enabled
                     }
                     _ => {}
                 }
@@ -1048,6 +1086,18 @@ impl Dashboard {
                             "debug" => "warn".into(),
                             "warn" => "error".into(),
                             _ => "info".into(),
+                        };
+                    }
+                    "appearance.theme" => {
+                        config.appearance.theme = match config.appearance.theme.as_str() {
+                            "light" => "dark".into(),
+                            _ => "light".into(),
+                        };
+                    }
+                    "experimental.stage_backend" => {
+                        config.experimental.stage_backend = match config.experimental.stage_backend.as_str() {
+                            "llamacpp" => "prototype".into(),
+                            _ => "llamacpp".into(),
                         };
                     }
                     _ => {}
@@ -1115,6 +1165,7 @@ impl Dashboard {
     }
 
     fn draw_config_panel(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1129,7 +1180,7 @@ impl Dashboard {
         let mut lines = vec![
             Line::from(Span::styled(
                 "  SETTINGS",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
         ];
@@ -1138,16 +1189,16 @@ impl Dashboard {
         if let Some(ref wallet) = self.config_confirm {
             lines.push(Line::from(Span::styled(
                 "  Are you sure you want to change your wallet address?",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(p.warning),
             )));
             lines.push(Line::from(Span::styled(
                 format!("  New: {wallet}"),
-                Style::default().fg(Color::White),
+                Style::default().fg(p.text),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  [Y] Confirm   [N] Cancel",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(p.dim),
             )));
             let widget = Paragraph::new(lines);
             frame.render_widget(widget, chunks[1]);
@@ -1167,11 +1218,11 @@ impl Dashboard {
             };
 
             let arrow = if is_selected { "▸ " } else { "  " };
-            let label_color = if is_selected { Color::White } else { Color::DarkGray };
+            let label_color = if is_selected { p.text } else { p.dim };
             let value_color = if is_selected {
-                if self.config_editing { Color::Yellow } else { Color::White }
+                if self.config_editing { p.warning } else { p.text }
             } else {
-                Color::Gray
+                p.muted
             };
 
             let hint = match item.kind {
@@ -1187,14 +1238,14 @@ impl Dashboard {
                     Style::default().fg(label_color),
                 ),
                 Span::styled(value, Style::default().fg(value_color)),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+                Span::styled(hint, Style::default().fg(p.dim)),
             ]));
         }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  ↑↓ Navigate   ↵ Edit/Toggle   Esc Cancel",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(p.dim),
         )));
 
         let config_widget = Paragraph::new(lines);
@@ -1433,6 +1484,7 @@ impl Dashboard {
     }
 
     fn draw_models_panel(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1452,7 +1504,7 @@ impl Dashboard {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
             "  MODELS",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
@@ -1474,22 +1526,22 @@ impl Dashboard {
             let style = if !downloaded && entry.id != "auto" {
                 // Grey out undownloaded models
                 if is_selected {
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+                    Style::default().fg(p.dim).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(p.dim)
                 }
             } else if is_selected {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default().fg(p.text).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(p.muted)
             };
 
             let check_style = if is_active {
-                Style::default().fg(Color::Green)
+                Style::default().fg(p.success)
             } else if !downloaded && entry.id != "auto" {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(p.dim)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(p.dim)
             };
 
             lines.push(Line::from(vec![
@@ -1506,7 +1558,7 @@ impl Dashboard {
             };
             lines.push(Line::from(vec![
                 Span::raw("      "),
-                Span::styled(desc_text, Style::default().fg(Color::DarkGray)),
+                Span::styled(desc_text, Style::default().fg(p.dim)),
             ]));
             lines.push(Line::from(""));
         }
@@ -1517,7 +1569,7 @@ impl Dashboard {
             if progress < 0.0 {
                 lines.push(Line::from(Span::styled(
                     format!("  Download failed: {}", model_id),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(p.danger),
                 )));
             } else {
                 let filled = (progress * bar_width as f64) as usize;
@@ -1526,7 +1578,7 @@ impl Dashboard {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("  Downloading  [{}{}] {:.0}%", "█".repeat(filled), "░".repeat(empty), pct),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(p.text),
                     ),
                 ]));
             }
@@ -1538,10 +1590,10 @@ impl Dashboard {
         // Footer
         let footer = Paragraph::new(Line::from(vec![
             Span::raw("  "),
-            Span::styled("↑↓", Style::default().fg(Color::DarkGray)),
-            Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↵", Style::default().fg(Color::DarkGray)),
-            Span::styled(" select", Style::default().fg(Color::DarkGray)),
+            Span::styled("↑↓", Style::default().fg(p.dim)),
+            Span::styled(" navigate  ", Style::default().fg(p.dim)),
+            Span::styled("↵", Style::default().fg(p.dim)),
+            Span::styled(" select", Style::default().fg(p.dim)),
         ]));
         frame.render_widget(footer, chunks[2]);
     }
