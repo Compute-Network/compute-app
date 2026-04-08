@@ -120,6 +120,14 @@ impl StagePrototypeClient {
         prompt: String,
         max_tokens: Option<u32>,
     ) -> Result<StagePrototypeResponse> {
+        info!(
+            "[stage] Queueing head request {} stage={}/{} prompt_len={} max_tokens={:?}",
+            request_id,
+            self.spec.stage_index + 1,
+            self.spec.total_stages,
+            prompt.len(),
+            max_tokens
+        );
         let (response_tx, response_rx) = oneshot::channel();
         self.request_tx
             .send(StagePrototypeCommand::Complete {
@@ -221,6 +229,7 @@ pub async fn start_stage_prototype(
                 Some(command) = request_rx.recv() => {
                     match command {
                         StagePrototypeCommand::Complete { request_id, prompt, max_tokens, response_tx } => {
+                            info!("[stage] Executing queued head request {}", request_id);
                             let result = handle_local_completion_command(
                                 &transport,
                                 &engine,
@@ -250,6 +259,11 @@ pub async fn start_stage_prototype(
 
                                 match msg {
                                     PipelineMessage::Activations(activation) => {
+                                        info!(
+                                            "[stage] Received activations for request {} from {}",
+                                            activation.request_id,
+                                            peer.remote_addr()
+                                        );
                                         let input = Activation {
                                             request_id: activation.request_id.clone(),
                                             shape: activation.shape.clone(),
@@ -266,6 +280,11 @@ pub async fn start_stage_prototype(
                                         match result {
                                             Ok(ForwardResult::Activations(output)) => {
                                                 if let Some(ref downstream_peer) = downstream {
+                                                    info!(
+                                                        "[stage] Forwarding activations for request {} downstream to {}",
+                                                        output.request_id,
+                                                        downstream_peer.remote_addr()
+                                                    );
                                                     let payload = PipelineMessage::Activations(ActivationPayload {
                                                         request_id: output.request_id,
                                                         seq_position: output.seq_position,
@@ -282,6 +301,11 @@ pub async fn start_stage_prototype(
                                                 }
                                             }
                                             Ok(ForwardResult::Tokens(tokens)) => {
+                                                info!(
+                                                    "[stage] Returning {} token(s) upstream for request {}",
+                                                    tokens.len(),
+                                                    activation.request_id
+                                                );
                                                 let payload = PipelineMessage::Tokens(compute_network::transport::protocol::TokenPayload {
                                                     request_id: activation.request_id,
                                                     tokens: tokens.iter().map(|t| t.token_id).collect(),
@@ -367,6 +391,14 @@ async fn handle_local_completion_command(
         anyhow::bail!("Only the head stage can accept direct completion commands");
     }
 
+    info!(
+        "[stage] Head begin request {} downstream_present={} prompt_len={} max_tokens={:?}",
+        request_id,
+        downstream.is_some(),
+        prompt.len(),
+        max_tokens
+    );
+
     let prompt_tokens = {
         let engine = engine.lock().await;
         engine.tokenize(&prompt).await?
@@ -419,6 +451,11 @@ async fn handle_local_completion_command(
     };
 
     let downstream = downstream.ok_or_else(|| anyhow::anyhow!("No downstream peer configured for head stage"))?;
+    info!(
+        "[stage] Sending assign/control message for request {} to downstream {}",
+        request_id,
+        downstream.remote_addr()
+    );
     downstream
         .send_activations(&PipelineMessage::Control(ControlMessage::AssignLayers {
             model_id: spec.model_name.clone(),
@@ -427,13 +464,26 @@ async fn handle_local_completion_command(
             total_layers: resolve_total_layers(&spec.model_name)?,
         }))
         .await?;
+    info!(
+        "[stage] Sending activation payload for request {} to downstream {}",
+        request_id,
+        downstream.remote_addr()
+    );
     downstream
         .send_activations(&PipelineMessage::Activations(activation))
         .await?;
+    info!("[stage] Waiting for downstream tokens for request {}", request_id);
 
     let tokens = loop {
         match downstream.recv_activations().await? {
-            PipelineMessage::Tokens(tokens) if tokens.request_id == request_id => break tokens,
+            PipelineMessage::Tokens(tokens) if tokens.request_id == request_id => {
+                info!(
+                    "[stage] Received downstream tokens for request {} count={}",
+                    request_id,
+                    tokens.tokens.len()
+                );
+                break tokens
+            },
             PipelineMessage::Control(ControlMessage::Error { message, .. }) => {
                 anyhow::bail!("Downstream stage error: {message}");
             }

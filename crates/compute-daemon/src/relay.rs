@@ -638,7 +638,12 @@ async fn handle_inference_request(
     mut cancel_rx: oneshot::Receiver<()>,
     stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
 ) -> RelayResponse {
+    info!(
+        "[relay] Received inference request {} path={} stream=false",
+        request.id, request.path
+    );
     if let Some(stage_client) = wait_for_stage_head_client(&stage_client, Duration::from_secs(2)).await {
+        info!("[relay] Routing request {} to stage prototype head", request.id);
         return tokio::select! {
             _ = &mut cancel_rx => {
                 RelayResponse {
@@ -654,6 +659,7 @@ async fn handle_inference_request(
 
     if let Some(stage_client) = stage_client.lock().await.clone() {
         if stage_client.is_head_stage() {
+            info!("[relay] Routing request {} to already-ready stage prototype head", request.id);
             return tokio::select! {
                 _ = &mut cancel_rx => {
                     RelayResponse {
@@ -669,6 +675,7 @@ async fn handle_inference_request(
     }
 
     // Wait for llama-server to be ready before forwarding
+    info!("[relay] Routing request {} to local llama-server fallback", request.id);
     wait_for_healthy(client, port).await;
 
     let url = format!("http://127.0.0.1:{port}{}", request.path);
@@ -768,11 +775,24 @@ async fn handle_stage_prototype_request(
         .and_then(|value| value.as_u64())
         .map(|value| value as u32);
 
+    info!(
+        "[stage] Head handling request {} prompt_len={} max_tokens={:?}",
+        request.id,
+        prompt.len(),
+        max_tokens
+    );
+
     match stage_client
         .complete_prompt(request.id.clone(), prompt, max_tokens)
         .await
     {
-        Ok(result) => RelayResponse {
+        Ok(result) => {
+            info!(
+                "[stage] Head completed request {} completion_tokens={}",
+                request.id,
+                result.completion_tokens
+            );
+            RelayResponse {
             id: request.id.clone(),
             r#type: "inference_response".into(),
             status: 200,
@@ -795,6 +815,7 @@ async fn handle_stage_prototype_request(
                 },
                 "prototype_stage_mode": true,
             }),
+        }
         },
         Err(err) => RelayResponse {
             id: request.id.clone(),
