@@ -388,7 +388,15 @@ impl DaemonRuntime {
                 }
                 _ = metrics_interval.tick() => {
                     // Fast crash detection: check process alive every 1s (not 30s)
-                    if stage_runtime.is_none() {
+                    if stage_runtime.is_some() {
+                        inference_mgr.set_externally_managed(true);
+                        if !matches!(inference_mgr.status(), InferenceStatus::Idle) {
+                            warn!("[stage] Forcing shutdown of legacy inference manager while stage runtime is active");
+                            inference_mgr.shutdown_server();
+                            inference_mgr.set_externally_managed(true);
+                        }
+                        crate::relay::mark_llama_unhealthy();
+                    } else {
                         if !inference_mgr.check_process_alive() {
                             crate::relay::mark_llama_unhealthy();
                             if matches!(inference_mgr.status(), InferenceStatus::Error(_)) {
@@ -410,8 +418,6 @@ impl DaemonRuntime {
                             };
                             spawn_ready_probe(inference_mgr.port(), active_model, ws_outbound_tx.clone());
                         }
-                    } else {
-                        crate::relay::mark_llama_unhealthy();
                     }
 
                     let metrics = hardware::collect_live_metrics(&mut sys);
