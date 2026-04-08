@@ -64,6 +64,7 @@ impl std::fmt::Display for Quantization {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardConfig {
     pub model_id: String,
+    pub shard_id: String,
     pub shard_index: u32,
     pub start_layer: u32,
     pub end_layer: u32,
@@ -72,6 +73,13 @@ pub struct ShardConfig {
     pub source: String,
     /// SHA256 checksum for verification.
     pub checksum: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelShardManifest {
+    pub model_id: String,
+    pub revision: String,
+    pub shards: Vec<ShardConfig>,
 }
 
 impl ModelCatalog {
@@ -102,6 +110,18 @@ impl ModelCatalog {
                     min_total_vram_mb: 5000,
                     recommended_stages: 1,
                     source: "unsloth/gemma-4-E4B-it-GGUF".into(),
+                },
+                ModelDefinition {
+                    id: "qwen3.5-27b-q4".into(),
+                    name: "Qwen 3.5 27B (Q4)".into(),
+                    family: ModelFamily::Qwen,
+                    total_layers: 36,
+                    vram_per_layer_mb: 460,
+                    total_size_mb: 16500,
+                    quantization: Quantization::Q4,
+                    min_total_vram_mb: 20000,
+                    recommended_stages: 1,
+                    source: "unsloth/Qwen3.5-27B-GGUF".into(),
                 },
                 ModelDefinition {
                     id: "llama-3.1-8b-q4".into(),
@@ -188,6 +208,16 @@ impl ModelCatalog {
     pub fn models_for_vram(&self, total_vram_mb: u64) -> Vec<&ModelDefinition> {
         self.models.iter().filter(|m| m.min_total_vram_mb <= total_vram_mb).collect()
     }
+
+    /// First concrete model target for the stage-based LAN prototype.
+    pub fn stage_v1_prototype_model(&self) -> Option<&ModelDefinition> {
+        self.find("gemma-4-e4b-q4")
+    }
+
+    /// Fixed shard manifest for the first concrete stage-based LAN prototype.
+    pub fn stage_v1_prototype_manifest(&self) -> Option<ModelShardManifest> {
+        self.stage_v1_prototype_model()?.fixed_two_stage_manifest()
+    }
 }
 
 impl ModelDefinition {
@@ -206,6 +236,7 @@ impl ModelDefinition {
 
             shards.push(ShardConfig {
                 model_id: self.id.clone(),
+                shard_id: format!("{}:shard-{}", self.id, i),
                 shard_index: i,
                 start_layer: current_layer,
                 end_layer,
@@ -221,6 +252,46 @@ impl ModelDefinition {
         }
 
         shards
+    }
+
+    /// Fixed 2-stage manifest for the first LAN prototype.
+    pub fn fixed_two_stage_manifest(&self) -> Option<ModelShardManifest> {
+        if self.total_layers < 2 {
+            return None;
+        }
+
+        let midpoint = self.total_layers / 2;
+        let shard_ranges = [
+            (0_u32, midpoint.saturating_sub(1)),
+            (midpoint, self.total_layers.saturating_sub(1)),
+        ];
+
+        let shards = shard_ranges
+            .into_iter()
+            .enumerate()
+            .map(|(index, (start_layer, end_layer))| {
+                let layer_count = end_layer.saturating_sub(start_layer) + 1;
+                ShardConfig {
+                    model_id: self.id.clone(),
+                    shard_id: format!("{}:lan-v1-{}", self.id, index),
+                    shard_index: index as u32,
+                    start_layer,
+                    end_layer,
+                    size_mb: layer_count as u64 * self.vram_per_layer_mb,
+                    source: format!(
+                        "{}/lan-v1-shard-{}-layers-{}-{}",
+                        self.source, index, start_layer, end_layer
+                    ),
+                    checksum: None,
+                }
+            })
+            .collect();
+
+        Some(ModelShardManifest {
+            model_id: self.id.clone(),
+            revision: "lan-v1".into(),
+            shards,
+        })
     }
 }
 
@@ -248,6 +319,19 @@ mod tests {
         // 48GB should fit 70B models
         let medium = catalog.models_for_vram(48000);
         assert!(medium.iter().any(|m| m.id == "llama-3.1-70b-q4"));
+    }
+
+    #[test]
+    fn test_stage_v1_prototype_manifest() {
+        let catalog = ModelCatalog::default_catalog();
+        let manifest = catalog.stage_v1_prototype_manifest().unwrap();
+
+        assert_eq!(manifest.model_id, "gemma-4-e4b-q4");
+        assert_eq!(manifest.shards.len(), 2);
+        assert_eq!(manifest.shards[0].start_layer, 0);
+        assert_eq!(manifest.shards[0].end_layer, 13);
+        assert_eq!(manifest.shards[1].start_layer, 14);
+        assert_eq!(manifest.shards[1].end_layer, 27);
     }
 
     #[test]
