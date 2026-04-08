@@ -98,6 +98,8 @@ pub struct RelayClient {
     completed_requests: Arc<AtomicU64>,
     /// Whether a relay request is actively being processed
     is_active: Arc<AtomicBool>,
+    /// Whether the websocket relay is currently connected and identified.
+    is_connected: Arc<AtomicBool>,
     /// Number of in-flight relay requests currently being processed
     active_requests: Arc<AtomicU32>,
     /// Channel to send assignment pushes to the runtime
@@ -123,6 +125,10 @@ impl RelayClient {
 
     pub fn is_active(&self) -> Arc<AtomicBool> {
         self.is_active.clone()
+    }
+
+    pub fn is_connected(&self) -> Arc<AtomicBool> {
+        self.is_connected.clone()
     }
 
     pub fn active_requests(&self) -> Arc<AtomicU32> {
@@ -157,6 +163,7 @@ impl RelayClient {
             last_tps: Arc::new(AtomicU64::new(0)),
             completed_requests: Arc::new(AtomicU64::new(0)),
             is_active: Arc::new(AtomicBool::new(false)),
+            is_connected: Arc::new(AtomicBool::new(false)),
             active_requests: Arc::new(AtomicU32::new(0)),
             assignment_tx,
             outbound_rx: Arc::new(tokio::sync::Mutex::new(outbound_rx)),
@@ -213,6 +220,7 @@ impl RelayClient {
 
     async fn connect_and_run(&self) -> Result<()> {
         info!("[relay] Connecting to {}", self.ws_url);
+        self.is_connected.store(false, Ordering::Relaxed);
 
         // Connection timeout prevents hanging on unreachable orchestrator
         let (ws_stream, _) = tokio::time::timeout(
@@ -282,6 +290,7 @@ impl RelayClient {
 
                     match msg_type.as_deref() {
                         Some("identified") => {
+                            self.is_connected.store(true, Ordering::Relaxed);
                             info!("[relay] Orchestrator confirmed identification");
                         }
                         Some("assignment") => {
@@ -405,6 +414,7 @@ impl RelayClient {
                     let _ = write.send(Message::Pong(data)).await;
                 }
                 Message::Close(frame) => {
+                    self.is_connected.store(false, Ordering::Relaxed);
                     if let Some(frame) = frame {
                         match frame.code {
                             tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Library(4004) => {

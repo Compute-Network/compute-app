@@ -200,7 +200,7 @@ impl DaemonRuntime {
         let relay_latency = relay.last_latency_ms();
         let relay_tps = relay.last_tps();
         let relay_completed_requests = relay.completed_requests();
-        let relay_is_active = relay.is_active();
+        let relay_is_connected = relay.is_connected();
         let relay_active_requests = relay.active_requests();
         let relay_handle = tokio::spawn(async move {
             if let Err(e) = relay.run().await {
@@ -366,7 +366,7 @@ impl DaemonRuntime {
                 _ = assignment_interval.tick() => {
                     // Fallback: only poll orchestrator when WS relay is not actively connected
                     // When WS is connected, assignments come via push (no polling needed)
-                    if !relay_is_active.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !relay_is_connected.load(std::sync::atomic::Ordering::Relaxed) {
                         self.check_assignment(
                             &mut inference_mgr,
                             &mut stage_runtime,
@@ -379,26 +379,30 @@ impl DaemonRuntime {
                 }
                 _ = metrics_interval.tick() => {
                     // Fast crash detection: check process alive every 1s (not 30s)
-                    if !inference_mgr.check_process_alive() {
-                        crate::relay::mark_llama_unhealthy();
-                        if matches!(inference_mgr.status(), InferenceStatus::Error(_)) {
-                            // Notify orchestrator immediately via WS
-                            let msg = serde_json::json!({"type": "node_error", "error": "llama-server crashed"}).to_string();
-                            let _ = ws_outbound_tx.try_send(msg);
-                            self.update_state(|state| {
-                                state.inference_status = "error: server crashed".into();
-                            });
+                    if stage_runtime.is_none() {
+                        if !inference_mgr.check_process_alive() {
+                            crate::relay::mark_llama_unhealthy();
+                            if matches!(inference_mgr.status(), InferenceStatus::Error(_)) {
+                                // Notify orchestrator immediately via WS
+                                let msg = serde_json::json!({"type": "node_error", "error": "llama-server crashed"}).to_string();
+                                let _ = ws_outbound_tx.try_send(msg);
+                                self.update_state(|state| {
+                                    state.inference_status = "error: server crashed".into();
+                                });
+                            }
                         }
-                    }
 
-                    if inference_mgr.recover_if_needed() {
+                        if inference_mgr.recover_if_needed() {
+                            crate::relay::mark_llama_unhealthy();
+                            let active_model = match inference_mgr.status() {
+                                InferenceStatus::Running { model_name, .. } => Some(model_name.clone()),
+                                InferenceStatus::RunningRpcWorker { model_name, .. } => Some(model_name.clone()),
+                                _ => None,
+                            };
+                            spawn_ready_probe(inference_mgr.port(), active_model, ws_outbound_tx.clone());
+                        }
+                    } else {
                         crate::relay::mark_llama_unhealthy();
-                        let active_model = match inference_mgr.status() {
-                            InferenceStatus::Running { model_name, .. } => Some(model_name.clone()),
-                            InferenceStatus::RunningRpcWorker { model_name, .. } => Some(model_name.clone()),
-                            _ => None,
-                        };
-                        spawn_ready_probe(inference_mgr.port(), active_model, ws_outbound_tx.clone());
                     }
 
                     let metrics = hardware::collect_live_metrics(&mut sys);
