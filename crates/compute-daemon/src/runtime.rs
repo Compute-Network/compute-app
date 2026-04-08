@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::hardware;
 use crate::idle::{IdleDetector, IdleState};
 use crate::inference::manager::{InferenceManager, InferenceStatus};
+use crate::inference::stage_backend::StageBackendKind;
 use crate::metrics::{Earnings, NetworkStats, PipelineStatus};
 use crate::relay::{AssignmentPush, RelayClient};
 use crate::stage_runtime::{StagePrototypeClient, StagePrototypeHandle, StagePrototypeSpec, start_stage_prototype};
@@ -132,10 +133,13 @@ impl DaemonRuntime {
         let mut held_tps = 0.0f64;
         let mut held_tps_until: Option<std::time::Instant> = None;
 
+        let stage_backend_kind = StageBackendKind::parse(&self.config.experimental.stage_backend);
+        let prototype_stage_mode =
+            self.config.experimental.stage_mode_enabled && stage_backend_kind == StageBackendKind::Prototype;
+
         // Pre-warm: start llama-server during splash so the model is ready for the first request.
-        // Uses pipeline_id "pre-warm" which is preserved until a real assignment arrives.
-        // When a real pipeline assigns the same model, it just updates the ID without restarting.
-        {
+        // Skip entirely for prototype stage mode, which does not use local llama-server.
+        if !prototype_stage_mode {
             let active = &self.config.models.active_model;
             let model_name = if active == "auto" {
                 // Prefer the small Gemma test model, then larger options, then first available.
@@ -156,6 +160,8 @@ impl DaemonRuntime {
                 info!("Pre-warming llama-server with model: {model_name}");
                 inference_mgr.check_assignment(Some("pre-warm"), Some(&model_name));
             }
+        } else {
+            info!("[stage] Prototype backend enabled — skipping local llama-server pre-warm");
         }
 
         // Initial state — use pre-detected hardware if available, else detect now
