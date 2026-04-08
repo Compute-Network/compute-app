@@ -36,7 +36,12 @@ case "$ARCH" in
   *)             error "Unsupported architecture: $ARCH" ;;
 esac
 
-FILENAME="compute-${PLATFORM}-${ARCH}.tar.gz"
+case "$PLATFORM" in
+  linux)  TARGET="${ARCH}-unknown-linux-gnu" ;;
+  darwin) TARGET="${ARCH}-apple-darwin" ;;
+esac
+
+FILENAME="compute-${TARGET}.tar.gz"
 
 echo ""
 printf "  ${BOLD}██████╗ ██████╗ ███╗   ███╗██████╗ ██╗   ██╗████████╗███████╗${NC}\n"
@@ -76,25 +81,26 @@ trap "rm -rf '$TMPDIR'" EXIT
 curl -fsSL "$DOWNLOAD_URL" -o "${TMPDIR}/${FILENAME}" || error "Download failed"
 tar -xzf "${TMPDIR}/${FILENAME}" -C "$TMPDIR" || error "Extract failed"
 
-if [ ! -f "${TMPDIR}/${BINARY_NAME}" ]; then
+ARCHIVE_BINARY="compute-${TARGET}"
+if [ ! -f "${TMPDIR}/${ARCHIVE_BINARY}" ]; then
   error "Binary not found in archive"
 fi
 
 # Try system install dir, fall back to user dir
 if [ -w "$INSTALL_DIR" ]; then
-  mv "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  mv "${TMPDIR}/${ARCHIVE_BINARY}" "${INSTALL_DIR}/${BINARY_NAME}"
   chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
   success "Installed to ${INSTALL_DIR}/${BINARY_NAME}"
 elif command -v sudo >/dev/null 2>&1; then
   info "  Installing to ${INSTALL_DIR} (requires sudo)..."
-  sudo mv "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  sudo mv "${TMPDIR}/${ARCHIVE_BINARY}" "${INSTALL_DIR}/${BINARY_NAME}"
   sudo chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
   success "Installed to ${INSTALL_DIR}/${BINARY_NAME}"
 else
   # Fall back to ~/.compute/bin
   INSTALL_DIR="${HOME}/.compute/bin"
   mkdir -p "$INSTALL_DIR"
-  mv "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  mv "${TMPDIR}/${ARCHIVE_BINARY}" "${INSTALL_DIR}/${BINARY_NAME}"
   chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
   success "Installed to ${INSTALL_DIR}/${BINARY_NAME}"
 

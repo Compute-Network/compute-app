@@ -2,33 +2,44 @@
 //! so it can forward inference requests to the local llama-server.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::stage_runtime::StagePrototypeClient;
 
 #[derive(Serialize)]
 struct IdentifyMessage {
     r#type: String,
     node_id: String,
     wallet_address: String,
+    token: String,
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct RelayRequest {
     id: String,
     r#type: String,
     method: String,
     path: String,
     body: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct RelayCancelMessage {
+    id: String,
+    r#type: String,
 }
 
 #[derive(Serialize)]
@@ -39,24 +50,62 @@ struct RelayResponse {
     body: serde_json::Value,
 }
 
-#[derive(Serialize)]
-struct RelayStreamChunk {
-    id: String,
-    r#type: String,
-    chunk: String,
+/// Assignment pushed from orchestrator via WebSocket.
+/// For multi-node pipelines using llama.cpp RPC:
+/// - Stage 0 (head): receives `rpc_peers` list of "host:port" for worker nodes
+/// - Stage 1+ (workers): receives `rpc_port` to listen on
+/// - Single-stage: neither field is set (solo mode)
+#[derive(Deserialize, Debug, Clone)]
+pub struct AssignmentPush {
+    pub pipeline_id: String,
+    pub model_name: String,
+    pub stage: i32,
+    pub total_stages: i32,
+    #[serde(default)]
+    pub assignment_mode: Option<String>,
+    #[serde(default)]
+    pub shard_id: Option<String>,
+    #[serde(default)]
+    pub start_layer: Option<i32>,
+    #[serde(default)]
+    pub end_layer: Option<i32>,
+    #[serde(default)]
+    pub upstream_addr: Option<String>,
+    #[serde(default)]
+    pub downstream_addr: Option<String>,
+    /// For head node (stage 0): list of "host:port" for worker rpc-servers
+    #[serde(default)]
+    pub rpc_peers: Option<Vec<String>>,
+    /// For worker nodes (stage 1+): port to run rpc-server on
+    #[serde(default)]
+    pub rpc_port: Option<u16>,
 }
+
+/// Channel for sending messages back through the WebSocket from other tasks
+pub type WsSender = tokio::sync::mpsc::Sender<String>;
 
 pub struct RelayClient {
     ws_url: String,
     node_id: String,
     wallet_address: String,
+    node_token: String,
     inference_port: u16,
     shutdown: Arc<AtomicBool>,
     last_latency_ms: Arc<AtomicU64>,
     /// Real tok/s from the last inference response (stored as f64 bits)
     last_tps: Arc<AtomicU64>,
+    /// Number of successfully completed relay requests observed by this process
+    completed_requests: Arc<AtomicU64>,
     /// Whether a relay request is actively being processed
     is_active: Arc<AtomicBool>,
+    /// Number of in-flight relay requests currently being processed
+    active_requests: Arc<AtomicU32>,
+    /// Channel to send assignment pushes to the runtime
+    assignment_tx: tokio::sync::mpsc::Sender<AssignmentPush>,
+    /// Channel for runtime to send messages through the WS (e.g. node_ready)
+    outbound_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>,
+    /// Experimental stage runtime client for stage-based prototype requests.
+    stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
 }
 
 impl RelayClient {
@@ -68,13 +117,27 @@ impl RelayClient {
         self.last_tps.clone()
     }
 
+    pub fn completed_requests(&self) -> Arc<AtomicU64> {
+        self.completed_requests.clone()
+    }
+
     pub fn is_active(&self) -> Arc<AtomicBool> {
         self.is_active.clone()
+    }
+
+    pub fn active_requests(&self) -> Arc<AtomicU32> {
+        self.active_requests.clone()
     }
 }
 
 impl RelayClient {
-    pub fn new(config: &Config, shutdown: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        config: &Config,
+        shutdown: Arc<AtomicBool>,
+        assignment_tx: tokio::sync::mpsc::Sender<AssignmentPush>,
+        outbound_rx: tokio::sync::mpsc::Receiver<String>,
+        stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
+    ) -> Self {
         // Convert https:// to wss:// (or http:// to ws://)
         let ws_url = config
             .network
@@ -87,18 +150,24 @@ impl RelayClient {
             ws_url,
             node_id: config.wallet.node_id.clone(),
             wallet_address: config.wallet.public_address.clone(),
+            node_token: config.wallet.node_token.clone(),
             inference_port: 8090,
             shutdown,
             last_latency_ms: Arc::new(AtomicU64::new(0)),
             last_tps: Arc::new(AtomicU64::new(0)),
+            completed_requests: Arc::new(AtomicU64::new(0)),
             is_active: Arc::new(AtomicBool::new(false)),
+            active_requests: Arc::new(AtomicU32::new(0)),
+            assignment_tx,
+            outbound_rx: Arc::new(tokio::sync::Mutex::new(outbound_rx)),
+            stage_client,
         }
     }
 
     /// Run the relay loop with automatic reconnection.
     pub async fn run(&self) -> Result<()> {
-        if self.node_id.is_empty() || self.wallet_address.is_empty() {
-            warn!("[relay] No node_id or wallet configured, relay disabled");
+        if self.node_id.is_empty() || self.wallet_address.is_empty() || self.node_token.is_empty() {
+            warn!("[relay] No node_id, wallet, or node token configured, relay disabled");
             return Ok(());
         }
 
@@ -125,8 +194,19 @@ impl RelayClient {
                 return Ok(());
             }
 
-            info!("[relay] Reconnecting in {}s...", backoff.as_secs());
-            sleep(backoff).await;
+            // Jitter: ±25% to prevent thundering herd when multiple nodes reconnect
+            // Use cheap pseudo-random from system time nanos
+            let jitter_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as u64;
+            let jitter_ms = (jitter_nanos % (backoff.as_millis() as u64 / 2 + 1)) as i64
+                - (backoff.as_millis() as i64 / 4);
+            let actual_backoff = Duration::from_millis(
+                (backoff.as_millis() as i64 + jitter_ms).max(500) as u64
+            );
+            info!("[relay] Reconnecting in {}ms...", actual_backoff.as_millis());
+            sleep(actual_backoff).await;
             backoff = (backoff * 2).min(max_backoff);
         }
     }
@@ -134,7 +214,13 @@ impl RelayClient {
     async fn connect_and_run(&self) -> Result<()> {
         info!("[relay] Connecting to {}", self.ws_url);
 
-        let (ws_stream, _) = connect_async(&self.ws_url).await?;
+        // Connection timeout prevents hanging on unreachable orchestrator
+        let (ws_stream, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_async(&self.ws_url),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("WebSocket connection timed out after 10s"))??;
         let (mut write, mut read) = ws_stream.split();
 
         // Send identify message
@@ -142,6 +228,7 @@ impl RelayClient {
             r#type: "identify".into(),
             node_id: self.node_id.clone(),
             wallet_address: self.wallet_address.clone(),
+            token: self.node_token.clone(),
         };
         write.send(Message::Text(serde_json::to_string(&identify)?)).await?;
 
@@ -150,6 +237,10 @@ impl RelayClient {
         let http_client = reqwest::Client::new();
         let inference_port = self.inference_port;
         let shutdown = self.shutdown.clone();
+        let outbound_rx = self.outbound_rx.clone();
+        let mut outbound = outbound_rx.lock().await;
+        let (response_tx, mut response_rx) = mpsc::channel::<String>(32);
+        let active_cancels = Arc::new(Mutex::new(std::collections::HashMap::<String, oneshot::Sender<()>>::new()));
 
         // Process messages
         loop {
@@ -160,7 +251,16 @@ impl RelayClient {
 
             let msg = tokio::select! {
                 msg = read.next() => msg,
-                _ = sleep(Duration::from_secs(30)) => {
+                Some(out_msg) = outbound.recv() => {
+                    // Send outbound message (e.g. node_ready) through WS
+                    let _ = write.send(Message::Text(out_msg)).await;
+                    continue;
+                }
+                Some(relay_msg) = response_rx.recv() => {
+                    let _ = write.send(Message::Text(relay_msg)).await;
+                    continue;
+                }
+                _ = sleep(Duration::from_secs(15)) => {
                     // Send ping to keep connection alive
                     let _ = write.send(Message::Ping(vec![])).await;
                     continue;
@@ -175,113 +275,232 @@ impl RelayClient {
 
             match msg {
                 Message::Text(text) => {
-                    let request: Result<RelayRequest, _> = serde_json::from_str(&text);
-                    match request {
-                        Ok(req) if req.r#type == "inference_request" => {
-                            self.is_active.store(true, Ordering::Relaxed);
+                    // Parse as generic JSON to check type before deserializing specific structs
+                    let msg_type = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from));
 
+                    match msg_type.as_deref() {
+                        Some("identified") => {
+                            info!("[relay] Orchestrator confirmed identification");
+                        }
+                        Some("assignment") => {
+                            match serde_json::from_str::<AssignmentPush>(&text) {
+                                Ok(assignment) => {
+                                    info!("[relay] Assignment push: pipeline={} model={}", assignment.pipeline_id, assignment.model_name);
+                                    // Reset health flag — new assignment may load a different model
+                                    LLAMA_HEALTHY.store(false, Ordering::Relaxed);
+                                    let _ = self.assignment_tx.try_send(assignment);
+                                }
+                                Err(e) => warn!("[relay] Failed to parse assignment: {e}"),
+                            }
+                        }
+                        Some("inference_request") => {
+                            let req: RelayRequest = match serde_json::from_str(&text) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    warn!("[relay] Failed to parse inference request: {e}");
+                                    continue;
+                                }
+                            };
+
+                            self.is_active.store(true, Ordering::Relaxed);
+                            self.active_requests.fetch_add(1, Ordering::Relaxed);
                             let is_stream = req.body.get("stream")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
-
                             let start = std::time::Instant::now();
+                            let response_tx = response_tx.clone();
+                            let http_client = http_client.clone();
+                            let stage_client = self.stage_client.clone();
+                            let is_active = self.is_active.clone();
+                            let active_requests = self.active_requests.clone();
+                            let last_latency_ms = self.last_latency_ms.clone();
+                            let last_tps = self.last_tps.clone();
+                            let completed_requests = self.completed_requests.clone();
+                            let active_cancels = active_cancels.clone();
+                            let (cancel_tx, cancel_rx) = oneshot::channel();
+                            active_cancels.lock().await.insert(req.id.clone(), cancel_tx);
 
-                            if is_stream {
-                                // Stream SSE chunks over WebSocket
-                                let final_response = handle_streaming_request(
-                                    &http_client,
-                                    inference_port,
-                                    &req,
-                                    &mut write,
-                                ).await;
-                                let total_ms = start.elapsed().as_millis() as u64;
-                                self.is_active.store(false, Ordering::Relaxed);
-                                self.last_latency_ms.store(total_ms.min(50), Ordering::Relaxed);
+                            tokio::spawn(async move {
+                                if is_stream {
+                                    let final_response = handle_streaming_request(
+                                        &http_client, inference_port, &req, response_tx.clone(), cancel_rx, stage_client,
+                                    ).await;
+                                    let total_ms = start.elapsed().as_millis() as u64;
+                                    let remaining = active_requests.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                                    is_active.store(remaining > 0, Ordering::Relaxed);
+                                    let network_latency = total_ms.min(200);
+                                    last_latency_ms.store(network_latency, Ordering::Relaxed);
 
-                                let response_json = serde_json::to_string(&final_response)?;
-                                write.send(Message::Text(response_json)).await?;
-                            } else {
-                                let response =
-                                    handle_inference_request(&http_client, inference_port, &req).await;
-                                let total_ms = start.elapsed().as_millis() as u64;
+                                    if let Some(usage) = final_response.body.get("usage") {
+                                        let comp_tokens = usage.get("completion_tokens")
+                                            .and_then(|v| v.as_u64()).unwrap_or(0);
+                                        if comp_tokens > 0 && total_ms > 0 {
+                                            let tps = (comp_tokens as f64 / total_ms as f64) * 1000.0;
+                                            last_tps.store(tps.to_bits(), Ordering::Relaxed);
+                                        }
+                                    }
+                                    if (200..400).contains(&final_response.status) {
+                                        completed_requests.fetch_add(1, Ordering::Relaxed);
+                                    }
 
-                                self.is_active.store(false, Ordering::Relaxed);
+                                    if let Ok(response_json) = serde_json::to_string(&final_response) {
+                                        let _ = response_tx.send(response_json).await;
+                                    }
+                                } else {
+                                    let response =
+                                        handle_inference_request(&http_client, inference_port, &req, cancel_rx, stage_client).await;
+                                    let total_ms = start.elapsed().as_millis() as u64;
+                                    let remaining = active_requests.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                                    is_active.store(remaining > 0, Ordering::Relaxed);
 
-                                // Latency = total time - inference time
-                                let inference_ms = response
-                                    .body
-                                    .get("timings")
-                                    .map(|t| {
-                                        let prompt =
-                                            t.get("prompt_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                        let predicted = t
-                                            .get("predicted_ms")
-                                            .and_then(|v| v.as_f64())
-                                            .unwrap_or(0.0);
+                                    let inference_ms = response.body.get("timings").map(|t| {
+                                        let prompt = t.get("prompt_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                        let predicted = t.get("predicted_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                         (prompt + predicted) as u64
-                                    })
-                                    .unwrap_or(0);
-                                let network_latency = total_ms.saturating_sub(inference_ms);
-                                self.last_latency_ms.store(network_latency, Ordering::Relaxed);
+                                    }).unwrap_or(0);
+                                    last_latency_ms.store(total_ms.saturating_sub(inference_ms), Ordering::Relaxed);
 
-                                // Store real tps from response
-                                if let Some(tps) = response
-                                    .body
-                                    .get("timings")
-                                    .and_then(|t| t.get("predicted_per_second"))
-                                    .and_then(|v| v.as_f64())
-                                {
-                                    self.last_tps.store(tps.to_bits(), Ordering::Relaxed);
+                                    if let Some(tps) = response.body.get("timings")
+                                        .and_then(|t| t.get("predicted_per_second"))
+                                        .and_then(|v| v.as_f64())
+                                    {
+                                        last_tps.store(tps.to_bits(), Ordering::Relaxed);
+                                    }
+                                    if (200..400).contains(&response.status) {
+                                        completed_requests.fetch_add(1, Ordering::Relaxed);
+                                    }
+
+                                    if let Ok(response_json) = serde_json::to_string(&response) {
+                                        let _ = response_tx.send(response_json).await;
+                                    }
                                 }
 
-                                let response_json = serde_json::to_string(&response)?;
-                                write.send(Message::Text(response_json)).await?;
+                                active_cancels.lock().await.remove(&req.id);
+                            });
+                        }
+                        Some("inference_cancel") => {
+                            let cancel: RelayCancelMessage = match serde_json::from_str(&text) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    warn!("[relay] Failed to parse inference cancel: {e}");
+                                    continue;
+                                }
+                            };
+                            if let Some(cancel_tx) = active_cancels.lock().await.remove(&cancel.id) {
+                                let _ = cancel_tx.send(());
+                                info!("[relay] Cancelled request {}", cancel.id);
                             }
                         }
-                        Ok(msg) => {
-                            // identified, pong, etc — ignore
-                            if msg.r#type != "identified" {
-                                warn!("[relay] Unknown message type: {}", msg.r#type);
-                            }
+                        Some(other) => {
+                            warn!("[relay] Unknown message type: {other}");
                         }
-                        Err(e) => {
-                            warn!("[relay] Failed to parse message: {e}");
+                        None => {
+                            warn!("[relay] Message missing type field");
                         }
                     }
                 }
                 Message::Ping(data) => {
                     let _ = write.send(Message::Pong(data)).await;
                 }
-                Message::Close(_) => return Ok(()),
+                Message::Close(frame) => {
+                    if let Some(frame) = frame {
+                        match frame.code {
+                            tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Library(4004) => {
+                                warn!("[relay] Node session expired or invalid. Run `compute wallet login`.");
+                            }
+                            tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Library(4005) => {
+                                warn!("[relay] Relay wallet mismatch. Re-authenticate with `compute wallet login`.");
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Ok(());
+                }
                 _ => {}
             }
         }
     }
 }
 
+/// Tracks whether llama-server has been confirmed healthy at least once.
+/// Reset when a new model is loaded (assignment push with different model).
+static LLAMA_HEALTHY: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_llama_unhealthy() {
+    LLAMA_HEALTHY.store(false, Ordering::Relaxed);
+}
+
+/// Wait for llama-server to be healthy before forwarding a request.
+/// Skips entirely if already confirmed healthy. Polls /health every 500ms, up to 60s.
+async fn wait_for_healthy(client: &reqwest::Client, port: u16) {
+    if LLAMA_HEALTHY.load(Ordering::Relaxed) {
+        return;
+    }
+    for attempt in 0..120u32 {
+        match client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if attempt > 0 {
+                    info!("[relay] llama-server became healthy after {:.1}s", attempt as f64 * 0.5);
+                }
+                LLAMA_HEALTHY.store(true, Ordering::Relaxed);
+                return;
+            }
+            _ => {}
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+    warn!("[relay] llama-server did not become healthy after 60s, proceeding anyway");
+    LLAMA_HEALTHY.store(true, Ordering::Relaxed); // Don't block future requests
+}
+
 /// Handle a streaming inference request: forward SSE chunks from llama-server
 /// over the WebSocket as individual `inference_stream_chunk` messages, then
 /// send a final `inference_response` with aggregated usage.
-async fn handle_streaming_request<S>(
+async fn handle_streaming_request(
     client: &reqwest::Client,
     port: u16,
     request: &RelayRequest,
-    write: &mut S,
-) -> RelayResponse
-where
-    S: SinkExt<Message> + Unpin,
-    S::Error: std::fmt::Display,
-{
+    response_tx: mpsc::Sender<String>,
+    mut cancel_rx: oneshot::Receiver<()>,
+    stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
+) -> RelayResponse {
+    if stage_client.lock().await.is_some() {
+        return RelayResponse {
+            id: request.id.clone(),
+            r#type: "inference_response".into(),
+            status: 501,
+            body: serde_json::json!({"error": "Streaming is not implemented for experimental stage mode yet"}),
+        };
+    }
+
+    // Wait for llama-server to be ready before forwarding
+    wait_for_healthy(client, port).await;
+
     let url = format!("http://127.0.0.1:{port}{}", request.path);
     info!("[relay] Streaming {} {}", request.method, request.path);
 
-    let resp = match client
-        .post(&url)
-        .json(&request.body)
-        .timeout(Duration::from_secs(120))
-        .send()
-        .await
-    {
+    let resp = match tokio::select! {
+        _ = &mut cancel_rx => {
+            return RelayResponse {
+                id: request.id.clone(),
+                r#type: "inference_response".into(),
+                status: 499,
+                body: serde_json::json!({"error": "Request cancelled by client"}),
+            };
+        }
+        result = client
+            .post(&url)
+            .json(&request.body)
+            .timeout(Duration::from_secs(120))
+            .send() => result
+    } {
         Ok(r) => r,
         Err(e) => {
             return RelayResponse {
@@ -307,14 +526,30 @@ where
         };
     }
 
-    // Read SSE stream using reqwest's bytes_stream (returns futures::Stream)
+    // Read SSE stream — optimized buffer management to minimize allocations
     let mut byte_stream = resp.bytes_stream();
-    let mut buffer = String::new();
-    let mut completion_tokens = 0u64;
-    let mut prompt_tokens = 0u64;
+    let mut buffer = String::with_capacity(4096); // Pre-allocate reasonable buffer
     let mut last_usage: Option<serde_json::Value> = None;
+    let mut prompt_tokens = 0u64;
+    let mut completion_tokens = 0u64;
 
-    while let Some(chunk_result) = byte_stream.next().await {
+    loop {
+        let chunk_result = tokio::select! {
+            _ = &mut cancel_rx => {
+                return RelayResponse {
+                    id: request.id.clone(),
+                    r#type: "inference_response".into(),
+                    status: 499,
+                    body: serde_json::json!({"error": "Request cancelled by client"}),
+                };
+            }
+            next = byte_stream.next() => next
+        };
+
+        let Some(chunk_result) = chunk_result else {
+            break;
+        };
+
         let chunk = match chunk_result {
             Ok(c) => c,
             Err(e) => {
@@ -325,53 +560,48 @@ where
 
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process complete SSE lines
-        while let Some(pos) = buffer.find('\n') {
-            let line = buffer[..pos].trim_end().to_string();
-            buffer = buffer[pos + 1..].to_string();
+        // Process complete SSE lines — drain from front without re-allocating
+        let mut search_start = 0;
+        while let Some(rel_pos) = buffer[search_start..].find('\n') {
+            let pos = search_start + rel_pos;
+            let line = buffer[search_start..pos].trim_end();
 
-            if !line.starts_with("data: ") {
-                continue;
-            }
+            if line.starts_with("data: ") {
+                let data = &line[6..];
 
-            let data = &line[6..];
+                // Forward SSE chunk to orchestrator via WebSocket
+                // Build JSON manually to avoid struct serialization overhead
+                let chunk_json = format!(
+                    r#"{{"id":"{}","type":"inference_stream_chunk","chunk":"{}\\n\\n"}}"#,
+                    request.id, line.replace('\\', "\\\\").replace('"', "\\\"")
+                );
+                let _ = response_tx.send(chunk_json).await;
 
-            // Forward every SSE chunk to orchestrator via WebSocket
-            let stream_chunk = RelayStreamChunk {
-                id: request.id.clone(),
-                r#type: "inference_stream_chunk".into(),
-                chunk: line.clone() + "\n\n",
-            };
-            let _ = write
-                .send(Message::Text(serde_json::to_string(&stream_chunk).unwrap_or_default()))
-                .await;
-
-            if data == "[DONE]" {
-                break;
-            }
-
-            // Parse for usage tracking
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(usage) = parsed.get("usage") {
-                    last_usage = Some(usage.clone());
-                    prompt_tokens = usage
-                        .get("prompt_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(prompt_tokens);
-                    completion_tokens = usage
-                        .get("completion_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(completion_tokens);
+                if data == "[DONE]" {
+                    search_start = pos + 1;
+                    break;
                 }
-                if parsed.get("choices")
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("delta"))
-                    .and_then(|d| d.get("content"))
-                    .is_some()
-                {
-                    completion_tokens += 1;
+
+                // Parse only for usage tracking (only chunks with "usage" key matter)
+                if data.contains("usage") {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(usage) = parsed.get("usage") {
+                            last_usage = Some(usage.clone());
+                            prompt_tokens = usage.get("prompt_tokens")
+                                .and_then(|v| v.as_u64()).unwrap_or(prompt_tokens);
+                            completion_tokens = usage.get("completion_tokens")
+                                .and_then(|v| v.as_u64()).unwrap_or(completion_tokens);
+                        }
+                    }
                 }
             }
+
+            search_start = pos + 1;
+        }
+
+        // Drain processed data from buffer (single allocation instead of per-line)
+        if search_start > 0 {
+            buffer.drain(..search_start);
         }
     }
 
@@ -395,21 +625,45 @@ async fn handle_inference_request(
     client: &reqwest::Client,
     port: u16,
     request: &RelayRequest,
+    mut cancel_rx: oneshot::Receiver<()>,
+    stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
 ) -> RelayResponse {
-    let url = format!("http://127.0.0.1:{port}{}", request.path);
-    info!("[relay] Proxying {} {}", request.method, request.path);
-    // Log request body for debugging (truncated)
-    let body_str = serde_json::to_string(&request.body).unwrap_or_default();
-    if body_str.len() > 2000 {
-        info!("[relay] Request body (truncated): {}...", &body_str[..2000]);
-    } else {
-        info!("[relay] Request body: {}", body_str);
+    if let Some(stage_client) = stage_client.lock().await.clone() {
+        if stage_client.is_head_stage() {
+            return tokio::select! {
+                _ = &mut cancel_rx => {
+                    RelayResponse {
+                        id: request.id.clone(),
+                        r#type: "inference_response".into(),
+                        status: 499,
+                        body: serde_json::json!({"error": "Request cancelled by client"}),
+                    }
+                }
+                result = handle_stage_prototype_request(&stage_client, request) => result
+            };
+        }
     }
+
+    // Wait for llama-server to be ready before forwarding
+    wait_for_healthy(client, port).await;
+
+    let url = format!("http://127.0.0.1:{port}{}", request.path);
+    tracing::debug!("[relay] Proxying {} {}", request.method, request.path);
 
     // Retry on 503 (server busy) — llama-server single slot may still be cleaning up
     let max_retries = 5;
     for attempt in 0..=max_retries {
-        match client.post(&url).json(&request.body).timeout(Duration::from_secs(120)).send().await {
+        match tokio::select! {
+            _ = &mut cancel_rx => {
+                return RelayResponse {
+                    id: request.id.clone(),
+                    r#type: "inference_response".into(),
+                    status: 499,
+                    body: serde_json::json!({"error": "Request cancelled by client"}),
+                };
+            }
+            result = client.post(&url).json(&request.body).timeout(Duration::from_secs(120)).send() => result
+        } {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 // Read body as text first so we can log errors
@@ -456,4 +710,144 @@ async fn handle_inference_request(
         }
     }
     unreachable!()
+}
+
+async fn handle_stage_prototype_request(
+    stage_client: &StagePrototypeClient,
+    request: &RelayRequest,
+) -> RelayResponse {
+    let prompt = extract_request_prompt(&request.body);
+    let max_tokens = request
+        .body
+        .get("max_tokens")
+        .or_else(|| request.body.get("max_completion_tokens"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u32);
+
+    match stage_client
+        .complete_prompt(request.id.clone(), prompt, max_tokens)
+        .await
+    {
+        Ok(result) => RelayResponse {
+            id: request.id.clone(),
+            r#type: "inference_response".into(),
+            status: 200,
+            body: serde_json::json!({
+                "id": request.id,
+                "object": "chat.completion",
+                "model": result.model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": result.content,
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": result.prompt_tokens,
+                    "completion_tokens": result.completion_tokens,
+                    "total_tokens": result.total_tokens,
+                },
+                "prototype_stage_mode": true,
+            }),
+        },
+        Err(err) => RelayResponse {
+            id: request.id.clone(),
+            r#type: "inference_response".into(),
+            status: 502,
+            body: serde_json::json!({"error": format!("Stage prototype request failed: {err}")}),
+        },
+    }
+}
+
+fn extract_request_prompt(body: &serde_json::Value) -> String {
+    if let Some(prompt) = body.get("prompt").and_then(|value| value.as_str()) {
+        return prompt.to_string();
+    }
+
+    if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
+        let combined = messages
+            .iter()
+            .filter_map(|message| {
+                let role = message.get("role").and_then(|value| value.as_str()).unwrap_or("user");
+                let content = message.get("content")?;
+                if let Some(text) = content.as_str() {
+                    Some(format!("{role}: {text}"))
+                } else if let Some(parts) = content.as_array() {
+                    let text = parts
+                        .iter()
+                        .filter_map(|part| {
+                            if part.get("type").and_then(|value| value.as_str()) == Some("text") {
+                                part.get("text").and_then(|value| value.as_str()).map(str::to_string)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if text.is_empty() {
+                        None
+                    } else {
+                        Some(format!("{role}: {text}"))
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !combined.is_empty() {
+            return combined;
+        }
+    }
+
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_request_prompt;
+
+    #[test]
+    fn extract_request_prompt_prefers_prompt_field() {
+        let body = serde_json::json!({
+            "prompt": "hello from prompt",
+            "messages": [
+                {"role": "user", "content": "ignored"}
+            ]
+        });
+        assert_eq!(extract_request_prompt(&body), "hello from prompt");
+    }
+
+    #[test]
+    fn extract_request_prompt_flattens_chat_messages() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "user", "content": "Say hi"}
+            ]
+        });
+        assert_eq!(
+            extract_request_prompt(&body),
+            "system: You are terse.\nuser: Say hi"
+        );
+    }
+
+    #[test]
+    fn extract_request_prompt_flattens_text_parts() {
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Part one"},
+                        {"type": "image_url", "image_url": {"url": "ignored"}},
+                        {"type": "text", "text": "Part two"}
+                    ]
+                }
+            ]
+        });
+        assert_eq!(extract_request_prompt(&body), "user: Part one Part two");
+    }
 }
