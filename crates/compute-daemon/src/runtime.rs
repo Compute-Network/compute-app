@@ -649,7 +649,14 @@ impl DaemonRuntime {
                     _ => None,
                 };
 
-                if stage_pipeline_match || looks_like_stage_assignment {
+                if stage_runtime.is_some() && node.pipeline_id.is_some() {
+                    if !stage_pipeline_match {
+                        tracing::debug!(
+                            "[stage] Stage runtime active for pipeline {:?}; skipping poll-based inference manager sync",
+                            node.pipeline_id
+                        );
+                    }
+                } else if stage_pipeline_match || looks_like_stage_assignment {
                     if looks_like_stage_assignment && !stage_pipeline_match {
                         tracing::debug!(
                             "[stage] Poll observed stage assignment for pipeline {:?}; waiting for push/runtime instead of falling back to solo",
