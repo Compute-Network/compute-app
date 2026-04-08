@@ -59,6 +59,8 @@ pub struct SplashScreen {
     model_load_rx: Option<mpsc::Receiver<Result<String, String>>>,
     /// Whether model is loaded and serving
     model_loaded: Arc<AtomicBool>,
+    /// Experimental stage mode skips local llama-server health gating.
+    stage_mode_enabled: bool,
 }
 
 #[derive(PartialEq)]
@@ -116,7 +118,10 @@ impl SplashScreen {
 
         // Show the model the daemon will actually pre-warm (from config), not just the first file
         let config = compute_daemon::config::Config::load().unwrap_or_default();
-        let model_label = if config.models.active_model != "auto" {
+        let stage_mode_enabled = config.experimental.stage_mode_enabled;
+        let model_label = if stage_mode_enabled {
+            format!("stage backend ({})", config.experimental.stage_backend)
+        } else if config.models.active_model != "auto" {
             config.models.active_model.clone()
         } else {
             // Same logic as runtime.rs pre-warm: prefer small Gemma, then larger Gemma, then Qwen.
@@ -160,6 +165,7 @@ impl SplashScreen {
             spinner_timer: Instant::now(),
             model_load_rx: None,
             model_loaded,
+            stage_mode_enabled,
         }
     }
 
@@ -254,6 +260,16 @@ impl SplashScreen {
                         }
 
                         // Step 4: wait for daemon's llama-server to be ready
+                        if self.current_step == 4 && self.stage_mode_enabled {
+                            self.model_loaded.store(true, Ordering::Relaxed);
+                            self.steps[self.current_step].label =
+                                "Stage backend ready".into();
+                            self.steps[self.current_step].done = true;
+                            self.current_step += 1;
+                            self.step_timer = Instant::now();
+                            return;
+                        }
+
                         if self.current_step == 4 && !self.model_loaded.load(Ordering::Relaxed) {
                             self.start_model_health_poll();
                             self.phase = SplashPhase::LoadingModel;
