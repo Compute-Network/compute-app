@@ -638,6 +638,20 @@ async fn handle_inference_request(
     mut cancel_rx: oneshot::Receiver<()>,
     stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
 ) -> RelayResponse {
+    if let Some(stage_client) = wait_for_stage_head_client(&stage_client, Duration::from_secs(2)).await {
+        return tokio::select! {
+            _ = &mut cancel_rx => {
+                RelayResponse {
+                    id: request.id.clone(),
+                    r#type: "inference_response".into(),
+                    status: 499,
+                    body: serde_json::json!({"error": "Request cancelled by client"}),
+                }
+            }
+            result = handle_stage_prototype_request(&stage_client, request) => result
+        };
+    }
+
     if let Some(stage_client) = stage_client.lock().await.clone() {
         if stage_client.is_head_stage() {
             return tokio::select! {
@@ -720,6 +734,26 @@ async fn handle_inference_request(
         }
     }
     unreachable!()
+}
+
+async fn wait_for_stage_head_client(
+    stage_client: &Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
+    timeout: Duration,
+) -> Option<StagePrototypeClient> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(client) = stage_client.lock().await.clone() {
+            if client.is_head_stage() {
+                return Some(client);
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn handle_stage_prototype_request(
