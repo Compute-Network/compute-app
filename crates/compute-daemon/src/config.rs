@@ -40,6 +40,8 @@ pub struct WalletConfig {
 pub struct NetworkConfig {
     pub orchestrator_url: String,
     pub region: String,
+    #[serde(default)]
+    pub advertise_host: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +157,7 @@ impl Default for Config {
             network: NetworkConfig {
                 orchestrator_url: "https://api.computenetwork.sh".into(),
                 region: "auto".into(),
+                advertise_host: String::new(),
             },
             docker: DockerConfig {
                 socket: default_docker_socket(),
@@ -222,6 +225,7 @@ impl Config {
             "wallet.node_token" => Some(self.wallet.node_token.clone()),
             "network.orchestrator_url" => Some(self.network.orchestrator_url.clone()),
             "network.region" => Some(self.network.region.clone()),
+            "network.advertise_host" => Some(self.network.advertise_host.clone()),
             "logging.level" => Some(self.logging.level.clone()),
             "appearance.theme" => Some(self.appearance.theme.clone()),
             "models.active_model" => Some(self.models.active_model.clone()),
@@ -244,6 +248,7 @@ impl Config {
             "wallet.node_token" => self.wallet.node_token = value.to_string(),
             "network.orchestrator_url" => self.network.orchestrator_url = value.to_string(),
             "network.region" => self.network.region = value.to_string(),
+            "network.advertise_host" => self.network.advertise_host = value.to_string(),
             "logging.level" => self.logging.level = value.to_string(),
             "appearance.theme" => self.appearance.theme = value.to_string(),
             "models.active_model" => self.models.active_model = value.to_string(),

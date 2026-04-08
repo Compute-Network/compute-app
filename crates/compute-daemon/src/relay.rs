@@ -16,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::stage_runtime::StagePrototypeClient;
+use std::net::{Ipv4Addr, UdpSocket};
 
 #[derive(Serialize)]
 struct IdentifyMessage {
@@ -23,6 +24,8 @@ struct IdentifyMessage {
     node_id: String,
     wallet_address: String,
     token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advertise_host: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -84,11 +87,30 @@ pub struct AssignmentPush {
 /// Channel for sending messages back through the WebSocket from other tasks
 pub type WsSender = tokio::sync::mpsc::Sender<String>;
 
+fn detect_advertise_ip() -> Option<String> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).ok()?;
+    let addr = socket.local_addr().ok()?;
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        _ => None,
+    }
+}
+
+fn advertised_host_from_config(config: &Config) -> Option<String> {
+    let configured = config.network.advertise_host.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+    detect_advertise_ip()
+}
+
 pub struct RelayClient {
     ws_url: String,
     node_id: String,
     wallet_address: String,
     node_token: String,
+    advertise_host: Option<String>,
     inference_port: u16,
     shutdown: Arc<AtomicBool>,
     last_latency_ms: Arc<AtomicU64>,
@@ -157,6 +179,7 @@ impl RelayClient {
             node_id: config.wallet.node_id.clone(),
             wallet_address: config.wallet.public_address.clone(),
             node_token: config.wallet.node_token.clone(),
+            advertise_host: advertised_host_from_config(config),
             inference_port: 8090,
             shutdown,
             last_latency_ms: Arc::new(AtomicU64::new(0)),
@@ -237,6 +260,7 @@ impl RelayClient {
             node_id: self.node_id.clone(),
             wallet_address: self.wallet_address.clone(),
             token: self.node_token.clone(),
+            advertise_host: self.advertise_host.clone(),
         };
         write.send(Message::Text(serde_json::to_string(&identify)?)).await?;
 

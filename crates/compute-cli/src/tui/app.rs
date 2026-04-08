@@ -138,7 +138,7 @@ pub async fn register_node_orchestrator(
     let cpu_cores = Some(hw.cpu.cores);
     let memory_mb = Some((hw.memory.total_gb * 1024.0) as u64);
     let os_str = Some(format!("{} {}", hw.os.name, hw.os.version));
-    let ip_address = detect_advertise_ip();
+    let ip_address = advertised_host(config);
 
     let mut client =
         OrchestratorClient::new(&config.network.orchestrator_url, Some(config.wallet.node_token.clone()));
@@ -171,6 +171,14 @@ fn detect_advertise_ip() -> Option<String> {
         std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
         _ => None,
     }
+}
+
+fn advertised_host(config: &Config) -> Option<String> {
+    let configured = config.network.advertise_host.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+    detect_advertise_ip()
 }
 
 /// Register the node with the orchestrator. Fires and forgets — non-blocking.

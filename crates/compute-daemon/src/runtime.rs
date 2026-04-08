@@ -802,7 +802,7 @@ impl DaemonRuntime {
                 inference_slots_total: slots_total,
                 inference_slots_busy: slots_busy,
                 gpu_vram_free_mb: vram_free,
-                ip_address: detect_advertise_ip(),
+                ip_address: advertised_host(&self.config),
                 last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
             };
 
@@ -836,6 +836,14 @@ fn detect_advertise_ip() -> Option<String> {
         std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
         _ => None,
     }
+}
+
+fn advertised_host(config: &Config) -> Option<String> {
+    let configured = config.network.advertise_host.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+    detect_advertise_ip()
 }
 
 /// Check if a file is a valid GGUF by reading the magic header.
