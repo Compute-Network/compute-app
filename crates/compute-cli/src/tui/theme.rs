@@ -4,13 +4,13 @@ use compute_daemon::config::Config;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeMode {
+    System,
     Dark,
     Light,
 }
 
 #[derive(Clone, Copy)]
 pub struct Palette {
-    pub background: Color,
     pub text: Color,
     pub muted: Color,
     pub dim: Color,
@@ -26,6 +26,7 @@ pub struct Palette {
 impl ThemeMode {
     pub fn from_config_value(value: &str) -> Self {
         match value.to_ascii_lowercase().as_str() {
+            "system" => Self::System,
             "light" => Self::Light,
             _ => Self::Dark,
         }
@@ -33,6 +34,7 @@ impl ThemeMode {
 
     pub fn as_config_value(self) -> &'static str {
         match self {
+            Self::System => "system",
             Self::Dark => "dark",
             Self::Light => "light",
         }
@@ -40,13 +42,15 @@ impl ThemeMode {
 
     pub fn toggle(self) -> Self {
         match self {
+            Self::System => Self::Dark,
             Self::Dark => Self::Light,
-            Self::Light => Self::Dark,
+            Self::Light => Self::System,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::System => "System",
             Self::Dark => "Dark",
             Self::Light => "Light",
         }
@@ -63,9 +67,8 @@ pub fn palette() -> Palette {
 }
 
 pub fn palette_for(mode: ThemeMode) -> Palette {
-    match mode {
+    match resolve_mode(mode) {
         ThemeMode::Dark => Palette {
-            background: Color::Black,
             text: Color::White,
             muted: Color::Gray,
             dim: Color::DarkGray,
@@ -78,7 +81,6 @@ pub fn palette_for(mode: ThemeMode) -> Palette {
             globe_me: Color::Yellow,
         },
         ThemeMode::Light => Palette {
-            background: Color::White,
             text: Color::Black,
             muted: Color::DarkGray,
             dim: Color::Gray,
@@ -90,5 +92,42 @@ pub fn palette_for(mode: ThemeMode) -> Palette {
             globe_nodes: Color::Green,
             globe_me: Color::Blue,
         },
+        ThemeMode::System => unreachable!("system mode should be resolved before palette selection"),
+    }
+}
+
+fn resolve_mode(mode: ThemeMode) -> ThemeMode {
+    match mode {
+        ThemeMode::System => detect_system_mode(),
+        other => other,
+    }
+}
+
+fn detect_system_mode() -> ThemeMode {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                let value = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+                if value.contains("dark") {
+                    return ThemeMode::Dark;
+                }
+            }
+        }
+        return ThemeMode::Light;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let gtk = std::env::var("GTK_THEME").unwrap_or_default().to_ascii_lowercase();
+        let color_scheme = std::env::var("COLORFGBG").unwrap_or_default().to_ascii_lowercase();
+        if gtk.contains("dark") || color_scheme.ends_with(";0") {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        }
     }
 }

@@ -419,11 +419,6 @@ impl Dashboard {
 
     fn draw(&self, frame: &mut Frame) {
         let full_area = frame.area();
-        let palette = theme::palette();
-        frame.render_widget(
-            Block::default().style(Style::default().bg(palette.background)),
-            full_area,
-        );
 
         // Cap dimensions, align top-left
         let max_w: u16 = 160;
@@ -456,7 +451,7 @@ impl Dashboard {
                 .split(area);
 
             // Globe centered in top section
-            self.globe.render(chunks[0], frame.buffer_mut(), palette);
+            self.globe.render(chunks[0], frame.buffer_mut(), theme::palette());
             self.draw_right_panel(frame, chunks[1]);
         } else {
             // Narrow/mobile: content only, no globe
@@ -1020,6 +1015,7 @@ impl Dashboard {
             }
             "network.region" => config.network.region.clone(),
             "appearance.theme" => match config.appearance.theme.as_str() {
+                "system" => "System".into(),
                 "light" => "Light".into(),
                 _ => "Dark".into(),
             },
@@ -1090,8 +1086,10 @@ impl Dashboard {
                     }
                     "appearance.theme" => {
                         config.appearance.theme = match config.appearance.theme.as_str() {
+                            "system" => "dark".into(),
                             "light" => "dark".into(),
-                            _ => "light".into(),
+                            "dark" => "light".into(),
+                            _ => "system".into(),
                         };
                     }
                     "experimental.stage_backend" => {

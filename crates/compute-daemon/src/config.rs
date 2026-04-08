@@ -96,7 +96,7 @@ fn default_active_model() -> String {
 }
 
 fn default_theme() -> String {
-    "dark".into()
+    "system".into()
 }
 
 impl Default for ModelsConfig {

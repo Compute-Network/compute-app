@@ -141,15 +141,21 @@ pub async fn start_stage_prototype(
     hw: &HardwareInfo,
     spec: StagePrototypeSpec,
 ) -> Result<StagePrototypeHandle> {
-    let model_path = resolve_model_path(&spec.model_name)
-        .with_context(|| format!("No local GGUF found for stage prototype model {}", spec.model_name))?;
     let total_layers = resolve_total_layers(&spec.model_name)?;
 
     let stage_backend = StageBackendKind::parse(&config.experimental.stage_backend);
     let mut engine = StageExecutionBackend::new_for_hardware(hw, stage_backend);
+    let shard_path = match stage_backend {
+        StageBackendKind::Prototype => std::path::PathBuf::from(format!(
+            "prototype://{}:{}-{}",
+            spec.model_name, spec.start_layer, spec.end_layer
+        )),
+        StageBackendKind::LlamaCpp => resolve_model_path(&spec.model_name)
+            .with_context(|| format!("No local GGUF found for stage prototype model {}", spec.model_name))?,
+    };
     let shard_config = EngineShardConfig {
         model_id: spec.model_name.clone(),
-        shard_path: model_path,
+        shard_path,
         start_layer: spec.start_layer,
         end_layer: spec.end_layer,
         total_layers,

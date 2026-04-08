@@ -326,10 +326,6 @@ impl OnboardingScreen {
     fn draw(&self, frame: &mut Frame) {
         let full_area = frame.area();
         let palette = theme::palette_for(self.theme_mode);
-        frame.render_widget(
-            Block::default().style(Style::default().bg(palette.background)),
-            full_area,
-        );
 
         let max_w: u16 = 160;
         let max_h: u16 = 45;

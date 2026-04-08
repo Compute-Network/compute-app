@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::Paragraph,
 };
 
 use super::globe::Globe;
@@ -440,10 +440,6 @@ impl SplashScreen {
     fn draw(&self, frame: &mut Frame) {
         let full_area = frame.area();
         let palette = theme::palette();
-        frame.render_widget(
-            Block::default().style(Style::default().bg(palette.background)),
-            full_area,
-        );
 
         // Cap dimensions, align top-left
         let max_w: u16 = 160;
