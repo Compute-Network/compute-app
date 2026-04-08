@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "compute-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "compute-daemon"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bollard",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "compute-network"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "compute-solana"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "serde",
