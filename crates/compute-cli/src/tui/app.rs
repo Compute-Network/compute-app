@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::net::{Ipv4Addr, UdpSocket};
 use tracing::warn;
 
 use compute_daemon::config::Config;
@@ -137,6 +138,7 @@ pub async fn register_node_orchestrator(
     let cpu_cores = Some(hw.cpu.cores);
     let memory_mb = Some((hw.memory.total_gb * 1024.0) as u64);
     let os_str = Some(format!("{} {}", hw.os.name, hw.os.version));
+    let ip_address = detect_advertise_ip();
 
     let mut client =
         OrchestratorClient::new(&config.network.orchestrator_url, Some(config.wallet.node_token.clone()));
@@ -154,10 +156,21 @@ pub async fn register_node_orchestrator(
         region: Some(config.network.region.clone()),
         tflops_fp16: tflops,
         listen_port: Some(9090),
+        ip_address,
     };
 
     let node_id = client.register(&node).await?;
     Ok(Some(node_id))
+}
+
+fn detect_advertise_ip() -> Option<String> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).ok()?;
+    let addr = socket.local_addr().ok()?;
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        _ => None,
+    }
 }
 
 /// Register the node with the orchestrator. Fires and forgets — non-blocking.

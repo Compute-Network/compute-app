@@ -27,6 +27,8 @@ pub struct NodeRegistration {
     pub app_version: Option<String>,
     pub region: Option<String>,
     pub listen_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +62,8 @@ pub struct HeartbeatPayload {
     pub inference_slots_busy: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_vram_free_mb: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ip_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_heartbeat: Option<String>,
 }

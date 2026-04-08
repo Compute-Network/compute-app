@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -801,6 +802,7 @@ impl DaemonRuntime {
                 inference_slots_total: slots_total,
                 inference_slots_busy: slots_busy,
                 gpu_vram_free_mb: vram_free,
+                ip_address: detect_advertise_ip(),
                 last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
             };
 
@@ -823,6 +825,16 @@ impl DaemonRuntime {
         F: FnOnce(&mut DaemonState),
     {
         self.state_tx.send_modify(f);
+    }
+}
+
+fn detect_advertise_ip() -> Option<String> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).ok()?;
+    let addr = socket.local_addr().ok()?;
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        _ => None,
     }
 }
 
