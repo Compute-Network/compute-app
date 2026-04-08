@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::hardware::HardwareInfo;
 use crate::inference::engine::{Activation, ForwardResult, ShardConfig as EngineShardConfig};
-use crate::inference::stage_backend::StageExecutionBackend;
+use crate::inference::stage_backend::{StageBackendKind, StageExecutionBackend};
 
 const STAGE_RUNTIME_LISTEN_PORT: u16 = 9090;
 
@@ -137,7 +137,7 @@ impl StagePrototypeClient {
 }
 
 pub async fn start_stage_prototype(
-    _config: &Config,
+    config: &Config,
     hw: &HardwareInfo,
     spec: StagePrototypeSpec,
 ) -> Result<StagePrototypeHandle> {
@@ -145,7 +145,8 @@ pub async fn start_stage_prototype(
         .with_context(|| format!("No local GGUF found for stage prototype model {}", spec.model_name))?;
     let total_layers = resolve_total_layers(&spec.model_name)?;
 
-    let mut engine = StageExecutionBackend::new_for_hardware(hw);
+    let stage_backend = StageBackendKind::parse(&config.experimental.stage_backend);
+    let mut engine = StageExecutionBackend::new_for_hardware(hw, stage_backend);
     let shard_config = EngineShardConfig {
         model_id: spec.model_name.clone(),
         shard_path: model_path,
@@ -365,13 +366,50 @@ async fn handle_local_completion_command(
         engine.tokenize(&prompt).await?
     };
 
-    let activation = ActivationPayload {
+    let initial_input = Activation {
         request_id: request_id.clone(),
-        seq_position: 0,
-        batch_index: 0,
         shape: vec![1, prompt_tokens.len().max(1), 2048],
         data: prompt.as_bytes().to_vec(),
-        dtype: compute_network::transport::protocol::TensorDtype::Float16,
+        seq_position: 0,
+        batch_index: 0,
+    };
+
+    let head_result = {
+        let engine = engine.lock().await;
+        engine.forward(initial_input).await?
+    };
+
+    let activation = match head_result {
+        ForwardResult::Activations(activation) => ActivationPayload {
+            request_id: activation.request_id,
+            seq_position: activation.seq_position,
+            batch_index: activation.batch_index,
+            shape: activation.shape,
+            data: activation.data,
+            dtype: compute_network::transport::protocol::TensorDtype::Float16,
+        },
+        ForwardResult::Tokens(tokens) => {
+            let raw_completion_tokens = tokens.len() as u32;
+            let completion_tokens = max_tokens
+                .map(|limit| raw_completion_tokens.min(limit))
+                .unwrap_or(raw_completion_tokens);
+            let token_slice = &tokens[..completion_tokens as usize];
+            let content = {
+                let engine = engine.lock().await;
+                engine
+                    .detokenize(&token_slice.iter().map(|t| t.token_id).collect::<Vec<_>>())
+                    .await
+                    .unwrap_or_else(|_| token_slice.iter().map(|t| t.token_text.clone()).collect::<Vec<_>>().join(""))
+            };
+
+            return Ok(StagePrototypeResponse {
+                model_name: spec.model_name.clone(),
+                content,
+                prompt_tokens: prompt_tokens.len() as u32,
+                completion_tokens,
+                total_tokens: prompt_tokens.len() as u32 + completion_tokens,
+            });
+        }
     };
 
     let downstream = downstream.ok_or_else(|| anyhow::anyhow!("No downstream peer configured for head stage"))?;

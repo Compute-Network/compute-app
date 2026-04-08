@@ -247,6 +247,7 @@ The prototype is successful if it proves all of the following:
 - `gemma-4-e4b-q4` is the fixed prototype model with a `0-13` / `14-27` split.
 - The orchestrator has a fixed 2-node Gemma prototype branch behind `EXPERIMENTAL_STAGE_MODE=true`.
 - The daemon has an explicit `experimental.stage_mode_enabled` gate and a distinct stage prototype runtime.
+- The daemon also supports `experimental.stage_backend`, currently defaulting to `prototype` for real deterministic stage execution without depending on llama.cpp hidden-state support.
 - A local 2-node head/tail QUIC roundtrip harness passes.
 - The daemon relay can now send experimental non-streaming requests into the head-stage prototype path.
 - Streaming remains unsupported for stage mode and should fail explicitly until token streaming is implemented through the transport path.

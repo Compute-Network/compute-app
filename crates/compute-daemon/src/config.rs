@@ -65,6 +65,8 @@ pub struct ModelsConfig {
 pub struct ExperimentalConfig {
     #[serde(default)]
     pub stage_mode_enabled: bool,
+    #[serde(default = "default_stage_backend")]
+    pub stage_backend: String,
 }
 
 fn default_models_cache_dir() -> String {
@@ -98,8 +100,13 @@ impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
             stage_mode_enabled: false,
+            stage_backend: default_stage_backend(),
         }
     }
+}
+
+fn default_stage_backend() -> String {
+    "prototype".into()
 }
 
 impl Default for Config {
@@ -197,6 +204,7 @@ impl Config {
             "logging.level" => Some(self.logging.level.clone()),
             "models.active_model" => Some(self.models.active_model.clone()),
             "experimental.stage_mode_enabled" => Some(self.experimental.stage_mode_enabled.to_string()),
+            "experimental.stage_backend" => Some(self.experimental.stage_backend.clone()),
             _ => None,
         }
     }
@@ -217,6 +225,7 @@ impl Config {
             "logging.level" => self.logging.level = value.to_string(),
             "models.active_model" => self.models.active_model = value.to_string(),
             "experimental.stage_mode_enabled" => self.experimental.stage_mode_enabled = value.parse()?,
+            "experimental.stage_backend" => self.experimental.stage_backend = value.to_string(),
             _ => anyhow::bail!("Unknown config key: {key}"),
         }
         Ok(())
