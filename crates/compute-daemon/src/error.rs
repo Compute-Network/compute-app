@@ -44,7 +44,7 @@ pub enum ComputeError {
     #[error("Invalid Solana address format: {0}")]
     InvalidWalletAddress(String),
 
-    #[error("No wallet address configured. Set with `compute wallet set <address>`")]
+    #[error("No wallet address configured. Connect one with `compute wallet login`")]
     NoWalletConfigured,
 
     // Container errors

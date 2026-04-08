@@ -3,7 +3,7 @@ use tracing::warn;
 
 use compute_daemon::config::Config;
 use compute_daemon::hardware;
-use compute_network::supabase::{NodeRow, SupabaseClient};
+use compute_network::client::{NodeRegistration as OrchestratorNodeRegistration, OrchestratorClient};
 
 use super::dashboard::Dashboard;
 use super::onboarding::{OnboardingResult, OnboardingScreen};
@@ -49,16 +49,19 @@ fn run_inner(
     config: &mut Config,
 ) -> Result<()> {
     // Check if wallet is configured — if not, show onboarding
-    if config.wallet.public_address.is_empty() {
+    if config.wallet.public_address.is_empty() || config.wallet.node_token.is_empty() {
         let mut onboarding = OnboardingScreen::new();
         match onboarding.run(terminal)? {
             OnboardingResult::WalletSet(address) => {
-                config.wallet.public_address = address;
-                compute_daemon::config::ensure_dirs()?;
-                config.save()?;
+                if let Ok(updated) = Config::load() {
+                    *config = updated;
+                } else {
+                    config.wallet.public_address = address;
+                }
 
-                // Register with Supabase in background
-                register_node_async(config, &hw);
+                if !config.wallet.node_token.is_empty() {
+                    register_node_async(config, &hw);
+                }
             }
             OnboardingResult::Skipped => {
                 // Continue without wallet — user can set it later
@@ -113,16 +116,17 @@ fn kill_llama_server() {
         .status();
 }
 
-/// Register the node with Supabase. Fires and forgets — non-blocking.
-fn register_node_async(config: &Config, hw: &hardware::HardwareInfo) {
-    let wallet = config.wallet.public_address.clone();
-    let node_name = config.node.name.clone();
-    let region = config.network.region.clone();
-    let version = env!("CARGO_PKG_VERSION").to_string();
+pub async fn register_node_orchestrator(
+    config: &Config,
+    hw: &hardware::HardwareInfo,
+) -> Result<Option<String>> {
+    if config.wallet.public_address.is_empty() || config.wallet.node_token.is_empty() {
+        return Ok(None);
+    }
 
     let gpu = hw.gpus.first();
     let gpu_model = gpu.map(|g| g.name.clone());
-    let gpu_vram_mb = gpu.map(|g| g.vram_mb as i64);
+    let gpu_vram_mb = gpu.map(|g| g.vram_mb as u64);
     let gpu_backend = gpu.map(|g| match g.backend {
         hardware::GpuBackend::Cuda => "cuda".to_string(),
         hardware::GpuBackend::Metal => "metal".to_string(),
@@ -130,44 +134,54 @@ fn register_node_async(config: &Config, hw: &hardware::HardwareInfo) {
     });
     let tflops = gpu.map(|g| compute_daemon::benchmark::estimate_tflops(&g.name, g.vram_mb));
     let cpu_model = Some(hw.cpu.brand.clone());
-    let cpu_cores = Some(hw.cpu.cores as i32);
-    let memory_mb = Some((hw.memory.total_gb * 1024.0) as i64);
+    let cpu_cores = Some(hw.cpu.cores);
+    let memory_mb = Some((hw.memory.total_gb * 1024.0) as u64);
     let os_str = Some(format!("{} {}", hw.os.name, hw.os.version));
+
+    let mut client =
+        OrchestratorClient::new(&config.network.orchestrator_url, Some(config.wallet.node_token.clone()));
+    let node = OrchestratorNodeRegistration {
+        wallet_address: config.wallet.public_address.clone(),
+        node_name: Some(config.node.name.clone()),
+        gpu_model,
+        gpu_vram_mb,
+        gpu_backend,
+        cpu_model,
+        cpu_cores,
+        memory_mb,
+        os: os_str,
+        app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        region: Some(config.network.region.clone()),
+        tflops_fp16: tflops,
+        listen_port: Some(9090),
+    };
+
+    let node_id = client.register(&node).await?;
+    Ok(Some(node_id))
+}
+
+/// Register the node with the orchestrator. Fires and forgets — non-blocking.
+fn register_node_async(config: &Config, hw: &hardware::HardwareInfo) {
+    let config = config.clone();
+    let hw = hw.clone();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
 
         if let Ok(rt) = rt {
             rt.block_on(async {
-                let client = SupabaseClient::new();
-                let node = NodeRow {
-                    id: None,
-                    wallet_address: wallet,
-                    node_name: Some(node_name),
-                    status: Some("online".into()),
-                    gpu_model,
-                    gpu_vram_mb,
-                    gpu_backend,
-                    cpu_model,
-                    cpu_cores,
-                    memory_mb,
-                    os: os_str,
-                    app_version: Some(version),
-                    region: Some(region),
-                    tflops_fp16: tflops,
-                };
-
-                match client.register_node(&node).await {
-                    Ok(id) => {
-                        tracing::info!("Node registered with Supabase: {id}");
+                match register_node_orchestrator(&config, &hw).await {
+                    Ok(Some(id)) => {
+                        tracing::info!("Node registered with orchestrator: {id}");
                         // Save node_id to config
                         if let Ok(mut cfg) = Config::load() {
                             cfg.wallet.node_id = id;
                             let _ = cfg.save();
                         }
                     }
+                    Ok(None) => {}
                     Err(e) => {
-                        warn!("Failed to register node with Supabase: {e}");
+                        warn!("Failed to register node with orchestrator: {e}");
                     }
                 }
             });

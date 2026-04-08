@@ -2,16 +2,48 @@ mod cli;
 mod tui;
 
 use anyhow::Result;
+use base64::Engine;
 use clap::Parser;
+use serde::Deserialize;
+use std::io::IsTerminal;
 use std::io::Seek;
+use std::sync::Arc;
 
 use cli::{Cli, Commands, ConfigAction, ServiceAction, WalletAction};
 use compute_daemon::config::{self, Config};
 use compute_daemon::daemon;
 use compute_daemon::hardware;
-use compute_network::supabase::SupabaseClient;
+use compute_network::client::OrchestratorClient;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const API_BASE: &str = "https://api.computenetwork.sh";
+
+#[derive(Debug, Deserialize)]
+struct DeviceStartResult {
+    device_code: String,
+    auth_url: String,
+    expires_in: u64,
+    poll_interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DevicePollResult {
+    status: String,
+    node_token: Option<String>,
+    wallet_address: Option<String>,
+}
+
+#[derive(Debug)]
+struct WalletLoginResult {
+    wallet_address: String,
+    node_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeTokenClaims {
+    #[serde(rename = "walletAddress")]
+    wallet_address: Option<String>,
+}
 
 fn main() -> Result<()> {
     // Ensure terminal is restored on panic (raw mode + alternate screen)
@@ -37,7 +69,7 @@ fn main() -> Result<()> {
         Some(Commands::Config { action }) => cmd_config(action)?,
         Some(Commands::Wallet { action }) => cmd_wallet(action)?,
         Some(Commands::Earnings) => cmd_earnings()?,
-        Some(Commands::Benchmark) => cmd_benchmark()?,
+        Some(Commands::Benchmark { llama, model, api_key }) => cmd_benchmark(llama, model, api_key)?,
         Some(Commands::Hardware) => cmd_hardware()?,
         Some(Commands::Pipeline) => cmd_pipeline()?,
         Some(Commands::Nodes { all, limit }) => cmd_nodes(all, limit)?,
@@ -60,9 +92,9 @@ fn cmd_start() -> Result<()> {
         return Ok(());
     }
 
-    // Check if wallet is configured — prompt if not
+    // Check if wallet auth is configured — prompt if not
     let mut config_check = Config::load()?;
-    if config_check.wallet.public_address.is_empty() {
+    if config_check.wallet.public_address.is_empty() || config_check.wallet.node_token.is_empty() {
         let mut terminal = ratatui::init();
         let mut onboarding = tui::onboarding::OnboardingScreen::new();
         let result = onboarding.run(&mut terminal);
@@ -71,6 +103,8 @@ fn cmd_start() -> Result<()> {
         match result? {
             tui::onboarding::OnboardingResult::WalletSet(address) => {
                 config_check.wallet.public_address = address;
+                // Onboarding persists the token directly when it completes successfully.
+                config_check = Config::load()?;
                 config::ensure_dirs()?;
                 config_check.save()?;
             }
@@ -79,8 +113,10 @@ fn cmd_start() -> Result<()> {
         }
     }
 
-    // Show splash screen
-    tui::app::run_splash_only()?;
+    // Show splash screen only in an interactive terminal.
+    if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
+        tui::app::run_splash_only()?;
+    }
 
     // Set up logging and dirs
     config::ensure_dirs()?;
@@ -97,9 +133,9 @@ fn cmd_start() -> Result<()> {
     // Run the daemon event loop
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        // Register with Supabase on startup
-        if !config.wallet.public_address.is_empty() {
-            register_node_supabase(&config).await;
+        // Register with orchestrator on startup
+        if !config.wallet.public_address.is_empty() && !config.wallet.node_token.is_empty() {
+            register_node_orchestrator(&config).await;
         }
 
         if let Err(e) = runtime.run().await {
@@ -111,40 +147,12 @@ fn cmd_start() -> Result<()> {
     Ok(())
 }
 
-async fn register_node_supabase(config: &Config) {
-    use compute_network::supabase::{NodeRow, SupabaseClient};
-
+async fn register_node_orchestrator(config: &Config) {
     let hw = hardware::detect();
-    let gpu = hw.gpus.first();
-
-    let tflops = gpu.map(|g| compute_daemon::benchmark::estimate_tflops(&g.name, g.vram_mb));
-
-    let node = NodeRow {
-        id: None,
-        wallet_address: config.wallet.public_address.clone(),
-        node_name: Some(config.node.name.clone()),
-        status: Some("online".into()),
-        gpu_model: gpu.map(|g| g.name.clone()),
-        gpu_vram_mb: gpu.map(|g| g.vram_mb as i64),
-        gpu_backend: gpu.map(|g| match g.backend {
-            hardware::GpuBackend::Cuda => "cuda".to_string(),
-            hardware::GpuBackend::Metal => "metal".to_string(),
-            hardware::GpuBackend::Cpu => "cpu".to_string(),
-        }),
-        cpu_model: Some(hw.cpu.brand.clone()),
-        cpu_cores: Some(hw.cpu.cores as i32),
-        memory_mb: Some((hw.memory.total_gb * 1024.0) as i64),
-        os: Some(format!("{} {}", hw.os.name, hw.os.version)),
-        app_version: Some(VERSION.to_string()),
-        region: Some(config.network.region.clone()),
-        tflops_fp16: tflops,
-    };
-
-    let client = SupabaseClient::new();
-    match client.register_node(&node).await {
+    match tui::app::register_node_orchestrator(config, &hw).await {
         Ok(id) => {
+            let Some(id) = id else { return; };
             println!("  Registered with network (node: {id})");
-            // Persist node_id to config
             let mut updated_config = config.clone();
             updated_config.wallet.node_id = id;
             if let Err(e) = updated_config.save() {
@@ -153,6 +161,80 @@ async fn register_node_supabase(config: &Config) {
         }
         Err(e) => eprintln!("  Warning: Could not register with network: {e}"),
     }
+}
+
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+fn wallet_login_flow() -> Result<WalletLoginResult> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let start = client
+        .post(format!("{API_BASE}/v1/auth/device/start"))
+        .json(&serde_json::json!({ "purpose": "node_session" }))
+        .send()?
+        .error_for_status()?
+        .json::<DeviceStartResult>()?;
+
+    println!("  Opening browser to connect your wallet...");
+    println!("  If the browser doesn't open, visit:");
+    println!("    {}", start.auth_url);
+    open_url(&start.auth_url);
+
+    let started_at = std::time::Instant::now();
+    loop {
+        if started_at.elapsed().as_secs() >= start.expires_in {
+            anyhow::bail!("Wallet login expired. Run the command again.");
+        }
+
+        let res = client.get(format!("{API_BASE}/v1/auth/device/poll/{}", start.device_code)).send()?;
+        if res.status() == reqwest::StatusCode::ACCEPTED {
+            std::thread::sleep(std::time::Duration::from_secs(start.poll_interval.max(1)));
+            continue;
+        }
+        if res.status() == reqwest::StatusCode::GONE || res.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("Wallet login expired. Run the command again.");
+        }
+
+        let body = res.error_for_status()?.json::<DevicePollResult>()?;
+        if body.status == "complete" {
+            let node_token = body
+                .node_token
+                .ok_or_else(|| anyhow::anyhow!("Missing node_token in auth result"))?;
+            let wallet_address = body
+                .wallet_address
+                .or_else(|| wallet_address_from_node_token(&node_token))
+                .ok_or_else(|| anyhow::anyhow!("Missing wallet address in auth response"))?;
+            return Ok(WalletLoginResult { wallet_address, node_token });
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(start.poll_interval.max(1)));
+    }
+}
+
+fn wallet_address_from_node_token(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let claims = decode_jwt_payload::<NodeTokenClaims>(payload)?;
+    claims.wallet_address
+}
+
+fn decode_jwt_payload<T: serde::de::DeserializeOwned>(payload: &str) -> Option<T> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 fn cmd_stop() -> Result<()> {
@@ -285,8 +367,8 @@ fn cmd_init() -> Result<()> {
     // Create or load config
     let mut config = Config::default();
 
-    // Ask for wallet address
-    println!("  Enter your Solana wallet address (or press Enter to skip):");
+    println!("  Connect your Solana wallet in the browser to enable node rewards.");
+    println!("  Press Enter to continue, or type 'skip' to configure it later.");
     print!("  > ");
     use std::io::Write;
     std::io::stdout().flush()?;
@@ -295,17 +377,20 @@ fn cmd_init() -> Result<()> {
     std::io::stdin().read_line(&mut wallet_input)?;
     let wallet_input = wallet_input.trim();
 
-    if !wallet_input.is_empty() {
-        if compute_solana::is_valid_address(wallet_input) {
-            config.wallet.public_address = wallet_input.to_string();
-            println!("  ✓ Wallet address set");
-        } else {
-            println!(
-                "  ⚠ Invalid address format — you can set it later with `compute wallet set <address>`"
-            );
+    if !wallet_input.eq_ignore_ascii_case("skip") {
+        match wallet_login_flow() {
+            Ok(login) => {
+                config.wallet.public_address = login.wallet_address;
+                config.wallet.node_token = login.node_token;
+                println!("  ✓ Wallet connected");
+            }
+            Err(e) => {
+                println!("  ⚠ Wallet login failed: {e}");
+                println!("  You can retry later with `compute wallet login`");
+            }
         }
     } else {
-        println!("  Skipped — set later with `compute wallet set <address>`");
+        println!("  Skipped — authenticate later with `compute wallet login`");
     }
 
     // Ask for node name
@@ -330,12 +415,12 @@ fn cmd_init() -> Result<()> {
     println!();
     println!("  ✓ Config saved to {}", config_path.display());
 
-    // Register with Supabase if wallet was set
-    if !config.wallet.public_address.is_empty() {
+    // Register with orchestrator if wallet auth was completed
+    if !config.wallet.public_address.is_empty() && !config.wallet.node_token.is_empty() {
         print!("  Registering with network... ");
         std::io::Write::flush(&mut std::io::stdout())?;
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(register_node_supabase(&config));
+        rt.block_on(register_node_orchestrator(&config));
     }
 
     println!();
@@ -352,13 +437,21 @@ fn cmd_init() -> Result<()> {
 fn cmd_config(action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Show => {
-            let config = Config::load()?;
+            let mut config = Config::load()?;
+            if !config.wallet.node_token.is_empty() {
+                config.wallet.node_token = "[REDACTED]".into();
+            }
             let toml_str = toml::to_string_pretty(&config)?;
             println!("{toml_str}");
         }
         ConfigAction::Get { key } => {
             let config = Config::load()?;
-            match config.get(&key) {
+            let value = if key == "wallet.node_token" && !config.wallet.node_token.is_empty() {
+                Some("[REDACTED]".to_string())
+            } else {
+                config.get(&key)
+            };
+            match value {
                 Some(value) => println!("{value}"),
                 None => println!("Unknown key: {key}"),
             }
@@ -377,27 +470,35 @@ fn cmd_wallet(action: Option<WalletAction>) -> Result<()> {
     let config = Config::load()?;
 
     match action {
-        Some(WalletAction::Set { address }) => {
-            if !compute_solana::is_valid_address(&address) {
-                println!("Invalid Solana address format");
-                return Ok(());
-            }
+        Some(WalletAction::Login) => {
+            let login = wallet_login_flow()?;
             let mut config = config;
-            config.wallet.public_address = address.clone();
+            config.wallet.public_address = login.wallet_address.clone();
+            config.wallet.node_token = login.node_token;
             config.save()?;
-            println!("Wallet address set to: {address}");
+            println!("Wallet connected: {}", login.wallet_address);
 
-            // Register/update with Supabase
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(register_node_supabase(&config));
+            rt.block_on(register_node_orchestrator(&config));
+        }
+        Some(WalletAction::Set { address }) => {
+            println!("`compute wallet set` is no longer supported.");
+            if !address.is_empty() {
+                println!("Provided address: {address}");
+            }
+            println!("Use `compute wallet login` to connect and authenticate this node.");
         }
         None => {
             if config.wallet.public_address.is_empty() {
                 println!("No wallet address configured");
-                println!("Set one with: compute wallet set <address>");
+                println!("Connect one with: compute wallet login");
             } else {
                 println!("Address: {}", config.wallet.public_address);
-                println!("(Balance checking not yet implemented)");
+                if config.wallet.node_token.is_empty() {
+                    println!("Auth:    missing node session (run `compute wallet login`)");
+                } else {
+                    println!("Auth:    connected");
+                }
             }
         }
     }
@@ -421,7 +522,7 @@ fn cmd_earnings() -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     let earnings = rt.block_on(async {
-        let client = SupabaseClient::new();
+        let client = OrchestratorClient::new(&config.network.orchestrator_url, None);
         client.get_earnings(wallet).await
     });
 
@@ -443,7 +544,7 @@ fn cmd_earnings() -> Result<()> {
     Ok(())
 }
 
-fn cmd_benchmark() -> Result<()> {
+fn cmd_benchmark(run_llama: bool, model: Option<String>, api_key: Option<String>) -> Result<()> {
     use compute_daemon::benchmark;
 
     println!("\n  COMPUTE BENCHMARK\n");
@@ -515,6 +616,120 @@ fn cmd_benchmark() -> Result<()> {
         None => println!("unavailable"),
     }
 
+    if run_llama {
+        let model_name = model.unwrap_or_else(|| "gemma-4-e4b-q4".to_string());
+        println!();
+        println!("  LLAMA SWEEP");
+        println!("  ────────────────────────────────");
+        println!("  Model: {model_name}");
+
+        let results = rt.block_on(benchmark::run_llama_benchmark_sweep(&model_name));
+        match results {
+            Ok(results) => {
+                println!(
+                    "  {:<14} {:<8} {:<9} {:<10} {:<8} {:<9} {:<10}",
+                    "CASE", "CTX", "BATCH", "UBATCH", "THREADS", "TOK/S", "TOTAL MS"
+                );
+                println!("  {}", "─".repeat(80));
+
+                for result in &results {
+                    if result.success {
+                        println!(
+                            "  {:<14} {:<8} {:<9} {:<10} {:<8} {:<9} {:<10}",
+                            result.case.name,
+                            result.case.ctx_size,
+                            result.case.batch_size,
+                            result.case.ubatch_size,
+                            result.case.threads,
+                            result
+                                .predicted_per_second
+                                .map(|v| format!("{v:.1}"))
+                                .unwrap_or_else(|| "-".into()),
+                            result
+                                .total_ms
+                                .map(|v| format!("{v:.0}"))
+                                .unwrap_or_else(|| "-".into()),
+                        );
+                    } else {
+                        println!(
+                            "  {:<14} {:<8} {:<9} {:<10} {:<8} {:<9} {:<10}",
+                            result.case.name,
+                            result.case.ctx_size,
+                            result.case.batch_size,
+                            result.case.ubatch_size,
+                            result.case.threads,
+                            "ERR",
+                            "-"
+                        );
+                        if let Some(error) = &result.error {
+                            println!("    {error}");
+                        }
+                    }
+                }
+
+                if let Some((best_case, best_tps)) = results
+                    .iter()
+                    .filter_map(|r| r.predicted_per_second.map(|tps| (&r.case.name, tps)))
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    println!();
+                    println!("  Best case: {best_case} at {best_tps:.1} tok/s");
+                }
+            }
+            Err(e) => println!("  Llama sweep unavailable: {e}"),
+        }
+
+        println!();
+        println!("  PATH COMPARISON");
+        println!("  ────────────────────────────────");
+
+        let direct_temp = rt.block_on(benchmark::run_direct_temp_path_case(&model_name));
+        if compute_daemon::daemon::is_running() {
+            println!("  Path comparison unavailable: stop the running daemon first for an isolated comparison.");
+        } else {
+            match start_managed_benchmark_daemon()? {
+                Some((daemon_runtime, daemon_thread)) => {
+                    wait_for_local_llama_ready(8090, 90)?;
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+
+                    let daemon_local = rt.block_on(benchmark::run_daemon_local_path_case());
+                    let orchestrator =
+                        rt.block_on(benchmark::run_orchestrator_path_case(&model_name, api_key.as_deref()));
+
+                    daemon_runtime.shutdown();
+                    let _ = daemon_thread.join();
+
+                    println!(
+                        "  {:<14} {:<10} {:<10} {:<14} {:<10}",
+                        "PATH", "TOK/S", "TTFT MS", "TOKENS", "TOTAL MS"
+                    );
+                    println!("  {}", "─".repeat(56));
+
+                    match direct_temp {
+                        Ok(result) => print_path_result(&result),
+                        Err(e) => println!("  {:<14} ERR\n    {}", "direct-temp", e),
+                    }
+                    print_path_result(&daemon_local);
+                    print_path_result(&orchestrator);
+                }
+                None => {
+                    println!("  Path comparison unavailable: wallet/node auth is not configured for this machine.");
+                    match direct_temp {
+                        Ok(result) => {
+                            println!(
+                                "  {:<14} {:<10} {:<10} {:<14} {:<10}",
+                                "PATH", "TOK/S", "TTFT MS", "TOKENS", "TOTAL MS"
+                            );
+                            println!("  {}", "─".repeat(56));
+                            print_path_result(&result);
+                        }
+                        Err(e) => println!("  {:<14} ERR\n    {}", "direct-temp", e),
+                    }
+                }
+            }
+        }
+    }
+
     println!();
     println!("  PIPELINE ELIGIBILITY");
     println!("  ────────────────────────────────");
@@ -542,6 +757,110 @@ fn cmd_benchmark() -> Result<()> {
     Ok(())
 }
 
+fn print_path_result(result: &compute_daemon::benchmark::PathBenchmarkResult) {
+    if result.success {
+        println!(
+            "  {:<14} {:<10} {:<10} {:<14} {:<10}",
+            result.name,
+            result
+                .effective_tok_per_sec
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "-".into()),
+            result
+                .first_token_ms
+                .map(|v| format!("{v:.0}"))
+                .unwrap_or_else(|| "-".into()),
+            result
+                .completion_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            result
+                .total_ms
+                .map(|v| format!("{v:.0}"))
+                .unwrap_or_else(|| "-".into()),
+        );
+        if let Some(profile) = &result.profile
+            && !profile.is_empty()
+        {
+            let important_keys = [
+                "parse_ms",
+                "resolve_auto_ms",
+                "model_lookup_ms",
+                "billing_preflight_ms",
+                "pipeline_select_ms",
+                "node_ready_wait_ms",
+                "relay_queue_wait_ms",
+                "first_chunk_ms",
+                "ttft_ms",
+                "relay_roundtrip_ms",
+                "inference_transport_ms",
+                "inference_ms",
+                "response_normalize_ms",
+                "postprocess_dispatch_ms",
+                "total_ms",
+            ];
+
+            let mut rendered: Vec<String> = Vec::new();
+            for key in important_keys {
+                if let Some(value) = profile.get(key) {
+                    rendered.push(format!("{key}={value:.1}"));
+                }
+            }
+
+            if !rendered.is_empty() {
+                println!("    {}", rendered.join("  "));
+            }
+        }
+    } else {
+        println!("  {:<14} ERR", result.name);
+        if let Some(error) = &result.error {
+            println!("    {error}");
+        }
+    }
+}
+
+fn start_managed_benchmark_daemon(
+) -> Result<Option<(Arc<compute_daemon::runtime::DaemonRuntime>, std::thread::JoinHandle<()>)>> {
+    let config = Config::load()?;
+    if config.wallet.public_address.is_empty() || config.wallet.node_token.is_empty() {
+        return Ok(None);
+    }
+
+    let reg_rt = tokio::runtime::Runtime::new()?;
+    reg_rt.block_on(register_node_orchestrator(&config));
+
+    let runtime = Arc::new(compute_daemon::runtime::DaemonRuntime::new(config));
+    let runtime_for_thread = Arc::clone(&runtime);
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
+        rt.block_on(async {
+            if let Err(e) = runtime_for_thread.run().await {
+                eprintln!("benchmark daemon error: {e}");
+            }
+        });
+    });
+
+    Ok(Some((runtime, handle)))
+}
+
+fn wait_for_local_llama_ready(port: u16, timeout_secs: u64) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    let start = std::time::Instant::now();
+
+    while start.elapsed().as_secs() < timeout_secs {
+        if let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/health")).send()
+            && resp.status().is_success()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    anyhow::bail!("managed benchmark daemon did not bring llama-server up within {timeout_secs}s")
+}
+
 fn cmd_hardware() -> Result<()> {
     let hw = hardware::detect();
     let json = serde_json::to_string_pretty(&hw)?;
@@ -565,8 +884,8 @@ fn cmd_pipeline() -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     let node = rt.block_on(async {
-        let client = SupabaseClient::new();
-        client.get_own_node(wallet).await
+        let client = OrchestratorClient::new(&config.network.orchestrator_url, None);
+        client.get_node_by_wallet(wallet).await
     });
 
     match node {
@@ -604,7 +923,7 @@ fn cmd_nodes(all: bool, limit: usize) -> Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     let nodes = rt.block_on(async {
-        let client = SupabaseClient::new();
+        let client = OrchestratorClient::new(API_BASE, None);
         client.list_nodes(!all, limit).await
     });
 
@@ -978,15 +1297,15 @@ fn cmd_doctor() -> Result<()> {
     println!("  ────────────────────────────────");
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (supabase_ok, node_count) = rt.block_on(async {
-        let client = SupabaseClient::new();
+    let (orchestrator_ok, node_count) = rt.block_on(async {
+        let client = OrchestratorClient::new(&config.network.orchestrator_url, None);
         let healthy = client.health_check().await;
         let stats = if healthy { client.get_network_stats().await.ok() } else { None };
         (healthy, stats.map(|s| s.total_nodes).unwrap_or(0))
     });
 
-    print_check("Supabase API reachable", supabase_ok);
-    if supabase_ok {
+    print_check("Orchestrator API reachable", orchestrator_ok);
+    if orchestrator_ok {
         println!("    {node_count} nodes in network");
     }
     println!();
@@ -997,7 +1316,7 @@ fn cmd_doctor() -> Result<()> {
         tips.push("Run `compute init` to create your config file");
     }
     if !wallet_ok {
-        tips.push("Run `compute init` or `compute wallet set <address>` to set your wallet");
+        tips.push("Run `compute init` or `compute wallet login` to connect your wallet");
     }
     if !node_id_ok && wallet_ok {
         tips.push("Run `compute start` to register with the network");

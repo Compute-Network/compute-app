@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -55,6 +56,13 @@ fn model_entries() -> Vec<ModelEntry> {
             gguf_filename: "gemma-4-E4B-it-Q4_K_M.gguf",
             hf_url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
         },
+        ModelEntry {
+            id: "qwen3.5-27b-q4",
+            label: "Qwen3.5 — 17GB (coding)",
+            desc: "SWE-bench 72.4% · 27B dense, 256K ctx",
+            gguf_filename: "Qwen3.5-27B-UD-Q4_K_XL.gguf",
+            hf_url: "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-UD-Q4_K_XL.gguf",
+        },
     ]
 }
 
@@ -106,11 +114,6 @@ struct ConfigItem {
 }
 
 const CONFIG_ITEMS: &[ConfigItem] = &[
-    ConfigItem {
-        label: "Wallet Address",
-        key: "wallet.public_address",
-        kind: ConfigItemKind::Text,
-    },
     ConfigItem { label: "Node Name", key: "node.name", kind: ConfigItemKind::Text },
     ConfigItem { label: "Usage Priority", key: "node.max_gpu_usage", kind: ConfigItemKind::Choice },
     ConfigItem {
@@ -137,7 +140,7 @@ pub struct Dashboard {
     earnings: Earnings,
     pipeline: PipelineStatus,
     network: NetworkStats,
-    throughput_history: Vec<u64>,
+    throughput_history: VecDeque<u64>,
     smoothed_tps: f64,
     last_throughput_push: Instant,
     sys: sysinfo::System,
@@ -172,7 +175,7 @@ impl Dashboard {
     pub fn new(hardware: HardwareInfo) -> Self {
         let mut globe = Globe::new();
 
-        // Fetch real nodes from Supabase for globe visualization
+        // Fetch real nodes from the orchestrator for globe visualization
         let config = compute_daemon::config::Config::load().unwrap_or_default();
         let (network, node_regions) = fetch_network_and_nodes();
         if !node_regions.is_empty() {
@@ -191,7 +194,7 @@ impl Dashboard {
             earnings: Earnings::default(),
             pipeline: PipelineStatus::default(),
             network,
-            throughput_history: vec![0; 60],
+            throughput_history: VecDeque::from(vec![0; 60]),
             smoothed_tps: 0.0,
             last_throughput_push: Instant::now(),
             sys: sysinfo::System::new_all(),
@@ -292,7 +295,8 @@ impl Dashboard {
                         }
                     }
                     KeyCode::Down if self.active_tab == Tab::Models => {
-                        if self.models_selected < 2 { // 3 items: auto, gemma-4, gemini-3.1
+                        let max = model_entries().len().saturating_sub(1);
+                        if self.models_selected < max {
                             self.models_selected += 1;
                         }
                     }
@@ -357,11 +361,12 @@ impl Dashboard {
             }
 
             // Push every 200ms (60 entries = 12 seconds visible)
+            // O(1) VecDeque operations instead of O(n) Vec::remove(0)
             if self.last_throughput_push.elapsed() >= Duration::from_millis(200) {
                 if self.throughput_history.len() >= 60 {
-                    self.throughput_history.remove(0);
+                    self.throughput_history.pop_front();
                 }
-                self.throughput_history.push(self.smoothed_tps as u64);
+                self.throughput_history.push_back(self.smoothed_tps as u64);
                 self.last_throughput_push = Instant::now();
             }
 
@@ -376,9 +381,9 @@ impl Dashboard {
             // Push one value every 500ms
             if self.last_throughput_push.elapsed() >= Duration::from_millis(500) {
                 if self.throughput_history.len() >= 60 {
-                    self.throughput_history.remove(0);
+                    self.throughput_history.pop_front();
                 }
-                self.throughput_history.push(0);
+                self.throughput_history.push_back(0);
                 self.last_throughput_push = Instant::now();
             }
         }
@@ -389,7 +394,7 @@ impl Dashboard {
             self.last_log_update = Instant::now();
         }
 
-        // Refresh network stats and nodes from Supabase every 60 seconds
+        // Refresh network stats and nodes from the orchestrator every 60 seconds
         if self.last_network_update.elapsed() > Duration::from_secs(60) {
             let (network, node_regions) = fetch_network_and_nodes();
             self.network = network;
@@ -519,7 +524,7 @@ impl Dashboard {
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let w = area.width as usize;
         let (status_color, status_text) =
-            if self.pipeline.active && self.pipeline.tokens_per_sec > 0.0 {
+            if self.pipeline.active && (self.pipeline.active_requests > 0 || self.pipeline.tokens_per_sec > 0.0) {
                 (Color::Green, "ACTIVE")
             } else if self.pipeline.active {
                 (Color::Green, "ONLINE")
@@ -747,6 +752,11 @@ impl Dashboard {
                     format!("{} requests", format_number(p.requests_served as u32)),
                     Style::default().fg(Color::White),
                 ),
+                Span::styled("    Active  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", p.active_requests),
+                    Style::default().fg(if p.active_requests > 0 { Color::Green } else { Color::White }),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("  Latency   ", Style::default().fg(Color::DarkGray)),
@@ -805,7 +815,7 @@ impl Dashboard {
         frame.render_widget(sparkline, sparkline_area);
 
         // Show actual value (0 when idle, not 1)
-        let current_tps = self.throughput_history.last().unwrap_or(&0);
+        let current_tps = self.throughput_history.back().unwrap_or(&0);
         let tps_label = Paragraph::new(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -959,17 +969,17 @@ impl Dashboard {
         self.draw_shortcuts(frame, chunks[2]);
     }
 
-    fn get_config_value(&self, key: &str) -> String {
-        let config = compute_daemon::config::Config::load().unwrap_or_default();
+    /// Get a config value for display. Caller should cache the Config if calling multiple times.
+    fn get_config_value_from(config: &compute_daemon::config::Config, key: &str) -> String {
         match key {
             "wallet.public_address" => {
                 if config.wallet.public_address.is_empty() {
                     "(not set)".into()
                 } else {
-                    config.wallet.public_address
+                    config.wallet.public_address.clone()
                 }
             }
-            "node.name" => config.node.name,
+            "node.name" => config.node.name.clone(),
             "node.max_gpu_usage" => match config.node.max_gpu_usage {
                 0..=40 => "Low".into(),
                 41..=70 => "Medium".into(),
@@ -984,8 +994,8 @@ impl Dashboard {
             "service.autostart" => {
                 if compute_daemon::service::is_service_installed() { "On" } else { "Off" }.into()
             }
-            "network.region" => config.network.region,
-            "logging.level" => config.logging.level,
+            "network.region" => config.network.region.clone(),
+            "logging.level" => config.logging.level.clone(),
             _ => "?".into(),
         }
     }
@@ -1046,7 +1056,8 @@ impl Dashboard {
             }
             ConfigItemKind::Text => {
                 self.config_editing = true;
-                let current = self.get_config_value(item.key);
+                let config = compute_daemon::config::Config::load().unwrap_or_default();
+                let current = Self::get_config_value_from(&config, item.key);
                 self.config_edit_buffer =
                     if current == "(not set)" { String::new() } else { current };
             }
@@ -1098,46 +1109,9 @@ impl Dashboard {
     fn apply_wallet_change(&self, new_wallet: &str) {
         let mut config = compute_daemon::config::Config::load().unwrap_or_default();
         config.wallet.public_address = new_wallet.to_string();
-        config.wallet.node_id.clear(); // Reset node_id, will re-register
+        config.wallet.node_id.clear();
+        config.wallet.node_token.clear();
         let _ = config.save();
-
-        // Register with Supabase in background
-        if !new_wallet.is_empty() {
-            let wallet = new_wallet.to_string();
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
-                if let Ok(rt) = rt {
-                    rt.block_on(async {
-                        let client = compute_network::supabase::SupabaseClient::new();
-                        let node = compute_network::supabase::NodeRow {
-                            id: None,
-                            wallet_address: wallet,
-                            node_name: None,
-                            status: Some("online".into()),
-                            gpu_model: None,
-                            gpu_vram_mb: None,
-                            gpu_backend: None,
-                            cpu_model: None,
-                            cpu_cores: None,
-                            memory_mb: None,
-                            os: None,
-                            app_version: Some(env!("CARGO_PKG_VERSION").into()),
-                            region: None,
-                            tflops_fp16: None,
-                        };
-                        match client.register_node(&node).await {
-                            Ok(id) => {
-                                if let Ok(mut cfg) = compute_daemon::config::Config::load() {
-                                    cfg.wallet.node_id = id;
-                                    let _ = cfg.save();
-                                }
-                            }
-                            Err(e) => tracing::warn!("Re-registration failed: {e}"),
-                        }
-                    });
-                }
-            });
-        }
     }
 
     fn draw_config_panel(&self, frame: &mut Frame, area: Rect) {
@@ -1181,12 +1155,15 @@ impl Dashboard {
             return;
         }
 
+        // Load config once for all items (not once per item — was doing 7 disk reads per frame!)
+        let cached_config = compute_daemon::config::Config::load().unwrap_or_default();
+
         for (i, item) in CONFIG_ITEMS.iter().enumerate() {
             let is_selected = i == self.config_selected;
             let value = if self.config_editing && is_selected {
                 format!("{}█", self.config_edit_buffer)
             } else {
-                self.get_config_value(item.key)
+                Self::get_config_value_from(&cached_config, item.key)
             };
 
             let arrow = if is_selected { "▸ " } else { "  " };
@@ -1273,6 +1250,7 @@ impl Dashboard {
 
             let client = match reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(7200))
+                .connect_timeout(std::time::Duration::from_secs(30))
                 .build()
             {
                 Ok(c) => c,
@@ -1282,52 +1260,148 @@ impl Dashboard {
                 }
             };
 
-            let resp = match client.get(&url).send() {
-                Ok(r) if r.status().is_success() => r,
-                _ => {
-                    let _ = tx.send((model_id, -1.0));
-                    return;
+            // Resume support: check if a partial .tmp file exists
+            let mut downloaded: u64 = std::fs::metadata(&tmp)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            // Retry loop: on network interruption (sleep/wake), retry up to 10 times
+            let max_retries = 10;
+            let mut total: u64 = 0;
+
+            for attempt in 0..=max_retries {
+                // Build request with Range header for resume
+                let mut req = client.get(&url);
+                if downloaded > 0 {
+                    req = req.header("Range", format!("bytes={downloaded}-"));
+                    tracing::info!("[download] Resuming from {:.1} MB (attempt {})", downloaded as f64 / 1048576.0, attempt + 1);
                 }
-            };
 
-            let total = resp.content_length().unwrap_or(0);
-            let mut downloaded: u64 = 0;
-
-            let mut file = match std::fs::File::create(&tmp) {
-                Ok(f) => f,
-                Err(_) => {
-                    let _ = tx.send((model_id, -1.0));
-                    return;
-                }
-            };
-
-            use std::io::{Read, Write};
-            let mut reader = std::io::BufReader::with_capacity(1024 * 1024, resp);
-            let mut buf = vec![0u8; 256 * 1024]; // 256KB chunks
-
-            loop {
-                let n = match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => break,
+                let resp = match req.send() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("[download] Request failed: {e}");
+                        if attempt < max_retries {
+                            std::thread::sleep(std::time::Duration::from_secs(2u64.pow(attempt.min(5))));
+                            continue;
+                        }
+                        let _ = tx.send((model_id, -1.0));
+                        return;
+                    }
                 };
-                let _ = file.write_all(&buf[..n]);
-                downloaded += n as u64;
 
-                // Send progress every ~1MB
-                if total > 0 && downloaded % (1024 * 1024) < n as u64 {
-                    let pct = downloaded as f64 / total as f64;
-                    let _ = tx.send((model_id.clone(), pct));
+                let status = resp.status();
+                if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                    // File is already complete or server doesn't support range
+                    // Check if tmp is actually complete by re-downloading fresh
+                    downloaded = 0;
+                    let _ = std::fs::remove_file(&tmp);
+                    continue;
+                }
+
+                if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                    if attempt < max_retries {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        continue;
+                    }
+                    let _ = tx.send((model_id, -1.0));
+                    return;
+                }
+
+                // Determine total file size
+                if status == reqwest::StatusCode::PARTIAL_CONTENT {
+                    // Parse Content-Range: bytes 12345-99999/100000
+                    if let Some(range) = resp.headers().get("content-range") {
+                        if let Ok(s) = range.to_str() {
+                            if let Some(slash) = s.rfind('/') {
+                                total = s[slash + 1..].parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                } else {
+                    total = resp.content_length().unwrap_or(0);
+                    // Fresh download (not partial) — reset
+                    downloaded = 0;
+                }
+
+                // Open file for append (resume) or create (fresh)
+                use std::io::{Read, Write};
+                let mut file = match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&tmp)
+                {
+                    Ok(f) => f,
+                    Err(_) => {
+                        let _ = tx.send((model_id, -1.0));
+                        return;
+                    }
+                };
+
+                let mut reader = std::io::BufReader::with_capacity(1024 * 1024, resp);
+                let mut buf = vec![0u8; 256 * 1024]; // 256KB chunks
+                let mut stall_count = 0u32;
+
+                loop {
+                    let n = match reader.read(&mut buf) {
+                        Ok(0) => break, // Stream finished
+                        Ok(n) => {
+                            stall_count = 0;
+                            n
+                        }
+                        Err(e) => {
+                            // Network interruption (e.g. Mac sleep) — break to retry
+                            tracing::warn!("[download] Read error: {e}");
+                            stall_count += 1;
+                            if stall_count >= 3 {
+                                break; // Will retry from outer loop
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            continue;
+                        }
+                    };
+                    let _ = file.write_all(&buf[..n]);
+                    downloaded += n as u64;
+
+                    // Send progress every ~1MB
+                    if total > 0 && downloaded % (1024 * 1024) < n as u64 {
+                        let pct = downloaded as f64 / total as f64;
+                        let _ = tx.send((model_id.clone(), pct));
+                    }
+                }
+
+                let _ = file.flush();
+                drop(file);
+
+                // Check if download is complete
+                if total > 0 && downloaded >= total {
+                    break; // Success — exit retry loop
+                }
+
+                // Incomplete — retry after backoff
+                if attempt < max_retries {
+                    tracing::info!(
+                        "[download] Incomplete ({:.1}/{:.1} MB), retrying in {}s...",
+                        downloaded as f64 / 1048576.0,
+                        total as f64 / 1048576.0,
+                        2u64.pow(attempt.min(5))
+                    );
+                    let _ = tx.send((model_id.clone(), downloaded as f64 / total.max(1) as f64));
+                    std::thread::sleep(std::time::Duration::from_secs(2u64.pow(attempt.min(5))));
+                } else {
+                    let _ = tx.send((model_id, -1.0));
+                    return;
                 }
             }
 
-            let _ = file.flush();
-            drop(file);
-
-            // Verify download size matches expected
+            // Verify download size matches expected (total is from Content-Range or Content-Length)
             if total > 0 {
                 if let Ok(meta) = std::fs::metadata(&tmp) {
                     if meta.len() != total {
+                        tracing::warn!(
+                            "[download] Size mismatch: expected {} bytes, got {}",
+                            total, meta.len()
+                        );
                         let _ = std::fs::remove_file(&tmp);
                         let _ = tx.send((model_id, -1.0));
                         return;
@@ -1554,13 +1628,16 @@ fn open_claim_page() {
     }
 }
 
-/// Fetch network stats and online nodes from Supabase.
+/// Fetch network stats and online nodes from the orchestrator.
 /// Returns (stats, list of (wallet, region) for globe).
 fn fetch_network_and_nodes() -> (NetworkStats, Vec<(String, Option<String>)>) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
     match rt {
         Ok(rt) => rt.block_on(async {
-            let client = compute_network::supabase::SupabaseClient::new();
+            let client = compute_network::client::OrchestratorClient::new(
+                "https://api.computenetwork.sh",
+                None,
+            );
 
             let stats = match client.get_network_stats().await {
                 Ok(s) => NetworkStats {

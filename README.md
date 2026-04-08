@@ -1,6 +1,6 @@
 # Compute
 
-**Decentralized GPU Infrastructure** — Aggregates idle GPU/CPU resources and daisy-chains them via pipeline parallelism to run large AI models no single machine could handle.
+**Decentralized GPU Infrastructure** — Runs local and distributed inference across contributed machines, with the current stable path focused on single-node serving through the Compute orchestrator.
 
 ## Quick Start
 
@@ -38,7 +38,7 @@ cargo build --release
 | `compute hardware` | Hardware info (JSON) |
 | `compute doctor` | Diagnose issues |
 | `compute config show` | Show configuration |
-| `compute wallet set <addr>` | Set Solana wallet |
+| `compute wallet login` | Connect wallet in browser and authorize this node |
 | `compute earnings` | View earnings |
 | `compute pipeline` | Pipeline status |
 | `compute logs -f` | Follow daemon logs |
@@ -55,9 +55,19 @@ crates/
   compute-solana/    Solana wallet validation (read-only)
 ```
 
-### Pipeline Parallelism
+### Inference Modes
 
-Compute's core architecture is **distributed pipeline parallelism** — daisy-chaining consumer GPUs across the internet to run models no single machine could handle:
+The repo contains both the stable single-node path and the experimental multi-node pipeline path.
+
+Single-node today:
+- local `llama-server` on the node
+- orchestrator scheduling and relay
+- wallet-authenticated node sessions
+
+Multi-node research/code:
+- daisy-chained consumer GPUs across the internet to run models no single machine could handle
+- QUIC/P2P transport and staged layer assignment remain in the repo, but are not the primary production path today
+- multi-node v1 is planned around stage-based pipeline parallelism; the current llama.cpp RPC path should be treated as experimental
 
 - Models are split across N nodes, each running a contiguous range of transformer layers
 - Activations flow through the pipeline: Node1 -> Node2 -> Node3

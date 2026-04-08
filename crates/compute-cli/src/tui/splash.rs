@@ -83,7 +83,7 @@ impl SplashScreen {
             .map(|g| format!("{} ({})", g.name, format_vram(g.vram_mb)))
             .unwrap_or_else(|| "No GPU detected".into());
 
-        // Fetch network stats from Supabase (non-blocking with timeout)
+        // Fetch network stats from the orchestrator (non-blocking with timeout)
         let node_count = fetch_node_count();
 
         // Check if llama-server is available
@@ -114,18 +114,18 @@ impl SplashScreen {
             });
         }
 
-        // Detect model file
-        let model_file = find_first_model();
-        let model_label = model_file
-            .as_ref()
-            .map(|p| {
-                std::path::Path::new(p)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string()
-            })
-            .unwrap_or_else(|| "no model found".into());
+        // Show the model the daemon will actually pre-warm (from config), not just the first file
+        let config = compute_daemon::config::Config::load().unwrap_or_default();
+        let model_label = if config.models.active_model != "auto" {
+            config.models.active_model.clone()
+        } else {
+            // Same logic as runtime.rs pre-warm: prefer small Gemma, then larger Gemma, then Qwen.
+            let downloaded = find_first_model()
+                .and_then(|p| std::path::Path::new(&p).file_stem()
+                    .and_then(|s| s.to_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
+            downloaded
+        };
 
         steps.push(StartupStep {
             label: format!("Loading model: {}...", model_label),
@@ -500,9 +500,12 @@ impl SplashScreen {
             let is_installing =
                 i == self.current_step && self.phase == SplashPhase::InstallingLlama;
 
+            let is_loading_model =
+                i == self.current_step && self.phase == SplashPhase::LoadingModel;
+
             let (icon, color) = if step.done {
                 ("  ✓ ".to_string(), Color::Green)
-            } else if is_installing || (i == self.current_step && self.phase == SplashPhase::StepsRunning) {
+            } else if is_installing || is_loading_model || (i == self.current_step && self.phase == SplashPhase::StepsRunning) {
                 (format!("  {spinner} "), Color::Yellow)
             } else {
                 ("    ".to_string(), Color::DarkGray)
@@ -551,13 +554,16 @@ fn format_vram(vram_mb: u64) -> String {
     if vram_mb >= 1024 { format!("{}GB", vram_mb / 1024) } else { format!("{vram_mb}MB") }
 }
 
-/// Fetch the total node count from Supabase. Returns 0 on failure.
+/// Fetch the total node count from the orchestrator. Returns 0 on failure.
 /// Uses a short timeout so the splash screen isn't delayed.
 fn fetch_node_count() -> u64 {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
     match rt {
         Ok(rt) => rt.block_on(async {
-            let client = compute_network::supabase::SupabaseClient::new();
+            let client = compute_network::client::OrchestratorClient::new(
+                "https://api.computenetwork.sh",
+                None,
+            );
             match client.get_network_stats().await {
                 Ok(stats) => stats.total_nodes,
                 Err(_) => 0,

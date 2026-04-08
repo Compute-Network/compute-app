@@ -11,6 +11,8 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub models: ModelsConfig,
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +30,8 @@ pub struct WalletConfig {
     pub public_address: String,
     #[serde(default)]
     pub node_id: String,
+    #[serde(default)]
+    pub node_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,9 +61,21 @@ pub struct ModelsConfig {
     pub active_model: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentalConfig {
+    #[serde(default)]
+    pub stage_mode_enabled: bool,
+}
+
 fn default_models_cache_dir() -> String {
     config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.compute"))
+        .or_else(|| {
+            // Fallback: expand ~ properly instead of using literal tilde
+            std::env::var("HOME").ok()
+                .or_else(|| std::env::var("USERPROFILE").ok())
+                .map(|h| PathBuf::from(h).join(".compute"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp/.compute"))
         .join("models")
         .to_string_lossy()
         .into_owned()
@@ -78,9 +94,23 @@ impl Default for ModelsConfig {
     }
 }
 
+impl Default for ExperimentalConfig {
+    fn default() -> Self {
+        Self {
+            stage_mode_enabled: false,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
-        let compute_dir = config_dir().unwrap_or_else(|| PathBuf::from("~/.compute"));
+        let compute_dir = config_dir()
+            .or_else(|| {
+                std::env::var("HOME").ok()
+                    .or_else(|| std::env::var("USERPROFILE").ok())
+                    .map(|h| PathBuf::from(h).join(".compute"))
+            })
+            .unwrap_or_else(|| PathBuf::from("/tmp/.compute"));
         Self {
             node: NodeConfig {
                 name: hostname(),
@@ -90,7 +120,11 @@ impl Default for Config {
                 pause_on_battery: true,
                 pause_on_fullscreen: true,
             },
-            wallet: WalletConfig { public_address: String::new(), node_id: String::new() },
+            wallet: WalletConfig {
+                public_address: String::new(),
+                node_id: String::new(),
+                node_token: String::new(),
+            },
             network: NetworkConfig {
                 orchestrator_url: "https://api.computenetwork.sh".into(),
                 region: "auto".into(),
@@ -108,6 +142,7 @@ impl Default for Config {
                 cache_dir: compute_dir.join("models").to_string_lossy().into_owned(),
                 active_model: "auto".into(),
             },
+            experimental: ExperimentalConfig::default(),
         }
     }
 }
@@ -125,6 +160,8 @@ impl Config {
         Ok(config)
     }
 
+    /// Save config atomically: write to .tmp then rename.
+    /// Prevents corruption if the process crashes mid-write.
     pub fn save(&self) -> Result<()> {
         let path = config_file_path()?;
         if let Some(parent) = path.parent() {
@@ -134,8 +171,13 @@ impl Config {
         }
         let contents =
             toml::to_string_pretty(self).with_context(|| "Failed to serialize config")?;
-        std::fs::write(&path, contents)
-            .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+
+        // Atomic write: write to temp file, then rename (rename is atomic on all platforms)
+        let tmp_path = path.with_extension("toml.tmp");
+        std::fs::write(&tmp_path, &contents)
+            .with_context(|| format!("Failed to write temp config: {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &path)
+            .with_context(|| format!("Failed to rename config: {} -> {}", tmp_path.display(), path.display()))?;
         Ok(())
     }
 
@@ -149,10 +191,12 @@ impl Config {
             "node.pause_on_fullscreen" => Some(self.node.pause_on_fullscreen.to_string()),
             "wallet.public_address" => Some(self.wallet.public_address.clone()),
             "wallet.node_id" => Some(self.wallet.node_id.clone()),
+            "wallet.node_token" => Some(self.wallet.node_token.clone()),
             "network.orchestrator_url" => Some(self.network.orchestrator_url.clone()),
             "network.region" => Some(self.network.region.clone()),
             "logging.level" => Some(self.logging.level.clone()),
             "models.active_model" => Some(self.models.active_model.clone()),
+            "experimental.stage_mode_enabled" => Some(self.experimental.stage_mode_enabled.to_string()),
             _ => None,
         }
     }
@@ -167,10 +211,12 @@ impl Config {
             "node.pause_on_fullscreen" => self.node.pause_on_fullscreen = value.parse()?,
             "wallet.public_address" => self.wallet.public_address = value.to_string(),
             "wallet.node_id" => self.wallet.node_id = value.to_string(),
+            "wallet.node_token" => self.wallet.node_token = value.to_string(),
             "network.orchestrator_url" => self.network.orchestrator_url = value.to_string(),
             "network.region" => self.network.region = value.to_string(),
             "logging.level" => self.logging.level = value.to_string(),
             "models.active_model" => self.models.active_model = value.to_string(),
+            "experimental.stage_mode_enabled" => self.experimental.stage_mode_enabled = value.parse()?,
             _ => anyhow::bail!("Unknown config key: {key}"),
         }
         Ok(())

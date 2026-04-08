@@ -67,6 +67,13 @@ pub struct HeartbeatUpdate {
     pub tokens_per_second: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub downloaded_models: Option<String>, // comma-separated model IDs
+    // Inference-aware heartbeat fields (for smarter scheduling)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_slots_total: Option<i32>,     // --parallel value
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inference_slots_busy: Option<i32>,      // currently processing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_vram_free_mb: Option<i64>,          // free unified/VRAM
     pub last_heartbeat: String, // ISO 8601
 }
 
@@ -103,6 +110,8 @@ pub struct OwnNodeInfo {
     pub total_earned_compute: Option<f64>,
     pub tokens_per_second: Option<f64>,
     pub requests_served: Option<i64>,
+    pub inference_slots_total: Option<i32>,
+    pub inference_slots_busy: Option<i32>,
 }
 
 /// Minimal node info for discovery/visualization.
@@ -464,6 +473,9 @@ mod tests {
             requests_served: None,
             tokens_per_second: None,
             downloaded_models: None,
+            inference_slots_total: Some(4),
+            inference_slots_busy: Some(1),
+            gpu_vram_free_mb: Some(20480),
             last_heartbeat: "2026-03-28T12:00:00Z".into(),
         };
 

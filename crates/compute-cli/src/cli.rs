@@ -13,7 +13,7 @@ const VERSION_INFO: &str = concat!(
 #[command(
     name = "compute",
     about = "Compute — Decentralized GPU Infrastructure",
-    long_about = "Compute aggregates idle GPU/CPU resources and daisy-chains them via pipeline parallelism to run large AI models. Revenue flows back to contributors via the $COMPUTE token on Solana.",
+    long_about = "Compute runs local and distributed inference across contributed machines. The stable live path today is single-node serving through the Compute orchestrator, with distributed pipeline work still present in the repo for future expansion.",
     version = VERSION_INFO,
     author = "Compute Network <dev@computenetwork.sh>"
 )]
@@ -24,7 +24,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Start the compute daemon (shows splash, then detaches)
+    /// Start the compute daemon in the foreground
     Start,
 
     /// Stop the daemon gracefully
@@ -65,8 +65,20 @@ pub enum Commands {
     /// Show earnings summary
     Earnings,
 
-    /// Run GPU/CPU benchmark
-    Benchmark,
+    /// Run hardware benchmark, optionally including llama-server sweep
+    Benchmark {
+        /// Run llama-server performance sweep
+        #[arg(long)]
+        llama: bool,
+
+        /// Model id to benchmark (default: gemma-4-e4b-q4)
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Compute API key for orchestrator comparison (falls back to OPENAI_API_KEY)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
 
     /// Show detected hardware info
     Hardware,
@@ -131,7 +143,10 @@ pub enum ConfigAction {
 
 #[derive(Subcommand)]
 pub enum WalletAction {
-    /// Set/update Solana public address
+    /// Authenticate this node via wallet in the browser
+    Login,
+
+    /// Deprecated: wallet-only auth now uses browser login
     Set {
         /// Solana public address
         address: String,

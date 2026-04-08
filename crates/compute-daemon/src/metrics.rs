@@ -15,6 +15,7 @@ pub struct Earnings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PipelineStatus {
     pub active: bool,
+    pub active_requests: u32,
     pub stage: Option<u32>,
     pub total_stages: Option<u32>,
     pub model: Option<String>,

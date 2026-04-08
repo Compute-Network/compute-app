@@ -1,4 +1,10 @@
+use anyhow::Result;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Results from a full node benchmark.
@@ -11,6 +17,46 @@ pub struct BenchmarkResults {
     pub upload_speed_mbps: Option<f64>,
     pub disk_read_mbps: f64,
     pub estimated_tflops_fp16: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlamaBenchmarkCase {
+    pub name: String,
+    pub ctx_size: u32,
+    pub parallel: u32,
+    pub batch_size: u32,
+    pub ubatch_size: u32,
+    pub threads: u32,
+    pub flash_attn: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlamaBenchmarkResult {
+    pub case: LlamaBenchmarkCase,
+    pub predicted_per_second: Option<f64>,
+    pub prompt_per_second: Option<f64>,
+    pub total_ms: Option<f64>,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathBenchmarkResult {
+    pub name: String,
+    pub first_token_ms: Option<f64>,
+    pub total_ms: Option<f64>,
+    pub completion_tokens: Option<u64>,
+    pub effective_tok_per_sec: Option<f64>,
+    pub profile: Option<BTreeMap<String, f64>>,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathBenchmarkSuite {
+    pub direct_temp: PathBenchmarkResult,
+    pub daemon_local: PathBenchmarkResult,
+    pub orchestrator: PathBenchmarkResult,
 }
 
 /// Run a CPU benchmark (simple computation throughput).
@@ -61,21 +107,27 @@ pub fn bench_cpu() -> (f64, f64) {
 
 /// Estimate memory bandwidth (simplified: measure sequential write throughput).
 pub fn bench_memory() -> f64 {
-    let size = 64 * 1024 * 1024; // 64 MB
+    let size = 256 * 1024 * 1024; // 256 MB
     let mut buf = vec![0u8; size];
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
 
     let start = Instant::now();
-    let iterations = 4;
-    for _ in 0..iterations {
-        for (i, byte) in buf.iter_mut().enumerate() {
-            *byte = (i & 0xFF) as u8;
-        }
+    let iterations = 6;
+    for iter in 0..iterations {
+        std::thread::scope(|scope| {
+            let chunk_len = buf.len().div_ceil(threads);
+            for (idx, chunk) in buf.chunks_mut(chunk_len).enumerate() {
+                scope.spawn(move || {
+                    let value = ((iter + idx) & 0xFF) as u8;
+                    chunk.fill(value);
+                });
+            }
+        });
     }
     let elapsed = start.elapsed();
-    let _ = buf[0]; // prevent optimization
+    let _ = buf[0];
 
     let bytes_written = size as f64 * iterations as f64;
-
     bytes_written / elapsed.as_secs_f64() / 1_073_741_824.0
 }
 
@@ -213,4 +265,705 @@ pub async fn run_full_benchmark(gpu_name: &str, vram_mb: u64) -> BenchmarkResult
         disk_read_mbps: disk_read,
         estimated_tflops_fp16: tflops,
     }
+}
+
+pub fn default_llama_sweep_cases() -> Vec<LlamaBenchmarkCase> {
+    vec![
+        LlamaBenchmarkCase {
+            name: "current".into(),
+            ctx_size: 32_768,
+            parallel: 2,
+            batch_size: 2048,
+            ubatch_size: 512,
+            threads: 6,
+            flash_attn: true,
+        },
+        LlamaBenchmarkCase {
+            name: "low-ctx".into(),
+            ctx_size: 8192,
+            parallel: 2,
+            batch_size: 2048,
+            ubatch_size: 512,
+            threads: 6,
+            flash_attn: true,
+        },
+        LlamaBenchmarkCase {
+            name: "small-batch".into(),
+            ctx_size: 8192,
+            parallel: 2,
+            batch_size: 1024,
+            ubatch_size: 256,
+            threads: 6,
+            flash_attn: true,
+        },
+        LlamaBenchmarkCase {
+            name: "more-threads".into(),
+            ctx_size: 8192,
+            parallel: 2,
+            batch_size: 1024,
+            ubatch_size: 256,
+            threads: 8,
+            flash_attn: true,
+        },
+        LlamaBenchmarkCase {
+            name: "flash-off".into(),
+            ctx_size: 8192,
+            parallel: 2,
+            batch_size: 2048,
+            ubatch_size: 512,
+            threads: 6,
+            flash_attn: false,
+        },
+        LlamaBenchmarkCase {
+            name: "parallel-1".into(),
+            ctx_size: 8192,
+            parallel: 1,
+            batch_size: 2048,
+            ubatch_size: 512,
+            threads: 6,
+            flash_attn: true,
+        },
+        LlamaBenchmarkCase {
+            name: "ubatch-1024".into(),
+            ctx_size: 8192,
+            parallel: 2,
+            batch_size: 2048,
+            ubatch_size: 1024,
+            threads: 6,
+            flash_attn: true,
+        },
+    ]
+}
+
+pub async fn run_llama_benchmark_sweep(model_name: &str) -> Result<Vec<LlamaBenchmarkResult>> {
+    let model_path = find_model_path(model_name)
+        .ok_or_else(|| anyhow::anyhow!("Model not found locally: {model_name}"))?;
+    let llama_server = find_llama_server()?;
+    let prompt = "Write one short paragraph about efficient local inference on Apple Silicon.";
+
+    let mut results = Vec::new();
+    for (idx, case) in default_llama_sweep_cases().into_iter().enumerate() {
+        let port = 18090 + idx as u16;
+        let result = run_single_llama_case(&llama_server, &model_path, port, prompt, case).await;
+        results.push(result);
+    }
+
+    Ok(results)
+}
+
+async fn run_single_llama_case(
+    llama_server: &Path,
+    model_path: &Path,
+    port: u16,
+    prompt: &str,
+    case: LlamaBenchmarkCase,
+) -> LlamaBenchmarkResult {
+    let mut command = Command::new(llama_server);
+    command
+        .arg("--model")
+        .arg(model_path)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--ctx-size")
+        .arg(case.ctx_size.to_string())
+        .arg("--n-gpu-layers")
+        .arg("999")
+        .arg("--parallel")
+        .arg(case.parallel.to_string())
+        .arg("--cache-type-k")
+        .arg("q8_0")
+        .arg("--cache-type-v")
+        .arg("q8_0")
+        .arg("--batch-size")
+        .arg(case.batch_size.to_string())
+        .arg("--ubatch-size")
+        .arg(case.ubatch_size.to_string())
+        .arg("--threads")
+        .arg(case.threads.to_string())
+        .arg("--jinja")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    if case.flash_attn {
+        command.arg("--flash-attn").arg("on");
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return LlamaBenchmarkResult {
+                case,
+                predicted_per_second: None,
+                prompt_per_second: None,
+                total_ms: None,
+                success: false,
+                error: Some(format!("Failed to start llama-server: {e}")),
+            };
+        }
+    };
+
+    let result = async {
+        let case_for_success = case.clone();
+        wait_for_health(port, 60).await?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()?;
+
+        let started = Instant::now();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/completion"))
+            .json(&serde_json::json!({
+                "prompt": prompt,
+                "n_predict": 512,
+                "temperature": 0.2,
+                "stream": false,
+            }))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("benchmark request failed ({}): {}", status, body);
+        }
+
+        let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let body = resp.json::<serde_json::Value>().await?;
+        let timings = body.get("timings").cloned().unwrap_or_default();
+
+        Ok::<LlamaBenchmarkResult, anyhow::Error>(LlamaBenchmarkResult {
+            case: case_for_success,
+            predicted_per_second: timings.get("predicted_per_second").and_then(|v| v.as_f64()),
+            prompt_per_second: timings.get("prompt_per_second").and_then(|v| v.as_f64()),
+            total_ms: Some(total_ms),
+            success: true,
+            error: None,
+        })
+    }.await;
+
+    let _ = stop_child(&mut child);
+
+    match result {
+        Ok(result) => result,
+        Err(e) => LlamaBenchmarkResult {
+            case,
+            predicted_per_second: None,
+            prompt_per_second: None,
+            total_ms: None,
+            success: false,
+            error: Some(e.to_string()),
+        },
+    }
+}
+
+pub async fn run_path_comparison(
+    model_name: &str,
+    api_key: Option<&str>,
+) -> Result<PathBenchmarkSuite> {
+    let direct_temp = run_direct_temp_path_case(model_name).await?;
+    let daemon_local = run_daemon_local_path_case().await;
+    let orchestrator = run_orchestrator_path_case(model_name, api_key).await;
+
+    Ok(PathBenchmarkSuite {
+        direct_temp,
+        daemon_local,
+        orchestrator,
+    })
+}
+
+pub async fn run_direct_temp_path_case(model_name: &str) -> Result<PathBenchmarkResult> {
+    let model_path = find_model_path(model_name)
+        .ok_or_else(|| anyhow::anyhow!("Model not found locally: {model_name}"))?;
+    let llama_server = find_llama_server()?;
+
+    let direct_case = LlamaBenchmarkCase {
+        name: "direct-temp".into(),
+        ctx_size: 32_768,
+        parallel: 2,
+        batch_size: 2048,
+        ubatch_size: 512,
+        threads: 6,
+        flash_attn: true,
+    };
+
+    Ok(run_single_path_case_temp(&llama_server, &model_path, 18100, model_name, direct_case).await)
+}
+
+pub async fn run_daemon_local_path_case() -> PathBenchmarkResult {
+    run_single_path_case_daemon_local().await
+}
+
+pub async fn run_orchestrator_path_case(
+    model_name: &str,
+    api_key: Option<&str>,
+) -> PathBenchmarkResult {
+    run_single_path_case_orchestrator(model_name, api_key).await
+}
+
+async fn run_single_path_case_temp(
+    llama_server: &Path,
+    model_path: &Path,
+    port: u16,
+    model_name: &str,
+    case: LlamaBenchmarkCase,
+) -> PathBenchmarkResult {
+    let mut command = Command::new(llama_server);
+    command
+        .arg("--model")
+        .arg(model_path)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--ctx-size")
+        .arg(case.ctx_size.to_string())
+        .arg("--n-gpu-layers")
+        .arg("999")
+        .arg("--parallel")
+        .arg(case.parallel.to_string())
+        .arg("--cache-type-k")
+        .arg("q8_0")
+        .arg("--cache-type-v")
+        .arg("q8_0")
+        .arg("--batch-size")
+        .arg(case.batch_size.to_string())
+        .arg("--ubatch-size")
+        .arg(case.ubatch_size.to_string())
+        .arg("--threads")
+        .arg(case.threads.to_string())
+        .arg("--jinja")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    if case.flash_attn {
+        command.arg("--flash-attn").arg("on");
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            return PathBenchmarkResult {
+                name: "direct-temp".into(),
+                first_token_ms: None,
+                total_ms: None,
+                completion_tokens: None,
+                effective_tok_per_sec: None,
+                profile: None,
+                success: false,
+                error: Some(format!("Failed to start llama-server: {e}")),
+            };
+        }
+    };
+
+    let result = match wait_for_health(port, 60).await {
+        Ok(()) => {
+            run_chat_stream_path_case(
+                "direct-temp",
+                &format!("http://127.0.0.1:{port}/v1/chat/completions"),
+                Some(model_name),
+                None,
+                false,
+            )
+            .await
+        }
+        Err(e) => PathBenchmarkResult {
+            name: "direct-temp".into(),
+            first_token_ms: None,
+            total_ms: None,
+            completion_tokens: None,
+            effective_tok_per_sec: None,
+            profile: None,
+            success: false,
+            error: Some(e.to_string()),
+        },
+    };
+
+    let _ = stop_child(&mut child);
+    result
+}
+
+async fn run_single_path_case_daemon_local() -> PathBenchmarkResult {
+    run_chat_stream_path_case(
+        "daemon-local",
+        "http://127.0.0.1:8090/v1/chat/completions",
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
+async fn run_single_path_case_orchestrator(
+    model_name: &str,
+    api_key: Option<&str>,
+) -> PathBenchmarkResult {
+    let api_key = api_key
+        .map(|v| v.to_string())
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .or_else(|| std::env::var("COMPUTE_API_KEY").ok())
+        .or_else(load_compute_code_api_key);
+
+    let Some(api_key) = api_key else {
+        return PathBenchmarkResult {
+            name: "orchestrator".into(),
+            first_token_ms: None,
+            total_ms: None,
+            completion_tokens: None,
+            effective_tok_per_sec: None,
+            profile: None,
+            success: false,
+            error: Some("missing api key (pass --api-key, set OPENAI_API_KEY, or log into compute-code)".into()),
+        };
+    };
+
+    let base_url = std::env::var("OPENAI_BASE_URL")
+        .unwrap_or_else(|_| "https://api.computenetwork.sh/v1".to_string());
+    run_chat_stream_path_case(
+        "orchestrator",
+        &format!("{base_url}/chat/completions"),
+        Some(model_name),
+        Some(api_key.as_str()),
+        true,
+    )
+    .await
+}
+
+async fn run_chat_stream_path_case(
+    name: &str,
+    url: &str,
+    model_name: Option<&str>,
+    api_key: Option<&str>,
+    with_profile: bool,
+) -> PathBenchmarkResult {
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(180)).build() {
+        Ok(client) => client,
+        Err(e) => {
+            return PathBenchmarkResult {
+                name: name.into(),
+                first_token_ms: None,
+                total_ms: None,
+                completion_tokens: None,
+                effective_tok_per_sec: None,
+                profile: None,
+                success: false,
+                error: Some(e.to_string()),
+            };
+        }
+    };
+
+    let prompt = "Write a concise explanation of why Apple Silicon memory bandwidth matters for local inference.";
+    let mut request = client.post(url).json(&serde_json::json!({
+        "model": model_name.unwrap_or("auto"),
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 512,
+        "temperature": 0.2,
+        "stream": true,
+    }));
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key);
+    }
+    if with_profile {
+        request = request.header("x-compute-profile", "1");
+    }
+
+    let started = Instant::now();
+    let resp = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            return PathBenchmarkResult {
+                name: name.into(),
+                first_token_ms: None,
+                total_ms: None,
+                completion_tokens: None,
+                effective_tok_per_sec: None,
+                profile: None,
+                success: false,
+                error: Some(e.to_string()),
+            };
+        }
+    };
+
+    let mut profile = resp
+        .headers()
+        .get("x-compute-profile")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| serde_json::from_str::<BTreeMap<String, f64>>(s).ok());
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return PathBenchmarkResult {
+            name: name.into(),
+            first_token_ms: None,
+            total_ms: None,
+            completion_tokens: None,
+            effective_tok_per_sec: None,
+            profile,
+            success: false,
+            error: Some(format!("{status}: {body}")),
+        };
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    let mut first_token_ms = None;
+    let mut completion_tokens = None;
+    let mut captured_content_tokens = 0u64;
+
+    loop {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                while let Some(frame_end) = find_sse_frame_end(&buf) {
+                    let frame = String::from_utf8_lossy(&buf[..frame_end]).to_string();
+                    buf.drain(..frame_end + 2);
+                    process_sse_frame(
+                        &frame,
+                        &started,
+                        &mut first_token_ms,
+                        &mut completion_tokens,
+                        &mut captured_content_tokens,
+                        &mut profile,
+                    );
+                }
+            }
+            Some(Err(e)) => {
+                return PathBenchmarkResult {
+                    name: name.into(),
+                    first_token_ms,
+                    total_ms: None,
+                    completion_tokens,
+                    effective_tok_per_sec: None,
+                    profile,
+                    success: false,
+                    error: Some(e.to_string()),
+                };
+            }
+            None => {
+                if !buf.is_empty() {
+                    let frame = String::from_utf8_lossy(&buf).to_string();
+                    process_sse_frame(
+                        &frame,
+                        &started,
+                        &mut first_token_ms,
+                        &mut completion_tokens,
+                        &mut captured_content_tokens,
+                        &mut profile,
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let completion_tokens = completion_tokens.or_else(|| Some(captured_content_tokens).filter(|v| *v > 0));
+    let effective_tok_per_sec = completion_tokens
+        .map(|tokens| tokens as f64 / started.elapsed().as_secs_f64().max(0.001));
+
+    PathBenchmarkResult {
+        name: name.into(),
+        first_token_ms,
+        total_ms: Some(total_ms),
+        completion_tokens,
+        effective_tok_per_sec,
+        profile,
+        success: true,
+        error: None,
+    }
+}
+
+fn find_sse_frame_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|window| window == b"\n\n")
+}
+
+fn process_sse_frame(
+    frame: &str,
+    started: &Instant,
+    first_token_ms: &mut Option<f64>,
+    completion_tokens: &mut Option<u64>,
+    captured_content_tokens: &mut u64,
+    profile: &mut Option<BTreeMap<String, f64>>,
+) {
+    for line in frame.lines() {
+        if !line.starts_with("data: ") {
+            continue;
+        }
+        let payload = line.trim_start_matches("data: ").trim();
+        if payload == "[DONE]" {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
+            continue;
+        };
+        if json.get("object").and_then(|v| v.as_str()) == Some("compute.profile") {
+            if let Some(next_profile) = json
+                .get("profile")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<BTreeMap<String, f64>>(value).ok())
+            {
+                *profile = Some(next_profile);
+            }
+            continue;
+        }
+        if first_token_ms.is_none() && has_visible_content_chunk(&json) {
+            *first_token_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        if let Some(tokens) = json
+            .get("usage")
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(|v| v.as_u64())
+        {
+            *completion_tokens = Some(tokens);
+        }
+        *captured_content_tokens += extract_delta_text(&json)
+            .map(|text| estimate_token_count(text) as u64)
+            .unwrap_or(0);
+    }
+}
+
+fn has_visible_content_chunk(json: &serde_json::Value) -> bool {
+    extract_delta_text(json)
+        .map(|text| !text.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn extract_delta_text<'a>(json: &'a serde_json::Value) -> Option<&'a str> {
+    json.get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json.get("choices")
+                .and_then(|choices| choices.as_array())
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("delta"))
+                .and_then(|delta| delta.get("reasoning_content"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            json.get("choices")
+                .and_then(|choices| choices.as_array())
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .and_then(|message| message.get("content"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| {
+            json.get("choices")
+                .and_then(|choices| choices.as_array())
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .and_then(|message| message.get("reasoning_content"))
+                .and_then(|v| v.as_str())
+        })
+}
+
+fn estimate_token_count(text: &str) -> usize {
+    text.split_whitespace().count().max(1)
+}
+
+async fn wait_for_health(port: u16, timeout_secs: u64) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(timeout_secs) {
+        if let Ok(resp) = client.get(format!("http://127.0.0.1:{port}/health")).send().await
+            && resp.status().is_success()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    anyhow::bail!("llama-server did not become healthy within {timeout_secs}s")
+}
+
+fn stop_child(child: &mut Child) -> Result<()> {
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+fn find_llama_server() -> Result<PathBuf> {
+    if let Ok(output) = Command::new("which").arg("llama-server").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    for candidate in ["/usr/local/bin/llama-server", "/opt/homebrew/bin/llama-server", "~/.local/bin/llama-server"] {
+        let expanded = shellexpand::tilde(candidate).to_string();
+        let path = PathBuf::from(expanded);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    anyhow::bail!("llama-server not found")
+}
+
+fn find_model_path(model_name: &str) -> Option<PathBuf> {
+    let cache_dir = dirs::home_dir()?.join(".compute").join("models");
+    if !cache_dir.exists() {
+        return None;
+    }
+
+    let lower_model = model_name.to_lowercase();
+    let segments: Vec<&str> = lower_model
+        .split('-')
+        .filter(|s| *s != "q4" && *s != "q8" && *s != "fp16" && *s != "q2")
+        .collect();
+
+    let entries = std::fs::read_dir(&cache_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_lowercase();
+        if !name.ends_with(".gguf") {
+            continue;
+        }
+        if segments.iter().all(|seg| name.contains(seg)) && verify_gguf_magic(&path) {
+            return Some(path);
+        }
+    }
+
+    let entries = std::fs::read_dir(&cache_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "gguf") && verify_gguf_magic(&path) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn verify_gguf_magic(path: &Path) -> bool {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 4];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    magic == [0x47, 0x47, 0x55, 0x46]
+}
+
+fn load_compute_code_api_key() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let path = home.join(".compute-code").join("credentials.json");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("api_key")
+        .or_else(|| value.get("apiKey"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }

@@ -36,6 +36,7 @@ tracing-subscriber = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
+base64 = "0.22"
 
 # System info
 sysinfo = { workspace = true }

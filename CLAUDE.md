@@ -4,34 +4,39 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Compute is a DePIN terminal application that aggregates idle GPU/CPU resources and daisy-chains them via pipeline parallelism to run large AI models no single machine could handle. Revenue flows back to contributors via the $COMPUTE token on Solana. This repo (`compute-app`) contains the CLI daemon + TUI application. The sibling `compute-website` repo contains the marketing landing page.
+Compute is a DePIN terminal application plus control plane for serving local and distributed inference. Revenue flows back to contributors via the $COMPUTE token on Solana. This repo (`compute-app`) contains the Rust CLI/daemon/TUI, the live TypeScript `orchestrator/`, and the related research/docs used to evolve both.
 
-**Current status:** Planning phase. Architecture is documented in `compute-plan.md`. No application code has been written yet.
+**Current status:** Active codebase, not planning-only.
+- Production orchestrator is deployed on Railway.
+- Supabase is the backing database.
+- The stable live path today is primarily single-node inference with node auth, relay scheduling, billing, and rewards.
+- Multi-node pipeline code and docs exist, but that path is still experimental relative to the single-node path.
 
 ## Core Architecture
 
-- **Pipeline parallelism only** — every node participates as a stage in a daisy-chained inference pipeline. There is no standalone single-node inference mode. NOT tensor parallelism (too bandwidth-hungry for public internet).
+- **Single-node first in practice** — the stable production path today is one node serving one model through the orchestrator relay.
+- **Multi-node pipeline work exists** — the repo also contains pipeline/sharding research and scheduler code for future multi-node inference, but treat that path as experimental unless the task is explicitly about distributed inference.
 - **TUI layout:** Left 1/3 = spinning ASCII globe (braille unicode, ratatui Canvas widget), right 2/3 = content/info/stats panels. This split is consistent across startup splash and dashboard.
 - **macOS/Apple Silicon:** Uses native llama.cpp with Metal backend, NOT Docker+CUDA. Separate execution paths needed.
-- **All workloads containerized** (Docker) except Apple Silicon Metal inference.
+- **Apple Silicon path matters** — local Metal-backed `llama-server` on macOS is a first-class workflow in this repo.
 - **Config:** `~/.compute/config.toml`. Daemon uses PID/lockfile at `~/.compute/compute.pid`.
 - **Binary target:** <20MB with LTO + strip. No runtime deps except Docker.
 
-## Planned Tech Stack (CLI/Daemon)
+## Current Tech Stack
 
 - **Language:** Rust
 - **CLI:** Clap 4
 - **TUI:** Ratatui 0.29 + Crossterm 0.28
 - **Async:** Tokio 1
-- **HTTP:** Reqwest 0.12 (client) + Axum 0.7 (server)
+- **HTTP:** Reqwest 0.12 for Rust clients, Hono for the orchestrator API/relay
 - **Serialization:** Serde + TOML
 - **Blockchain:** Solana SDK 2 + Anchor Client 0.30
 - **Docker:** Bollard 0.18
 - **System:** Sysinfo 0.32 + NVML Wrapper 0.10
-- **P2P:** libp2p 0.54 + Quinn 0.11 (QUIC) — for pipeline stage communication
+- **Relay/control plane:** orchestrator WebSocket relay + Supabase-backed persistence
 - **Logging:** Tracing 0.1
 
-## Planned Workspace Structure
+## Workspace Structure
 
 ```
 Cargo.toml (workspace root)
@@ -40,7 +45,7 @@ crates/
   compute-daemon/       # Background daemon process
   compute-network/      # P2P pipeline communication
   compute-solana/       # Solana read-only (public address + balance reading)
-  compute-orchestrator/ # Central orchestrator (node registry, pipeline scheduling, public API)
+orchestrator/            # Central orchestrator (node registry, scheduling, relay, public API)
 ```
 
 ## Build Targets
@@ -51,13 +56,14 @@ crates/
 
 Uses `cross` crate for Linux cross-compilation. Windows builds use MSVC toolchain.
 
-## Platform-Specific GPU Paths
+## Platform Notes
 
 - **NVIDIA (Linux/Windows):** Docker containers with CUDA GPU passthrough (WSL2 backend on Windows)
 - **Apple Silicon (macOS):** Native Metal/MLX inference, no Docker. Reference Parallax's Metal paged attention shaders.
 - **CPU fallback (all platforms):** llama.cpp CPU mode for nodes without a GPU
-- **Windows daemon:** Windows Service (via `windows-service` crate) or background process. Config at `%APPDATA%\compute\config.toml`.
-- **Windows TUI:** Requires Windows Terminal or PowerShell 7 for Unicode braille globe rendering.
+- **Config:** `~/.compute/config.toml` on macOS/Linux
+- **Logs:** `~/.compute/logs/compute.log`
+- **Daemon runtime:** local `llama-server` process management is part of the normal single-node path
 
 ## TUI Design Principles (from design-language.md)
 
@@ -72,3 +78,10 @@ Uses `cross` crate for Linux cross-compilation. Windows builds use MSVC toolchai
 ## Branding
 
 Design specs in `Branding-Guide/design-language.md`. Key: monochromatic stone palette, DM Sans headings, Inter body, IBM Plex Mono for code/terminal output.
+
+## Practical Guidance
+
+- Do not assume old planning docs reflect the live system; read the current code first.
+- For node auth and control-plane behavior, prefer the orchestrator paths over legacy direct-Supabase client paths.
+- When improving reliability, prioritize the single-node path before expanding distributed-system surface area.
+- `compute-code` and `compute-website` are sibling repos and matter for wallet auth, API-key UX, and end-to-end testing.

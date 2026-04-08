@@ -52,7 +52,8 @@ pub fn is_service_installed() -> bool {
 #[cfg(target_os = "macos")]
 fn launchd_plist_path() -> PathBuf {
     dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
+        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
+        .expect("Cannot determine home directory for launchd plist")
         .join("Library/LaunchAgents/sh.computenetwork.compute.plist")
 }
 
@@ -141,7 +142,8 @@ fn uninstall_launchd() -> Result<()> {
 #[cfg(target_os = "linux")]
 fn systemd_unit_path() -> PathBuf {
     dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("~"))
+        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
+        .expect("Cannot determine home directory for systemd unit")
         .join(".config/systemd/user/compute.service")
 }
 

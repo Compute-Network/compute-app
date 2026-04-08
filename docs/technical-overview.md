@@ -221,7 +221,7 @@ Messages use a simple length-prefixed format: 4-byte little-endian length + JSON
 3. **Auto-linking**: database trigger matches the wallet address and links the node to the authenticated account
 4. **Claiming rewards**: user presses `[c]` in the terminal dashboard → opens the claim page in browser → connects wallet → signs claim transaction on Solana
 
-No private keys ever touch the CLI. The terminal only stores the public address. Ownership is proven on the website through standard wallet signature verification (EIP-4361 / Sign In With Solana).
+No private keys ever touch the CLI. The terminal stores the public address plus a node session token. Ownership is proven through wallet signature verification in the browser.
 
 ---
 
@@ -240,7 +240,7 @@ No private keys ever touch the CLI. The terminal only stores the public address.
 | `compute doctor` | Diagnose issues with actionable recommendations |
 | `compute nodes` | List online nodes in the network |
 | `compute earnings` | Show earnings summary |
-| `compute wallet set <addr>` | Set Solana wallet address |
+| `compute wallet login` | Connect wallet in browser and authorize this node |
 | `compute config show` | Show current configuration |
 | `compute update` | Self-update to latest release |
 | `compute service install` | Auto-start on login (launchd/systemd) |

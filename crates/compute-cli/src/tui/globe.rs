@@ -84,7 +84,7 @@ impl Globe {
         self.my_position = Some(latlon_to_xyz(37.7749, -122.4194));
     }
 
-    /// Set node positions from region strings (from Supabase discovery).
+    /// Set node positions from region strings (from orchestrator discovery).
     /// Each region is mapped to approximate coordinates. Nodes with unknown
     /// regions are spread across the globe using a hash of their wallet address.
     pub fn set_nodes_from_regions(&mut self, regions: &[(String, Option<String>)]) {

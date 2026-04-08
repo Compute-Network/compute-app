@@ -1,7 +1,9 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use serde::{de::DeserializeOwned, Deserialize};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -10,9 +12,39 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 
+use compute_daemon::config::{self, Config};
+
 use super::globe::Globe;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const API_BASE: &str = "https://api.computenetwork.sh";
+
+#[derive(Debug, Deserialize)]
+struct DeviceStartResult {
+    device_code: String,
+    auth_url: String,
+    expires_in: u64,
+    poll_interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DevicePollResult {
+    status: String,
+    node_token: Option<String>,
+    wallet_address: Option<String>,
+}
+
+#[derive(Debug)]
+struct WalletAuthResult {
+    wallet_address: String,
+    node_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeTokenClaims {
+    #[serde(rename = "walletAddress")]
+    wallet_address: Option<String>,
+}
 
 /// Onboarding result — the wallet address entered by the user.
 pub enum OnboardingResult {
@@ -28,15 +60,14 @@ pub enum OnboardingResult {
 pub struct OnboardingScreen {
     globe: Globe,
     input: String,
-    cursor_pos: usize,
     error_message: Option<String>,
     success: bool,
     step: OnboardingStep,
-    cursor_blink: bool,
-    last_blink: Instant,
     llama_found: bool,
     install_rx: Option<mpsc::Receiver<Result<(), String>>>,
     install_status: Option<String>,
+    auth_rx: Option<mpsc::Receiver<Result<WalletAuthResult, String>>>,
+    auth_status: Option<String>,
 }
 
 #[derive(PartialEq)]
@@ -56,15 +87,14 @@ impl OnboardingScreen {
         Self {
             globe,
             input: String::new(),
-            cursor_pos: 0,
             error_message: None,
             success: false,
             step: OnboardingStep::Welcome,
-            cursor_blink: true,
-            last_blink: Instant::now(),
             llama_found: find_llama_server(),
             install_rx: None,
             install_status: None,
+            auth_rx: None,
+            auth_status: None,
         }
     }
 
@@ -115,61 +145,12 @@ impl OnboardingScreen {
             }
             OnboardingStep::WalletInput => {
                 match code {
-                    KeyCode::Char(c) => {
-                        self.input.insert(self.cursor_pos, c);
-                        self.cursor_pos += 1;
-                        self.error_message = None;
-                    }
-                    KeyCode::Backspace => {
-                        if self.cursor_pos > 0 {
-                            self.cursor_pos -= 1;
-                            self.input.remove(self.cursor_pos);
-                            self.error_message = None;
-                        }
-                    }
-                    KeyCode::Delete => {
-                        if self.cursor_pos < self.input.len() {
-                            self.input.remove(self.cursor_pos);
-                            self.error_message = None;
-                        }
-                    }
-                    KeyCode::Left => {
-                        if self.cursor_pos > 0 {
-                            self.cursor_pos -= 1;
-                        }
-                    }
-                    KeyCode::Right => {
-                        if self.cursor_pos < self.input.len() {
-                            self.cursor_pos += 1;
-                        }
-                    }
-                    KeyCode::Home => {
-                        self.cursor_pos = 0;
-                    }
-                    KeyCode::End => {
-                        self.cursor_pos = self.input.len();
-                    }
                     KeyCode::Enter => {
-                        if self.input.trim().is_empty() {
-                            return Some(OnboardingResult::Skipped);
-                        }
-                        let address = self.input.trim().to_string();
-                        if compute_solana::is_valid_address(&address) {
-                            // Check if we need to install llama-server
-                            if self.llama_found {
-                                self.step = OnboardingStep::Done;
-                                self.success = true;
-                                return Some(OnboardingResult::WalletSet(address));
-                            } else {
-                                self.start_llama_install();
-                                self.step = OnboardingStep::Installing;
-                            }
-                        } else {
-                            self.error_message = Some(
-                                "Invalid Solana address. Must be 32-44 base58 characters.".into(),
-                            );
+                        if self.auth_rx.is_none() {
+                            self.start_wallet_auth();
                         }
                     }
+                    KeyCode::Char('s') | KeyCode::Char('S') => return Some(OnboardingResult::Skipped),
                     _ => {}
                 }
                 None
@@ -197,10 +178,37 @@ impl OnboardingScreen {
     fn tick(&mut self) -> Option<OnboardingResult> {
         self.globe.tick();
 
-        // Cursor blink every 500ms
-        if self.last_blink.elapsed() > Duration::from_millis(500) {
-            self.cursor_blink = !self.cursor_blink;
-            self.last_blink = Instant::now();
+        if self.step == OnboardingStep::WalletInput
+            && let Some(ref rx) = self.auth_rx
+            && let Ok(result) = rx.try_recv()
+        {
+            self.auth_rx = None;
+            match result {
+                Ok(auth) => {
+                    self.input = auth.wallet_address.clone();
+                    self.auth_status = Some("Wallet connected".into());
+                    self.success = true;
+
+                    if let Ok(mut config) = Config::load() {
+                        config.wallet.public_address = auth.wallet_address.clone();
+                        config.wallet.node_token = auth.node_token;
+                        let _ = config::ensure_dirs();
+                        let _ = config.save();
+                    }
+
+                    if self.llama_found {
+                        self.step = OnboardingStep::Done;
+                        return Some(OnboardingResult::WalletSet(auth.wallet_address));
+                    }
+
+                    self.start_llama_install();
+                    self.step = OnboardingStep::Installing;
+                }
+                Err(e) => {
+                    self.error_message = Some(e);
+                    self.auth_status = None;
+                }
+            }
         }
 
         // Poll install progress
@@ -225,6 +233,80 @@ impl OnboardingScreen {
         }
 
         None
+    }
+
+    fn start_wallet_auth(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.auth_rx = Some(rx);
+        self.auth_status = Some("Opening browser for wallet login...".into());
+        self.error_message = None;
+
+        std::thread::spawn(move || {
+            let result = (|| -> Result<WalletAuthResult, String> {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(15))
+                    .build()
+                    .map_err(|e| e.to_string())?;
+
+                let start = client
+                    .post(format!("{API_BASE}/v1/auth/device/start"))
+                    .json(&serde_json::json!({ "purpose": "node_session" }))
+                    .send()
+                    .map_err(|e| e.to_string())?
+                    .error_for_status()
+                    .map_err(|e| e.to_string())?
+                    .json::<DeviceStartResult>()
+                    .map_err(|e| e.to_string())?;
+
+                open_url(&start.auth_url);
+
+                let started_at = Instant::now();
+                loop {
+                    if started_at.elapsed().as_secs() >= start.expires_in {
+                        return Err("Wallet login expired. Press Enter to try again.".into());
+                    }
+
+                    let res = client
+                        .get(format!("{API_BASE}/v1/auth/device/poll/{}", start.device_code))
+                        .send()
+                        .map_err(|e| e.to_string())?;
+
+                    if res.status() == reqwest::StatusCode::ACCEPTED {
+                        std::thread::sleep(Duration::from_secs(start.poll_interval.max(1)));
+                        continue;
+                    }
+                    if res.status() == reqwest::StatusCode::GONE
+                        || res.status() == reqwest::StatusCode::NOT_FOUND
+                    {
+                        return Err("Wallet login expired. Press Enter to try again.".into());
+                    }
+
+                    let body = res
+                        .error_for_status()
+                        .map_err(|e| e.to_string())?
+                        .json::<DevicePollResult>()
+                        .map_err(|e| e.to_string())?;
+
+                    if body.status == "complete" {
+                        let node_token = body
+                            .node_token
+                            .ok_or_else(|| "Missing node token in auth response".to_string())?;
+                        let wallet_address = body
+                            .wallet_address
+                            .or_else(|| wallet_address_from_node_token(&node_token))
+                            .ok_or_else(|| "Missing wallet address in auth response".to_string())?;
+                        return Ok(WalletAuthResult {
+                            wallet_address,
+                            node_token,
+                        });
+                    }
+
+                    std::thread::sleep(Duration::from_secs(start.poll_interval.max(1)));
+                }
+            })();
+
+            let _ = tx.send(result);
+        });
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -319,7 +401,7 @@ impl OnboardingScreen {
         // Bottom help
         let help_text = match self.step {
             OnboardingStep::Welcome => "  [Enter] Continue  [S] Skip  [Esc] Quit",
-            OnboardingStep::WalletInput => "  [Enter] Submit  [Enter on empty] Skip  [Esc] Quit",
+            OnboardingStep::WalletInput => "  [Enter] Open wallet login  [S] Skip  [Esc] Quit",
             OnboardingStep::DependencyCheck => "  [Enter] Retry  [Esc] Quit",
             OnboardingStep::Installing => "  Installing...",
             OnboardingStep::Done => "  [Enter] Continue",
@@ -346,20 +428,20 @@ impl OnboardingScreen {
             Line::from(""),
             Line::from(""),
             Line::from(Span::styled(
-                "  To start earning $COMPUTE, you need to link",
+                "  To start earning $COMPUTE, you need to connect",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(Span::styled(
-                "  your Solana wallet address. This is the address",
+                "  your Solana wallet in the browser. Compute will",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(Span::styled(
-                "  where your rewards will be sent.",
+                "  create your wallet account and bind this node.",
                 Style::default().fg(Color::Gray),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  No private keys needed — just your public address.",
+                "  No private keys touch the CLI.",
                 Style::default().fg(Color::DarkGray),
             )),
         ];
@@ -370,48 +452,23 @@ impl OnboardingScreen {
         let inner_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2), // label
-                Constraint::Length(3), // input box
-                Constraint::Length(2), // error/status
+                Constraint::Length(2),
+                Constraint::Length(5),
+                Constraint::Length(2),
                 Constraint::Min(0),    // remaining
             ])
             .split(area);
 
         // Label
         let label = Paragraph::new(vec![Line::from(Span::styled(
-            "  SOLANA WALLET ADDRESS",
+            "  CONNECT WALLET",
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ))]);
         frame.render_widget(label, inner_chunks[0]);
 
-        // Input box — calculate visible area
-        let input_area = Rect {
-            x: inner_chunks[1].x + 2,
-            y: inner_chunks[1].y,
-            width: inner_chunks[1].width.saturating_sub(4),
-            height: inner_chunks[1].height,
-        };
-
-        // Build the display string with cursor
-        let display_text = if self.input.is_empty() && self.step == OnboardingStep::WalletInput {
-            if self.cursor_blink { "█".to_string() } else { " ".to_string() }
-        } else {
-            let mut text = self.input.clone();
-            if self.step == OnboardingStep::WalletInput && self.cursor_blink {
-                if self.cursor_pos >= text.len() {
-                    text.push('█');
-                } else {
-                    text.insert(self.cursor_pos, '█');
-                }
-            }
-            text
-        };
-
         let border_color = if self.error_message.is_some() {
             Color::Red
-        } else if self.success
-            || (!self.input.is_empty() && compute_solana::is_valid_address(self.input.trim()))
-        {
+        } else if self.success {
             Color::Green
         } else {
             Color::DarkGray
@@ -420,13 +477,20 @@ impl OnboardingScreen {
         let input_block =
             Block::default().borders(Borders::ALL).border_style(Style::default().fg(border_color));
 
-        let input_text = Paragraph::new(Line::from(Span::styled(
-            display_text,
-            Style::default().fg(Color::White),
-        )))
+        let status = self.auth_status.as_deref().unwrap_or("Press Enter to authenticate in your browser.");
+        let input_text = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "  Compute uses wallet auth like compute-code.",
+                Style::default().fg(Color::Gray),
+            )),
+            Line::from(Span::styled(
+                format!("  {status}"),
+                Style::default().fg(Color::White),
+            )),
+        ])
         .block(input_block);
 
-        frame.render_widget(input_text, input_area);
+        frame.render_widget(input_text, inner_chunks[1]);
 
         // Error or validation message
         let msg_area = inner_chunks[2];
@@ -436,18 +500,12 @@ impl OnboardingScreen {
                 Style::default().fg(Color::Red),
             )));
             frame.render_widget(err_msg, msg_area);
-        } else if !self.input.is_empty() && compute_solana::is_valid_address(self.input.trim()) {
+        } else if self.success && !self.input.is_empty() {
             let ok_msg = Paragraph::new(Line::from(Span::styled(
-                "  Valid Solana address",
+                format!("  Connected wallet: {}", self.input.trim()),
                 Style::default().fg(Color::Green),
             )));
             frame.render_widget(ok_msg, msg_area);
-        } else if !self.input.is_empty() {
-            let hint = Paragraph::new(Line::from(Span::styled(
-                format!("  {} / 32-44 characters", self.input.trim().len()),
-                Style::default().fg(Color::DarkGray),
-            )));
-            frame.render_widget(hint, msg_area);
         }
     }
 
@@ -535,4 +593,30 @@ fn find_llama_server() -> bool {
     // Check common locations
     let candidates = ["/usr/local/bin/llama-server", "/opt/homebrew/bin/llama-server"];
     candidates.iter().any(|p| std::path::Path::new(p).exists())
+}
+
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+fn wallet_address_from_node_token(token: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let claims = decode_jwt_payload::<NodeTokenClaims>(payload)?;
+    claims.wallet_address
+}
+
+fn decode_jwt_payload<T: DeserializeOwned>(payload: &str) -> Option<T> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
