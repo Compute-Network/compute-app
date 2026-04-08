@@ -51,6 +51,17 @@ Look for:
 - `experimental.stage_mode_enabled = true`
 - `experimental.stage_backend = "prototype"`
 
+Optional real-execution spike:
+
+```bash
+compute config set experimental.stage_backend tail-llama
+```
+
+`tail-llama` keeps the same head/tail QUIC stage path, but the tail stage runs a
+real local completion instead of returning the deterministic prototype text.
+This is still not true model-shard execution; it is the first real inference step
+inside the stage transport.
+
 ## Start
 
 On each machine:
@@ -80,6 +91,8 @@ When the scheduler forms the fixed Gemma prototype pipeline:
 
 - stage mode only supports non-streaming requests right now
 - the prototype backend returns deterministic synthetic completions
+- `tail-llama` requires the tail node to have the model downloaded locally
+- `tail-llama` is a real-execution spike, not true layer-sharded inference
 - this validates routing, transport, and stage ownership, not real model math
 
 ## What To Test

@@ -234,6 +234,42 @@ impl LlamaCppEngine {
         }])
     }
 
+    pub async fn generate_completion_text(
+        &self,
+        prompt: &str,
+        max_tokens: Option<u32>,
+    ) -> Result<String> {
+        if self.paused.load(Ordering::Relaxed) {
+            anyhow::bail!("Engine is paused");
+        }
+
+        let url = format!("http://127.0.0.1:{}/completion", self.server_port);
+        let body = serde_json::json!({
+            "prompt": prompt,
+            "n_predict": max_tokens.unwrap_or(96),
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "stream": false,
+        });
+
+        let resp = self
+            .http_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to send completion request")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Completion failed ({status}): {text}");
+        }
+
+        let result: serde_json::Value = resp.json().await?;
+        Ok(result["content"].as_str().unwrap_or("").to_string())
+    }
+
     /// Send an embedding/activation request for pipeline mid-stage.
     /// This uses the /embedding endpoint to get hidden states.
     async fn get_activations(&self, input_data: &[u8], shape: &[usize]) -> Result<Vec<u8>> {

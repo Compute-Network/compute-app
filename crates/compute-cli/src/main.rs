@@ -893,7 +893,7 @@ fn cmd_pipeline() -> Result<()> {
             if n.pipeline_id.is_some() {
                 println!("  Status:   ● Active");
                 if let (Some(s), Some(t)) = (n.pipeline_stage, n.pipeline_total_stages) {
-                    println!("  Stage:    {} / {}", s, t);
+                    println!("  Stage:    {} / {}", s + 1, t);
                 }
                 if let Some(ref model) = n.model_name {
                     println!("  Model:    {model}");

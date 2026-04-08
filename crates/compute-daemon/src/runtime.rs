@@ -135,8 +135,8 @@ impl DaemonRuntime {
         let mut held_tps_until: Option<std::time::Instant> = None;
 
         let stage_backend_kind = StageBackendKind::parse(&self.config.experimental.stage_backend);
-        let prototype_stage_mode =
-            self.config.experimental.stage_mode_enabled && stage_backend_kind == StageBackendKind::Prototype;
+        let prototype_stage_mode = self.config.experimental.stage_mode_enabled
+            && matches!(stage_backend_kind, StageBackendKind::Prototype | StageBackendKind::TailLlama);
 
         // Pre-warm: start llama-server during splash so the model is ready for the first request.
         // Skip entirely for prototype stage mode, which does not use local llama-server.

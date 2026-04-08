@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::hardware::HardwareInfo;
 use crate::inference::engine::{Activation, ForwardResult, ShardConfig as EngineShardConfig};
-use crate::inference::stage_backend::{StageBackendKind, StageExecutionBackend};
+use crate::inference::stage_backend::{StageBackendKind, StageExecutionBackend, encode_stage_prompt};
 
 const STAGE_RUNTIME_LISTEN_PORT: u16 = 9090;
 
@@ -158,6 +158,17 @@ pub async fn start_stage_prototype(
             "prototype://{}:{}-{}",
             spec.model_name, spec.start_layer, spec.end_layer
         )),
+        StageBackendKind::TailLlama => {
+            if spec.stage_index + 1 == spec.total_stages {
+                resolve_model_path(&spec.model_name)
+                    .with_context(|| format!("No local GGUF found for stage prototype model {}", spec.model_name))?
+            } else {
+                std::path::PathBuf::from(format!(
+                    "prototype://{}:{}-{}",
+                    spec.model_name, spec.start_layer, spec.end_layer
+                ))
+            }
+        }
         StageBackendKind::LlamaCpp => resolve_model_path(&spec.model_name)
             .with_context(|| format!("No local GGUF found for stage prototype model {}", spec.model_name))?,
     };
@@ -407,7 +418,7 @@ async fn handle_local_completion_command(
     let initial_input = Activation {
         request_id: request_id.clone(),
         shape: vec![1, prompt_tokens.len().max(1), 2048],
-        data: prompt.as_bytes().to_vec(),
+        data: encode_stage_prompt(&prompt, max_tokens)?,
         seq_position: 0,
         batch_index: 0,
     };

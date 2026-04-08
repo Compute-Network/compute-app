@@ -630,7 +630,7 @@ impl Dashboard {
 
         let pipeline_stage =
             if let (Some(s), Some(t)) = (self.pipeline.stage, self.pipeline.total_stages) {
-                format!("Pipeline Stage {s}/{t}")
+                format!("Pipeline Stage {}/{}", s + 1, t)
             } else {
                 "Not assigned".into()
             };
@@ -1024,6 +1024,7 @@ impl Dashboard {
             }
             "experimental.stage_backend" => match config.experimental.stage_backend.as_str() {
                 "llamacpp" => "LlamaCpp".into(),
+                "tail-llama" => "TailLlama".into(),
                 _ => "Prototype".into(),
             },
             "logging.level" => config.logging.level.clone(),
@@ -1094,8 +1095,9 @@ impl Dashboard {
                     }
                     "experimental.stage_backend" => {
                         config.experimental.stage_backend = match config.experimental.stage_backend.as_str() {
-                            "llamacpp" => "prototype".into(),
-                            _ => "llamacpp".into(),
+                            "prototype" => "tail-llama".into(),
+                            "tail-llama" => "llamacpp".into(),
+                            _ => "prototype".into(),
                         };
                     }
                     _ => {}

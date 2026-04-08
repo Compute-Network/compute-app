@@ -10,12 +10,14 @@ use crate::inference::llamacpp::LlamaCppEngine;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageBackendKind {
     Prototype,
+    TailLlama,
     LlamaCpp,
 }
 
 impl StageBackendKind {
     pub fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            "tail-llama" | "tailllama" | "tail_llama" | "hybrid" => Self::TailLlama,
             "llamacpp" | "llama.cpp" | "llama" => Self::LlamaCpp,
             _ => Self::Prototype,
         }
@@ -24,6 +26,7 @@ impl StageBackendKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Prototype => "prototype",
+            Self::TailLlama => "tail-llama",
             Self::LlamaCpp => "llamacpp",
         }
     }
@@ -36,6 +39,7 @@ impl StageBackendKind {
 /// multi-node plumbing.
 pub enum StageExecutionBackend {
     Prototype(PrototypeStageEngine),
+    TailLlama(TailLlamaStageEngine),
     LlamaCpp(LlamaCppEngine),
 }
 
@@ -43,6 +47,7 @@ impl StageExecutionBackend {
     pub fn new_for_hardware(hw: &HardwareInfo, kind: StageBackendKind) -> Self {
         match kind {
             StageBackendKind::Prototype => Self::Prototype(PrototypeStageEngine::default()),
+            StageBackendKind::TailLlama => Self::TailLlama(TailLlamaStageEngine::new(hw)),
             StageBackendKind::LlamaCpp => Self::LlamaCpp(LlamaCppEngine::new(detect_backend(hw))),
         }
     }
@@ -50,6 +55,7 @@ impl StageExecutionBackend {
     pub async fn load_shard(&mut self, config: &ShardConfig) -> Result<()> {
         match self {
             Self::Prototype(engine) => engine.load_shard(config),
+            Self::TailLlama(engine) => engine.load_shard(config).await,
             Self::LlamaCpp(engine) => engine.load_shard(config).await,
         }
     }
@@ -57,6 +63,7 @@ impl StageExecutionBackend {
     pub async fn unload(&mut self) -> Result<()> {
         match self {
             Self::Prototype(engine) => engine.unload(),
+            Self::TailLlama(engine) => engine.unload().await,
             Self::LlamaCpp(engine) => engine.unload().await,
         }
     }
@@ -64,6 +71,7 @@ impl StageExecutionBackend {
     pub async fn forward(&self, input: Activation) -> Result<ForwardResult> {
         match self {
             Self::Prototype(engine) => engine.forward(input),
+            Self::TailLlama(engine) => engine.forward(input).await,
             Self::LlamaCpp(engine) => engine.forward(input).await,
         }
     }
@@ -71,6 +79,7 @@ impl StageExecutionBackend {
     pub async fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         match self {
             Self::Prototype(engine) => engine.tokenize(text),
+            Self::TailLlama(engine) => engine.tokenize(text),
             Self::LlamaCpp(engine) => engine.tokenize(text).await,
         }
     }
@@ -78,6 +87,7 @@ impl StageExecutionBackend {
     pub async fn detokenize(&self, tokens: &[u32]) -> Result<String> {
         match self {
             Self::Prototype(engine) => engine.detokenize(tokens),
+            Self::TailLlama(engine) => engine.detokenize(tokens),
             Self::LlamaCpp(engine) => engine.detokenize(tokens).await,
         }
     }
@@ -85,15 +95,18 @@ impl StageExecutionBackend {
     pub fn backend_name(&self) -> &'static str {
         match self {
             Self::Prototype(_) => "prototype",
+            Self::TailLlama(_) => "tail-llama",
             Self::LlamaCpp(_) => "llamacpp",
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PrototypePayload {
+pub(crate) struct StagePromptPayload {
     prompt: String,
     stages: Vec<String>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Default)]
@@ -157,16 +170,18 @@ impl PrototypeStageEngine {
         }
 
         let mut payload = if input.data.is_empty() {
-            PrototypePayload {
+            StagePromptPayload {
                 prompt: String::new(),
                 stages: Vec::new(),
+                max_tokens: None,
             }
         } else if let Ok(existing) = parse_payload(&input.data) {
             existing
         } else {
-            PrototypePayload {
+            StagePromptPayload {
                 prompt: String::from_utf8_lossy(&input.data).to_string(),
                 stages: Vec::new(),
+                max_tokens: None,
             }
         };
 
@@ -184,13 +199,99 @@ impl PrototypeStageEngine {
     }
 }
 
-fn parse_payload(data: &[u8]) -> Result<PrototypePayload> {
+pub fn encode_stage_prompt(prompt: &str, max_tokens: Option<u32>) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&StagePromptPayload {
+        prompt: prompt.to_string(),
+        stages: Vec::new(),
+        max_tokens,
+    })?)
+}
+
+fn parse_payload(data: &[u8]) -> Result<StagePromptPayload> {
     serde_json::from_slice(data).or_else(|_| {
-        Ok(PrototypePayload {
+        Ok(StagePromptPayload {
             prompt: String::from_utf8_lossy(data).to_string(),
             stages: Vec::new(),
+            max_tokens: None,
         })
     })
+}
+
+pub struct TailLlamaStageEngine {
+    passthrough: PrototypeStageEngine,
+    tail: LlamaCppEngine,
+    shard_config: Option<ShardConfig>,
+}
+
+impl TailLlamaStageEngine {
+    pub fn new(hw: &HardwareInfo) -> Self {
+        Self {
+            passthrough: PrototypeStageEngine::default(),
+            tail: LlamaCppEngine::new(detect_backend(hw)),
+            shard_config: None,
+        }
+    }
+
+    async fn load_shard(&mut self, config: &ShardConfig) -> Result<()> {
+        self.shard_config = Some(config.clone());
+        self.passthrough.load_shard(config)?;
+        if config.is_last_stage {
+            self.tail.load_shard(config).await?;
+        }
+        Ok(())
+    }
+
+    async fn unload(&mut self) -> Result<()> {
+        if self
+            .shard_config
+            .as_ref()
+            .map(|config| config.is_last_stage)
+            .unwrap_or(false)
+        {
+            self.tail.unload().await?;
+        }
+        self.shard_config = None;
+        self.passthrough.unload()?;
+        Ok(())
+    }
+
+    async fn forward(&self, input: Activation) -> Result<ForwardResult> {
+        let config = self
+            .shard_config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TailLlama stage backend has no shard loaded"))?;
+
+        if !config.is_last_stage {
+            return self.passthrough.forward(input);
+        }
+
+        let payload = parse_payload(&input.data)?;
+        let content = self
+            .tail
+            .generate_completion_text(&payload.prompt, payload.max_tokens)
+            .await?;
+        let tokens = content
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(idx, byte)| GeneratedToken {
+                request_id: input.request_id.clone(),
+                token_id: *byte as u32,
+                token_text: (*byte as char).to_string(),
+                is_finished: idx + 1 == content.len(),
+                logprob: None,
+            })
+            .collect::<Vec<_>>();
+        Ok(ForwardResult::Tokens(tokens))
+    }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        self.passthrough.tokenize(text)
+    }
+
+    fn detokenize(&self, tokens: &[u32]) -> Result<String> {
+        self.passthrough.detokenize(tokens)
+    }
 }
 
 #[cfg(test)]
@@ -248,9 +349,10 @@ mod tests {
         })
         .unwrap();
 
-        let payload = PrototypePayload {
+        let payload = StagePromptPayload {
             prompt: "hello".into(),
             stages: vec!["0-13".into(), "14-27".into()],
+            max_tokens: Some(32),
         };
         let activation = Activation {
             request_id: "req".into(),
