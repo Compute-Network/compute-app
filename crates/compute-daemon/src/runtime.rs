@@ -369,6 +369,8 @@ impl DaemonRuntime {
                     if !relay_is_active.load(std::sync::atomic::Ordering::Relaxed) {
                         self.check_assignment(
                             &mut inference_mgr,
+                            &mut stage_runtime,
+                            &stage_runtime_client,
                             &ws_outbound_tx,
                             &mut baseline_tps,
                             &mut served_baseline,
@@ -528,6 +530,8 @@ impl DaemonRuntime {
     async fn check_assignment(
         &self,
         inference_mgr: &mut InferenceManager,
+        stage_runtime: &mut Option<StagePrototypeHandle>,
+        stage_runtime_client: &Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
         ws_outbound_tx: &tokio::sync::mpsc::Sender<String>,
         baseline_tps: &mut f64,
         served_baseline: &mut u64,
@@ -607,6 +611,23 @@ impl DaemonRuntime {
                 });
 
                 // Tell inference manager about the assignment
+                let stage_pipeline_match = stage_runtime
+                    .as_ref()
+                    .map(|handle| {
+                        node.pipeline_id.as_deref() == Some(handle.pipeline_id())
+                            && node.model_name.as_deref() == Some(handle.model_name())
+                            && node.pipeline_stage.map(|s| s as u32) == Some(handle.stage_index())
+                            && node.pipeline_total_stages.map(|s| s as u32) == Some(handle.total_stages())
+                    })
+                    .unwrap_or(false);
+
+                let looks_like_stage_assignment =
+                    self.config.experimental.stage_mode_enabled
+                        && node.model_name.as_deref() == Some("gemma-4-e4b-q4")
+                        && node.pipeline_id.is_some()
+                        && node.pipeline_stage.is_some()
+                        && node.pipeline_total_stages == Some(2);
+
                 let previous_pipeline_id = match inference_mgr.status() {
                     InferenceStatus::Running { pipeline_id, .. } => Some(pipeline_id.clone()),
                     InferenceStatus::RunningRpcWorker { pipeline_id, .. } => Some(pipeline_id.clone()),
@@ -618,14 +639,30 @@ impl DaemonRuntime {
                     _ => None,
                 };
 
-                inference_mgr.check_assignment(
-                    node.pipeline_id.as_deref(),
-                    node.model_name.as_deref(),
-                );
+                if stage_pipeline_match || looks_like_stage_assignment {
+                    if looks_like_stage_assignment && !stage_pipeline_match {
+                        tracing::debug!(
+                            "[stage] Poll observed stage assignment for pipeline {:?}; waiting for push/runtime instead of falling back to solo",
+                            node.pipeline_id
+                        );
+                    }
+                } else {
+                    if stage_runtime.is_some() && node.pipeline_id.is_none() {
+                        if let Some(handle) = stage_runtime.take() {
+                            handle.stop().await;
+                        }
+                        *stage_runtime_client.lock().await = None;
+                    }
+
+                    inference_mgr.check_assignment(
+                        node.pipeline_id.as_deref(),
+                        node.model_name.as_deref(),
+                    );
+                }
 
                 let pipeline_changed = previous_pipeline_id.as_deref() != node.pipeline_id.as_deref();
                 let model_changed = previous_model_name.as_deref() != node.model_name.as_deref();
-                if node.pipeline_id.is_some() && (pipeline_changed || model_changed) {
+                if !looks_like_stage_assignment && node.pipeline_id.is_some() && (pipeline_changed || model_changed) {
                     // Poll-based assignment detection runs before the WS push path on startup/reconnect.
                     // Emit the same ready probe here so the orchestrator doesn't wait 120s for a
                     // node_ready message that only the push path would have produced.
