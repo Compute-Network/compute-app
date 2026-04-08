@@ -257,6 +257,7 @@ impl DaemonRuntime {
                             }
 
                             inference_mgr.shutdown_server();
+                            inference_mgr.set_externally_managed(true);
 
                             let Some(shard_id) = assignment.shard_id.clone() else {
                                 warn!("[stage] Ignoring stage assignment without shard_id");
@@ -324,6 +325,7 @@ impl DaemonRuntime {
                             continue;
                         }
                         "rpc" if assignment.total_stages > 1 => {
+                            inference_mgr.set_externally_managed(false);
                             if let Some(handle) = stage_runtime.take() {
                                 handle.stop().await;
                             }
@@ -341,6 +343,7 @@ impl DaemonRuntime {
                             }
                         }
                         _ => {
+                            inference_mgr.set_externally_managed(false);
                             if let Some(handle) = stage_runtime.take() {
                                 handle.stop().await;
                             }
@@ -669,6 +672,7 @@ impl DaemonRuntime {
                             handle.stop().await;
                         }
                         *stage_runtime_client.lock().await = None;
+                        inference_mgr.set_externally_managed(false);
                     }
 
                     inference_mgr.check_assignment(

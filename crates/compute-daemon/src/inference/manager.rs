@@ -69,6 +69,7 @@ pub struct InferenceManager {
     current_pipeline_id: Option<String>,
     current_model_name: Option<String>,
     current_role: PipelineRole,
+    externally_managed: bool,
     restart_attempts: u32,
     restart_after: Option<std::time::Instant>,
 }
@@ -90,6 +91,7 @@ impl InferenceManager {
             current_pipeline_id: None,
             current_model_name: None,
             current_role: PipelineRole::Solo,
+            externally_managed: false,
             restart_attempts: 0,
             restart_after: None,
         }
@@ -120,6 +122,17 @@ impl InferenceManager {
         self.current_role = PipelineRole::Solo;
     }
 
+    /// When true, the regular llama/rpc lifecycle manager is disabled because
+    /// another runtime path (currently stage prototype mode) owns execution.
+    pub fn set_externally_managed(&mut self, externally_managed: bool) {
+        self.externally_managed = externally_managed;
+        if externally_managed {
+            self.current_pipeline_id = None;
+            self.current_model_name = None;
+            self.status = InferenceStatus::Idle;
+        }
+    }
+
     /// Set the pipeline role for this node. Call before check_assignment.
     /// - Solo: single-node llama-server (default)
     /// - Head { rpc_peers }: llama-server with --rpc connecting to workers
@@ -134,6 +147,9 @@ impl InferenceManager {
     /// Check if we should start or stop inference based on the pipeline assignment.
     /// Called by the daemon on each heartbeat cycle.
     pub fn check_assignment(&mut self, pipeline_id: Option<&str>, model_name: Option<&str>) {
+        if self.externally_managed {
+            return;
+        }
         match (&self.status, pipeline_id) {
             // Not running, got assigned → start
             (InferenceStatus::Idle | InferenceStatus::Error(_), Some(pid)) => {
@@ -412,6 +428,9 @@ impl InferenceManager {
     /// Fast process liveness check — call at 1-second intervals.
     /// Detects crashes without waiting for the next heartbeat cycle.
     pub fn check_process_alive(&mut self) -> bool {
+        if self.externally_managed {
+            return true;
+        }
         if let Some(ref mut child) = self.server_process {
             match child.try_wait() {
                 Ok(Some(exit)) => {
@@ -437,6 +456,9 @@ impl InferenceManager {
     /// Attempt to restart the currently assigned process after a crash.
     /// Returns true when a restart attempt was triggered.
     pub fn recover_if_needed(&mut self) -> bool {
+        if self.externally_managed {
+            return false;
+        }
         if !matches!(self.status, InferenceStatus::Error(_)) {
             return false;
         }
@@ -467,6 +489,9 @@ impl InferenceManager {
     /// Check if the llama-server is healthy (responds to /health).
     /// For RPC workers, just checks that the process is alive (no HTTP endpoint).
     pub async fn health_check(&self) -> bool {
+        if self.externally_managed {
+            return false;
+        }
         if matches!(self.status, InferenceStatus::RunningRpcWorker { .. }) {
             // RPC workers don't have an HTTP /health endpoint
             return self.server_process.is_some();
@@ -493,6 +518,9 @@ impl InferenceManager {
     /// Note: /slots can return malformed JSON when prompts contain control chars,
     /// so we parse with string matching rather than JSON deserialization.
     pub async fn get_metrics(&self) -> Option<InferenceMetrics> {
+        if self.externally_managed {
+            return None;
+        }
         if !matches!(self.status, InferenceStatus::Running { .. }) {
             return None;
         }
