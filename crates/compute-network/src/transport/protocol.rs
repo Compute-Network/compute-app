@@ -54,6 +54,8 @@ pub struct TokenPayload {
     pub request_id: String,
     pub tokens: Vec<u32>,
     pub is_finished: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// Pipeline control messages.

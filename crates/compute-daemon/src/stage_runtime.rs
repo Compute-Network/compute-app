@@ -310,6 +310,7 @@ pub async fn start_stage_prototype(
                                                     request_id: activation.request_id,
                                                     tokens: tokens.iter().map(|t| t.token_id).collect(),
                                                     is_finished: tokens.last().map(|t| t.is_finished).unwrap_or(false),
+                                                    text: Some(tokens.iter().map(|t| t.token_text.as_str()).collect::<String>()),
                                                 });
                                                 if let Err(err) = peer.send_activations(&payload).await {
                                                     warn!("[stage] Failed to send tokens upstream: {err}");
@@ -522,8 +523,10 @@ async fn handle_local_completion_command(
     let completion_tokens = max_tokens
         .map(|limit| raw_completion_tokens.min(limit))
         .unwrap_or(raw_completion_tokens);
-    let token_slice = &tokens.tokens[..completion_tokens as usize];
-    let content = {
+    let content = if let Some(text) = tokens.text.clone() {
+        text.chars().take(completion_tokens as usize).collect::<String>()
+    } else {
+        let token_slice = &tokens.tokens[..completion_tokens as usize];
         let engine = engine.lock().await;
         engine
             .detokenize(token_slice)

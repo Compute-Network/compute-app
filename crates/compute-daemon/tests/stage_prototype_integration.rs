@@ -66,6 +66,7 @@ async fn test_two_stage_head_tail_roundtrip() {
             request_id: "req-stage-1".into(),
             tokens: vec![42, 43],
             is_finished: true,
+            text: Some("OK".into()),
         });
         peer.send_activations(&tokens).await.unwrap();
         let _ = tail_done_rx.await;
@@ -102,6 +103,7 @@ async fn test_two_stage_head_tail_roundtrip() {
                 assert_eq!(tokens.request_id, "req-stage-1");
                 assert_eq!(tokens.tokens, vec![42, 43]);
                 assert!(tokens.is_finished);
+                assert_eq!(tokens.text.as_deref(), Some("OK"));
 
                 client_peer
                     .send_activations(&PipelineMessage::Tokens(tokens))
@@ -134,6 +136,7 @@ async fn test_two_stage_head_tail_roundtrip() {
             assert_eq!(tokens.request_id, "req-stage-1");
             assert_eq!(tokens.tokens, vec![42, 43]);
             assert!(tokens.is_finished);
+            assert_eq!(tokens.text.as_deref(), Some("OK"));
         }
         other => panic!("expected Tokens from head, got {other:?}"),
     }
