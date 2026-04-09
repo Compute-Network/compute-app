@@ -5,7 +5,7 @@ use compute_network::transport::node::TransportNode;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -208,7 +208,7 @@ pub async fn start_stage_prototype(
         .as_deref()
         .and_then(|addr| addr.parse::<SocketAddr>().ok());
 
-    let engine = Arc::new(tokio::sync::Mutex::new(engine));
+    let engine = Arc::new(Mutex::new(engine));
     let (request_tx, mut request_rx) = mpsc::channel::<StagePrototypeCommand>(8);
     let client = StagePrototypeClient {
         spec: spec.clone(),
@@ -217,20 +217,7 @@ pub async fn start_stage_prototype(
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let spec_for_task = spec.clone();
     let task = tokio::spawn(async move {
-        let mut downstream = if let Some(addr) = downstream_addr {
-            match transport.connect(addr).await {
-                Ok(peer) => {
-                                info!("[stage] Connected to downstream peer at {}", addr);
-                    Some(peer)
-                }
-                Err(err) => {
-                    warn!("[stage] Failed to connect to downstream peer {}: {err}", addr);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let downstream = Arc::new(Mutex::new(None::<compute_network::transport::node::PeerConnection>));
 
         loop {
             tokio::select! {
@@ -245,7 +232,8 @@ pub async fn start_stage_prototype(
                                 &transport,
                                 &engine,
                                 &spec_for_task,
-                                downstream.as_ref(),
+                                &downstream,
+                                downstream_addr,
                                 request_id,
                                 prompt,
                                 max_tokens,
@@ -290,7 +278,8 @@ pub async fn start_stage_prototype(
 
                                         match result {
                                             Ok(ForwardResult::Activations(output)) => {
-                                                if let Some(ref downstream_peer) = downstream {
+                                                let downstream_guard = downstream.lock().await;
+                                                if let Some(ref downstream_peer) = *downstream_guard {
                                                     info!(
                                                         "[stage] Forwarding activations for request {} downstream to {}",
                                                         output.request_id,
@@ -368,7 +357,7 @@ pub async fn start_stage_prototype(
             }
         }
 
-        if let Some(peer) = downstream.take() {
+        if let Some(peer) = downstream.lock().await.take() {
             peer.close();
         }
 
@@ -391,9 +380,10 @@ pub async fn start_stage_prototype(
 
 async fn handle_local_completion_command(
     transport: &TransportNode,
-    engine: &Arc<tokio::sync::Mutex<StageExecutionBackend>>,
+    engine: &Arc<Mutex<StageExecutionBackend>>,
     spec: &StagePrototypeSpec,
-    downstream: Option<&compute_network::transport::node::PeerConnection>,
+    downstream: &Arc<Mutex<Option<compute_network::transport::node::PeerConnection>>>,
+    downstream_addr: Option<SocketAddr>,
     request_id: String,
     prompt: String,
     max_tokens: Option<u32>,
@@ -405,7 +395,7 @@ async fn handle_local_completion_command(
     info!(
         "[stage] Head begin request {} downstream_present={} prompt_len={} max_tokens={:?}",
         request_id,
-        downstream.is_some(),
+        downstream.lock().await.is_some(),
         prompt.len(),
         max_tokens
     );
@@ -461,44 +451,57 @@ async fn handle_local_completion_command(
         }
     };
 
-    let downstream = downstream.ok_or_else(|| anyhow::anyhow!("No downstream peer configured for head stage"))?;
+    let mut downstream_guard = ensure_downstream_connection(transport, downstream, downstream_addr).await?;
+    let downstream_peer = downstream_guard
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("No downstream peer configured for head stage"))?;
     info!(
         "[stage] Sending assign/control message for request {} to downstream {}",
         request_id,
-        downstream.remote_addr()
+        downstream_peer.remote_addr()
     );
-    downstream
+    if let Err(err) = downstream_peer
         .send_activations(&PipelineMessage::Control(ControlMessage::AssignLayers {
             model_id: spec.model_name.clone(),
             start_layer: spec.start_layer,
             end_layer: spec.end_layer,
             total_layers: resolve_total_layers(&spec.model_name)?,
         }))
-        .await?;
+        .await
+    {
+        warn!("[stage] Failed to send assign/control to downstream: {err}");
+        *downstream_guard = None;
+        anyhow::bail!("Failed to send assign/control to downstream: {err}");
+    }
     info!(
         "[stage] Sending activation payload for request {} to downstream {}",
         request_id,
-        downstream.remote_addr()
+        downstream_peer.remote_addr()
     );
-    downstream
+    if let Err(err) = downstream_peer
         .send_activations(&PipelineMessage::Activations(activation))
-        .await?;
+        .await
+    {
+        warn!("[stage] Failed to send activations to downstream: {err}");
+        *downstream_guard = None;
+        anyhow::bail!("Failed to send activations to downstream: {err}");
+    }
     info!("[stage] Waiting for downstream tokens for request {}", request_id);
 
     let tokens = loop {
-        match downstream.recv_activations().await? {
-            PipelineMessage::Tokens(tokens) if tokens.request_id == request_id => {
+        match downstream_peer.recv_activations().await {
+            Ok(PipelineMessage::Tokens(tokens)) if tokens.request_id == request_id => {
                 info!(
                     "[stage] Received downstream tokens for request {} count={}",
                     request_id,
                     tokens.tokens.len()
                 );
                 break tokens
-            },
-            PipelineMessage::Control(ControlMessage::Error { message, .. }) => {
+            }
+            Ok(PipelineMessage::Control(ControlMessage::Error { message, .. })) => {
                 anyhow::bail!("Downstream stage error: {message}");
             }
-            other => {
+            Ok(other) => {
                 warn!(
                     "[stage] Ignoring unexpected downstream response while handling {} on {}: {:?}",
                     request_id,
@@ -506,8 +509,14 @@ async fn handle_local_completion_command(
                     other
                 );
             }
+            Err(err) => {
+                warn!("[stage] Downstream receive failed for request {}: {err}", request_id);
+                *downstream_guard = None;
+                anyhow::bail!("Downstream receive failed: {err}");
+            }
         }
     };
+    drop(downstream_guard);
 
     let raw_completion_tokens = tokens.tokens.len() as u32;
     let completion_tokens = max_tokens
@@ -529,6 +538,27 @@ async fn handle_local_completion_command(
         completion_tokens,
         total_tokens: prompt_tokens.len() as u32 + completion_tokens,
     })
+}
+
+async fn ensure_downstream_connection<'a>(
+    transport: &TransportNode,
+    downstream: &'a Arc<Mutex<Option<compute_network::transport::node::PeerConnection>>>,
+    downstream_addr: Option<SocketAddr>,
+) -> Result<tokio::sync::MutexGuard<'a, Option<compute_network::transport::node::PeerConnection>>> {
+    let mut downstream_guard = downstream.lock().await;
+    if downstream_guard.is_some() {
+        return Ok(downstream_guard);
+    }
+
+    let addr = downstream_addr.ok_or_else(|| anyhow::anyhow!("No downstream address configured for head stage"))?;
+    info!("[stage] Connecting to downstream peer {}", addr);
+    let peer = transport
+        .connect(addr)
+        .await
+        .with_context(|| format!("Failed to connect to downstream peer {addr}"))?;
+    info!("[stage] Connected to downstream peer {}", peer.remote_addr());
+    *downstream_guard = Some(peer);
+    Ok(downstream_guard)
 }
 
 fn resolve_total_layers(model_name: &str) -> Result<u32> {
