@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.17"
+version = "0.2.18"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/Compute-Network/compute-app"
@@ -56,6 +56,7 @@ rcgen = "0.13"
 
 # Directories
 dirs = "6"
+if-addrs = "0.13"
 
 # Internal crates
 compute-daemon = { path = "crates/compute-daemon" }

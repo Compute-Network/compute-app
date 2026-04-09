@@ -41,6 +41,7 @@ compute-network = { workspace = true }
 
 # Directories
 dirs = { workspace = true }
+if-addrs = { workspace = true }
 
 # Utilities
 shellexpand = "3"

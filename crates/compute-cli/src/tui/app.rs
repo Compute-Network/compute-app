@@ -1,4 +1,6 @@
 use anyhow::Result;
+use if_addrs::{IfAddr, get_if_addrs};
+use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, UdpSocket};
 use tracing::warn;
 
@@ -173,12 +175,40 @@ fn detect_advertise_ip() -> Option<String> {
     }
 }
 
+fn collect_advertise_ips() -> Vec<String> {
+    let mut hosts = BTreeSet::new();
+
+    if let Ok(ifaces) = get_if_addrs() {
+        for iface in ifaces {
+            let ip = match iface.addr {
+                IfAddr::V4(v4) => v4.ip,
+                IfAddr::V6(_) => continue,
+            };
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+                continue;
+            }
+            if !ip.is_private() {
+                continue;
+            }
+            hosts.insert(ip.to_string());
+        }
+    }
+
+    if hosts.is_empty() {
+        if let Some(ip) = detect_advertise_ip() {
+            hosts.insert(ip);
+        }
+    }
+
+    hosts.into_iter().collect()
+}
+
 fn advertised_host(config: &Config) -> Option<String> {
     let configured = config.network.advertise_host.trim();
     if !configured.is_empty() {
         return Some(configured.to_string());
     }
-    detect_advertise_ip()
+    collect_advertise_ips().into_iter().next()
 }
 
 /// Register the node with the orchestrator. Fires and forgets — non-blocking.

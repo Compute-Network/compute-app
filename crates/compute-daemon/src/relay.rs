@@ -16,6 +16,8 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::stage_runtime::StagePrototypeClient;
+use if_addrs::{IfAddr, get_if_addrs};
+use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, UdpSocket};
 
 #[derive(Serialize)]
@@ -26,6 +28,8 @@ struct IdentifyMessage {
     token: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     advertise_host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    advertise_hosts: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -97,12 +101,40 @@ fn detect_advertise_ip() -> Option<String> {
     }
 }
 
-fn advertised_host_from_config(config: &Config) -> Option<String> {
+fn collect_advertise_hosts() -> Vec<String> {
+    let mut hosts = BTreeSet::new();
+
+    if let Ok(ifaces) = get_if_addrs() {
+        for iface in ifaces {
+            let ip = match iface.addr {
+                IfAddr::V4(v4) => v4.ip,
+                IfAddr::V6(_) => continue,
+            };
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+                continue;
+            }
+            if !ip.is_private() {
+                continue;
+            }
+            hosts.insert(ip.to_string());
+        }
+    }
+
+    if hosts.is_empty() {
+        if let Some(ip) = detect_advertise_ip() {
+            hosts.insert(ip);
+        }
+    }
+
+    hosts.into_iter().collect()
+}
+
+fn advertised_hosts_from_config(config: &Config) -> Vec<String> {
     let configured = config.network.advertise_host.trim();
     if !configured.is_empty() {
-        return Some(configured.to_string());
+        return vec![configured.to_string()];
     }
-    detect_advertise_ip()
+    collect_advertise_hosts()
 }
 
 pub struct RelayClient {
@@ -110,7 +142,7 @@ pub struct RelayClient {
     node_id: String,
     wallet_address: String,
     node_token: String,
-    advertise_host: Option<String>,
+    advertise_hosts: Vec<String>,
     inference_port: u16,
     shutdown: Arc<AtomicBool>,
     last_latency_ms: Arc<AtomicU64>,
@@ -179,7 +211,7 @@ impl RelayClient {
             node_id: config.wallet.node_id.clone(),
             wallet_address: config.wallet.public_address.clone(),
             node_token: config.wallet.node_token.clone(),
-            advertise_host: advertised_host_from_config(config),
+            advertise_hosts: advertised_hosts_from_config(config),
             inference_port: 8090,
             shutdown,
             last_latency_ms: Arc::new(AtomicU64::new(0)),
@@ -260,7 +292,12 @@ impl RelayClient {
             node_id: self.node_id.clone(),
             wallet_address: self.wallet_address.clone(),
             token: self.node_token.clone(),
-            advertise_host: self.advertise_host.clone(),
+            advertise_host: self.advertise_hosts.first().cloned(),
+            advertise_hosts: if self.advertise_hosts.is_empty() {
+                None
+            } else {
+                Some(self.advertise_hosts.clone())
+            },
         };
         write.send(Message::Text(serde_json::to_string(&identify)?)).await?;
 

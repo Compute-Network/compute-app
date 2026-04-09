@@ -43,3 +43,4 @@ sysinfo = { workspace = true }
 
 # Directories
 dirs = { workspace = true }
+if-addrs = { workspace = true }

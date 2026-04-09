@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "compute-cli"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "base64",
@@ -316,6 +316,7 @@ dependencies = [
  "compute-solana",
  "crossterm",
  "dirs",
+ "if-addrs",
  "ratatui",
  "reqwest",
  "serde",
@@ -329,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "compute-daemon"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "bollard",
@@ -337,6 +338,7 @@ dependencies = [
  "compute-network",
  "dirs",
  "futures-util",
+ "if-addrs",
  "libc",
  "reqwest",
  "serde",
@@ -354,7 +356,7 @@ dependencies = [
 
 [[package]]
 name = "compute-network"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "chrono",
@@ -371,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "compute-solana"
-version = "0.2.16"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "serde",
@@ -1018,6 +1020,16 @@ checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b2eeee38fef3aa9b4cc5f1beea8a2444fc00e7377cafae396de3f5c2065e24"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
