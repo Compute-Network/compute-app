@@ -411,44 +411,19 @@ async fn handle_local_completion_command(
         engine.tokenize(&prompt).await?
     };
 
-    let head_result = {
+    let activation = {
         let engine = engine.lock().await;
         engine
             .begin_prompt(request_id.clone(), &prompt, max_tokens, 2048)
             .await?
     };
-
-    let activation = match head_result {
-        ForwardResult::Activations(activation) => ActivationPayload {
-            request_id: activation.request_id,
-            seq_position: activation.seq_position,
-            batch_index: activation.batch_index,
-            shape: activation.shape,
-            data: activation.data,
-            dtype: compute_network::transport::protocol::TensorDtype::Float16,
-        },
-        ForwardResult::Tokens(tokens) => {
-            let raw_completion_tokens = tokens.len() as u32;
-            let completion_tokens = max_tokens
-                .map(|limit| raw_completion_tokens.min(limit))
-                .unwrap_or(raw_completion_tokens);
-            let token_slice = &tokens[..completion_tokens as usize];
-            let content = {
-                let engine = engine.lock().await;
-                engine
-                    .detokenize(&token_slice.iter().map(|t| t.token_id).collect::<Vec<_>>())
-                    .await
-                    .unwrap_or_else(|_| token_slice.iter().map(|t| t.token_text.clone()).collect::<Vec<_>>().join(""))
-            };
-
-            return Ok(StagePrototypeResponse {
-                model_name: spec.model_name.clone(),
-                content,
-                prompt_tokens: prompt_tokens.len() as u32,
-                completion_tokens,
-                total_tokens: prompt_tokens.len() as u32 + completion_tokens,
-            });
-        }
+    let activation = ActivationPayload {
+        request_id: activation.request_id,
+        seq_position: activation.seq_position,
+        batch_index: activation.batch_index,
+        shape: activation.shape,
+        data: activation.data,
+        dtype: compute_network::transport::protocol::TensorDtype::Float16,
     };
 
     let mut downstream_guard = ensure_downstream_connection(transport, downstream, downstream_addr).await?;

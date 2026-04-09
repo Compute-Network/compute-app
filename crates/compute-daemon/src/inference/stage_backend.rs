@@ -82,7 +82,7 @@ impl StageExecutionBackend {
         prompt: &str,
         max_tokens: Option<u32>,
         hidden_dim_hint: usize,
-    ) -> Result<ForwardResult> {
+    ) -> Result<Activation> {
         let token_count = self.tokenize(prompt).await?.len().max(1);
         let ingress = Activation {
             request_id,
@@ -91,7 +91,12 @@ impl StageExecutionBackend {
             seq_position: 0,
             batch_index: 0,
         };
-        self.forward(ingress).await
+        match self.forward(ingress).await? {
+            ForwardResult::Activations(activation) => Ok(activation),
+            ForwardResult::Tokens(_) => anyhow::bail!(
+                "Prompt ingress unexpectedly produced tokens instead of stage activations"
+            ),
+        }
     }
 
     pub async fn continue_forward(&self, input: Activation) -> Result<ForwardResult> {
@@ -559,14 +564,10 @@ mod tests {
             .await
             .unwrap();
 
-        let activation = match backend
+        let activation = backend
             .begin_prompt("req".into(), "hello", Some(16), 2048)
             .await
-            .unwrap()
-        {
-            ForwardResult::Activations(activation) => activation,
-            ForwardResult::Tokens(_) => panic!("expected activation output"),
-        };
+            .unwrap();
 
         let payload = parse_payload(&activation.data).unwrap();
         assert_eq!(payload.kind, StagePayloadKind::HiddenStatesV1);
