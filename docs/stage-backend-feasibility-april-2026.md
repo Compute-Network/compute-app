@@ -41,6 +41,15 @@ So today:
 - stage correctness is not
 - performance numbers from this path would be misleading
 
+As of the latest runtime refactor, the stage wire contract now explicitly separates:
+
+- `PromptV1` for request ingress into the head stage
+- `HiddenStatesV1` for inter-stage payloads
+
+That is an important architectural improvement because the runtime is no longer
+pretending that prompt JSON is itself a hidden-state tensor. It is still not real
+model-stage math, but it is now the correct boundary for a future true-forward backend.
+
 ## Why The Current llama.cpp Path Is Not Enough
 
 Official `llama-server` documentation currently advertises:

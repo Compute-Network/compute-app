@@ -101,12 +101,27 @@ impl StageExecutionBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StagePayloadKind {
+    PromptV1,
+    HiddenStatesV1,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct StagePromptPayload {
-    prompt: String,
+pub(crate) struct StagePayloadEnvelope {
+    kind: StagePayloadKind,
+    #[serde(default)]
+    prompt: Option<String>,
     stages: Vec<String>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    #[serde(default)]
+    hidden_state_bytes: Option<usize>,
+    #[serde(default)]
+    hidden_dim: Option<usize>,
+    #[serde(default)]
+    hidden_state: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -150,9 +165,16 @@ impl PrototypeStageEngine {
             } else {
                 payload.stages.join(" -> ")
             };
+            let hidden_state_summary = payload
+                .hidden_state_bytes
+                .map(|bytes| format!(" hidden={}B", bytes))
+                .unwrap_or_default();
             let content = format!(
-                "Prototype stage completion for {}: {} [stages: {}]",
-                config.model_id, payload.prompt, stage_summary
+                "Prototype stage completion for {}: {} [stages: {}{}]",
+                config.model_id,
+                payload.prompt.clone().unwrap_or_default(),
+                stage_summary,
+                hidden_state_summary
             );
             let tokens = content
                 .as_bytes()
@@ -170,28 +192,43 @@ impl PrototypeStageEngine {
         }
 
         let mut payload = if input.data.is_empty() {
-            StagePromptPayload {
-                prompt: String::new(),
+            StagePayloadEnvelope {
+                kind: StagePayloadKind::PromptV1,
+                prompt: Some(String::new()),
                 stages: Vec::new(),
                 max_tokens: None,
+                hidden_state_bytes: None,
+                hidden_dim: None,
+                hidden_state: Vec::new(),
             }
         } else if let Ok(existing) = parse_payload(&input.data) {
             existing
         } else {
-            StagePromptPayload {
-                prompt: String::from_utf8_lossy(&input.data).to_string(),
+            StagePayloadEnvelope {
+                kind: StagePayloadKind::PromptV1,
+                prompt: Some(String::from_utf8_lossy(&input.data).to_string()),
                 stages: Vec::new(),
                 max_tokens: None,
+                hidden_state_bytes: None,
+                hidden_dim: None,
+                hidden_state: Vec::new(),
             }
         };
 
-        payload
-            .stages
-            .push(format!("{}-{}", config.start_layer, config.end_layer));
+        let stage_span = format!("{}-{}", config.start_layer, config.end_layer);
+        payload.stages.push(stage_span.clone());
+        let prompt_seed = payload.prompt.clone().unwrap_or_default();
+        let hidden_dim = payload.hidden_dim.unwrap_or_else(|| input.shape.last().copied().unwrap_or(256));
+        let previous_hidden = std::mem::take(&mut payload.hidden_state);
+        let hidden_state = synthesize_hidden_state_bytes(&prompt_seed, &stage_span, &previous_hidden, hidden_dim);
+        payload.kind = StagePayloadKind::HiddenStatesV1;
+        payload.hidden_state_bytes = Some(hidden_state.len());
+        payload.hidden_dim = Some(hidden_dim);
+        payload.hidden_state = hidden_state;
 
         Ok(ForwardResult::Activations(Activation {
             request_id: input.request_id,
-            shape: input.shape,
+            shape: vec![1, 1, hidden_dim],
             data: serde_json::to_vec(&payload)?,
             seq_position: input.seq_position,
             batch_index: input.batch_index,
@@ -200,21 +237,73 @@ impl PrototypeStageEngine {
 }
 
 pub fn encode_stage_prompt(prompt: &str, max_tokens: Option<u32>) -> Result<Vec<u8>> {
-    Ok(serde_json::to_vec(&StagePromptPayload {
-        prompt: prompt.to_string(),
+    Ok(serde_json::to_vec(&StagePayloadEnvelope {
+        kind: StagePayloadKind::PromptV1,
+        prompt: Some(prompt.to_string()),
         stages: Vec::new(),
         max_tokens,
+        hidden_state_bytes: None,
+        hidden_dim: None,
+        hidden_state: Vec::new(),
     })?)
 }
 
-fn parse_payload(data: &[u8]) -> Result<StagePromptPayload> {
+pub fn encode_stage_hidden_state_stub(
+    stages: Vec<String>,
+    max_tokens: Option<u32>,
+    hidden_state_bytes: usize,
+    hidden_dim: usize,
+) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&StagePayloadEnvelope {
+        kind: StagePayloadKind::HiddenStatesV1,
+        prompt: None,
+        stages,
+        max_tokens,
+        hidden_state_bytes: Some(hidden_state_bytes),
+        hidden_dim: Some(hidden_dim),
+        hidden_state: vec![0; hidden_state_bytes],
+    })?)
+}
+
+fn parse_payload(data: &[u8]) -> Result<StagePayloadEnvelope> {
     serde_json::from_slice(data).or_else(|_| {
-        Ok(StagePromptPayload {
-            prompt: String::from_utf8_lossy(data).to_string(),
+        Ok(StagePayloadEnvelope {
+            kind: StagePayloadKind::PromptV1,
+            prompt: Some(String::from_utf8_lossy(data).to_string()),
             stages: Vec::new(),
             max_tokens: None,
+            hidden_state_bytes: None,
+            hidden_dim: None,
+            hidden_state: Vec::new(),
         })
     })
+}
+
+fn synthesize_hidden_state_bytes(
+    prompt: &str,
+    stage_span: &str,
+    previous_hidden: &[u8],
+    hidden_dim: usize,
+) -> Vec<u8> {
+    let seed = if previous_hidden.is_empty() {
+        let mut seed = prompt.as_bytes().to_vec();
+        seed.extend_from_slice(stage_span.as_bytes());
+        if seed.is_empty() {
+            seed.extend_from_slice(b"compute-stage-forward");
+        }
+        seed
+    } else {
+        previous_hidden.to_vec()
+    };
+
+    let width = hidden_dim.max(64).min(4096);
+    let mut output = Vec::with_capacity(width);
+    for idx in 0..width {
+        let base = seed[idx % seed.len()];
+        let stage = stage_span.as_bytes()[idx % stage_span.len()];
+        output.push(base.wrapping_add(stage).wrapping_add((idx % 251) as u8));
+    }
+    output
 }
 
 pub struct TailLlamaStageEngine {
@@ -266,9 +355,21 @@ impl TailLlamaStageEngine {
         }
 
         let payload = parse_payload(&input.data)?;
+        let prompt = payload
+            .prompt
+            .clone()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| {
+                format!(
+                    "Hidden-state stage payload for {} ({} bytes across {})",
+                    config.model_id,
+                    payload.hidden_state_bytes.unwrap_or(payload.hidden_state.len()),
+                    payload.stages.join(" -> ")
+                )
+            });
         let content = self
             .tail
-            .generate_completion_text(&payload.prompt, payload.max_tokens)
+            .generate_completion_text(&prompt, payload.max_tokens)
             .await?;
         let tokens = content
             .as_bytes()
@@ -329,8 +430,12 @@ mod tests {
         };
 
         let payload = parse_payload(&forwarded.data).unwrap();
-        assert_eq!(payload.prompt, "hello");
+        assert_eq!(payload.prompt.as_deref(), Some("hello"));
         assert_eq!(payload.stages, vec!["0-13"]);
+        assert_eq!(payload.kind, StagePayloadKind::HiddenStatesV1);
+        assert_eq!(payload.hidden_dim, Some(2048));
+        assert_eq!(payload.hidden_state_bytes, Some(2048));
+        assert_eq!(payload.hidden_state.len(), 2048);
     }
 
     #[tokio::test]
@@ -349,10 +454,14 @@ mod tests {
         })
         .unwrap();
 
-        let payload = StagePromptPayload {
-            prompt: "hello".into(),
+        let payload = StagePayloadEnvelope {
+            kind: StagePayloadKind::PromptV1,
+            prompt: Some("hello".into()),
             stages: vec!["0-13".into(), "14-27".into()],
             max_tokens: Some(32),
+            hidden_state_bytes: None,
+            hidden_dim: None,
+            hidden_state: Vec::new(),
         };
         let activation = Activation {
             request_id: "req".into(),
@@ -373,5 +482,17 @@ mod tests {
         assert!(text.contains("Prototype stage completion"));
         assert!(text.contains("hello"));
         assert!(text.contains("0-13 -> 14-27"));
+    }
+
+    #[test]
+    fn hidden_state_stub_records_size_and_dim() {
+        let payload = parse_payload(
+            &encode_stage_hidden_state_stub(vec!["0-13".into()], Some(16), 512, 256).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload.kind, StagePayloadKind::HiddenStatesV1);
+        assert_eq!(payload.hidden_state_bytes, Some(512));
+        assert_eq!(payload.hidden_dim, Some(256));
+        assert_eq!(payload.hidden_state.len(), 512);
     }
 }

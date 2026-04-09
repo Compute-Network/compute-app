@@ -252,3 +252,5 @@ The prototype is successful if it proves all of the following:
 - The daemon relay can now send experimental non-streaming requests into the head-stage prototype path.
 - Streaming remains unsupported for stage mode and should fail explicitly until token streaming is implemented through the transport path.
 - Stage execution is now isolated behind a dedicated backend module so the prototype can swap away from the current llama.cpp placeholder path without rewriting transport/runtime code.
+- The stage payload contract now distinguishes request ingress (`PromptV1`) from inter-stage traffic (`HiddenStatesV1`), so the head stage no longer forwards prompt-shaped JSON as if it were a hidden-state tensor.
+- The current hidden-state contract is still a stubbed envelope, not true model activations, but it gives the runtime a real stage-forward boundary to build on.
