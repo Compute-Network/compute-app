@@ -893,6 +893,42 @@ fn extract_request_prompt(body: &serde_json::Value) -> String {
     }
 
     if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
+        for message in messages.iter().rev() {
+            let role = message
+                .get("role")
+                .and_then(|value| value.as_str())
+                .unwrap_or("user");
+            if role != "user" {
+                continue;
+            }
+
+            if let Some(content) = message.get("content") {
+                if let Some(text) = content.as_str() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_string();
+                    }
+                } else if let Some(parts) = content.as_array() {
+                    let text = parts
+                        .iter()
+                        .filter_map(|part| {
+                            if part.get("type").and_then(|value| value.as_str()) == Some("text") {
+                                part.get("text").and_then(|value| value.as_str()).map(str::to_string)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .trim()
+                        .to_string();
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+            }
+        }
+
         let combined = messages
             .iter()
             .filter_map(|message| {
@@ -954,10 +990,7 @@ mod tests {
                 {"role": "user", "content": "Say hi"}
             ]
         });
-        assert_eq!(
-            extract_request_prompt(&body),
-            "system: You are terse.\nuser: Say hi"
-        );
+        assert_eq!(extract_request_prompt(&body), "Say hi");
     }
 
     #[test]
@@ -974,6 +1007,18 @@ mod tests {
                 }
             ]
         });
-        assert_eq!(extract_request_prompt(&body), "user: Part one Part two");
+        assert_eq!(extract_request_prompt(&body), "Part one Part two");
+    }
+
+    #[test]
+    fn extract_request_prompt_prefers_last_user_message() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "First request"},
+                {"role": "assistant", "content": "Interim answer"},
+                {"role": "user", "content": "Second request"}
+            ]
+        });
+        assert_eq!(extract_request_prompt(&body), "Second request");
     }
 }
