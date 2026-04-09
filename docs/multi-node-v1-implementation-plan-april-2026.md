@@ -254,3 +254,4 @@ The prototype is successful if it proves all of the following:
 - Stage execution is now isolated behind a dedicated backend module so the prototype can swap away from the current llama.cpp placeholder path without rewriting transport/runtime code.
 - The stage payload contract now distinguishes request ingress (`PromptV1`) from inter-stage traffic (`HiddenStatesV1`), so the head stage no longer forwards prompt-shaped JSON as if it were a hidden-state tensor.
 - The current hidden-state contract is still a stubbed envelope, not true model activations, but it gives the runtime a real stage-forward boundary to build on.
+- Stage backends now validate that only the head stage accepts `PromptV1` ingress and that downstream stages receive `HiddenStatesV1`, which removes another class of hybrid-path ambiguity.

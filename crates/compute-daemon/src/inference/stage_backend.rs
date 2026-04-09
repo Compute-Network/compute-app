@@ -124,6 +124,12 @@ pub(crate) struct StagePayloadEnvelope {
     hidden_state: Vec<u8>,
 }
 
+impl StagePayloadEnvelope {
+    fn hidden_state_len(&self) -> usize {
+        self.hidden_state_bytes.unwrap_or(self.hidden_state.len())
+    }
+}
+
 #[derive(Default)]
 pub struct PrototypeStageEngine {
     shard_config: Option<ShardConfig>,
@@ -158,39 +164,7 @@ impl PrototypeStageEngine {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Prototype stage backend has no shard loaded"))?;
 
-        if config.is_last_stage {
-            let payload = parse_payload(&input.data)?;
-            let stage_summary = if payload.stages.is_empty() {
-                "none".to_string()
-            } else {
-                payload.stages.join(" -> ")
-            };
-            let hidden_state_summary = payload
-                .hidden_state_bytes
-                .map(|bytes| format!(" hidden={}B", bytes))
-                .unwrap_or_default();
-            let content = format!(
-                "Prototype stage completion for {}: {} [stages: {}{}]",
-                config.model_id,
-                payload.prompt.clone().unwrap_or_default(),
-                stage_summary,
-                hidden_state_summary
-            );
-            let tokens = content
-                .as_bytes()
-                .iter()
-                .enumerate()
-                .map(|(idx, byte)| GeneratedToken {
-                    request_id: input.request_id.clone(),
-                    token_id: *byte as u32,
-                    token_text: (*byte as char).to_string(),
-                    is_finished: idx + 1 == content.len(),
-                    logprob: None,
-                })
-                .collect::<Vec<_>>();
-            return Ok(ForwardResult::Tokens(tokens));
-        }
-
+        let expected_prompt_ingress = config.is_first_stage;
         let mut payload = if input.data.is_empty() {
             StagePayloadEnvelope {
                 kind: StagePayloadKind::PromptV1,
@@ -214,6 +188,48 @@ impl PrototypeStageEngine {
                 hidden_state: Vec::new(),
             }
         };
+
+        if expected_prompt_ingress && payload.kind != StagePayloadKind::PromptV1 {
+            anyhow::bail!(
+                "First stage expected PromptV1 ingress payload, got {:?}",
+                payload.kind
+            );
+        }
+        if !expected_prompt_ingress && payload.kind != StagePayloadKind::HiddenStatesV1 {
+            anyhow::bail!(
+                "Non-head stage expected HiddenStatesV1 payload, got {:?}",
+                payload.kind
+            );
+        }
+
+        if config.is_last_stage {
+            let stage_summary = if payload.stages.is_empty() {
+                "none".to_string()
+            } else {
+                payload.stages.join(" -> ")
+            };
+            let hidden_state_summary = format!(" hidden={}B", payload.hidden_state_len());
+            let content = format!(
+                "Prototype stage completion for {}: {} [stages: {}{}]",
+                config.model_id,
+                payload.prompt.clone().unwrap_or_default(),
+                stage_summary,
+                hidden_state_summary
+            );
+            let tokens = content
+                .as_bytes()
+                .iter()
+                .enumerate()
+                .map(|(idx, byte)| GeneratedToken {
+                    request_id: input.request_id.clone(),
+                    token_id: *byte as u32,
+                    token_text: (*byte as char).to_string(),
+                    is_finished: idx + 1 == content.len(),
+                    logprob: None,
+                })
+                .collect::<Vec<_>>();
+            return Ok(ForwardResult::Tokens(tokens));
+        }
 
         let stage_span = format!("{}-{}", config.start_layer, config.end_layer);
         payload.stages.push(stage_span.clone());
@@ -355,6 +371,12 @@ impl TailLlamaStageEngine {
         }
 
         let payload = parse_payload(&input.data)?;
+        if payload.kind != StagePayloadKind::HiddenStatesV1 {
+            anyhow::bail!(
+                "TailLlama tail stage expected HiddenStatesV1 payload, got {:?}",
+                payload.kind
+            );
+        }
         let prompt = payload
             .prompt
             .clone()
@@ -363,7 +385,7 @@ impl TailLlamaStageEngine {
                 format!(
                     "Hidden-state stage payload for {} ({} bytes across {})",
                     config.model_id,
-                    payload.hidden_state_bytes.unwrap_or(payload.hidden_state.len()),
+                    payload.hidden_state_len(),
                     payload.stages.join(" -> ")
                 )
             });
@@ -455,13 +477,13 @@ mod tests {
         .unwrap();
 
         let payload = StagePayloadEnvelope {
-            kind: StagePayloadKind::PromptV1,
+            kind: StagePayloadKind::HiddenStatesV1,
             prompt: Some("hello".into()),
             stages: vec!["0-13".into(), "14-27".into()],
             max_tokens: Some(32),
-            hidden_state_bytes: None,
-            hidden_dim: None,
-            hidden_state: Vec::new(),
+            hidden_state_bytes: Some(2048),
+            hidden_dim: Some(2048),
+            hidden_state: vec![7; 2048],
         };
         let activation = Activation {
             request_id: "req".into(),
@@ -494,5 +516,33 @@ mod tests {
         assert_eq!(payload.hidden_state_bytes, Some(512));
         assert_eq!(payload.hidden_dim, Some(256));
         assert_eq!(payload.hidden_state.len(), 512);
+    }
+
+    #[tokio::test]
+    async fn non_head_stage_rejects_prompt_payloads() {
+        let mut middle = PrototypeStageEngine::default();
+        middle.load_shard(&ShardConfig {
+            model_id: "gemma-4-e4b-q4".into(),
+            shard_path: "ignored".into(),
+            start_layer: 14,
+            end_layer: 20,
+            total_layers: 28,
+            is_first_stage: false,
+            is_last_stage: false,
+            max_batch_size: 2048,
+            context_length: 8192,
+        })
+        .unwrap();
+
+        let activation = Activation {
+            request_id: "req".into(),
+            shape: vec![1, 1, 2048],
+            data: encode_stage_prompt("hello", Some(16)).unwrap(),
+            seq_position: 0,
+            batch_index: 0,
+        };
+
+        let err = middle.forward(activation).unwrap_err().to_string();
+        assert!(err.contains("expected HiddenStatesV1"));
     }
 }
