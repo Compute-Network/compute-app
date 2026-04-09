@@ -255,3 +255,4 @@ The prototype is successful if it proves all of the following:
 - The stage payload contract now distinguishes request ingress (`PromptV1`) from inter-stage traffic (`HiddenStatesV1`), so the head stage no longer forwards prompt-shaped JSON as if it were a hidden-state tensor.
 - The current hidden-state contract is still a stubbed envelope, not true model activations, but it gives the runtime a real stage-forward boundary to build on.
 - Stage backends now validate that only the head stage accepts `PromptV1` ingress and that downstream stages receive `HiddenStatesV1`, which removes another class of hybrid-path ambiguity.
+- The `llamacpp` stage backend is now intentionally blocked in runtime startup until a real hidden-state forward path exists, so the codebase no longer implies that true stage-forward inference is already available there.

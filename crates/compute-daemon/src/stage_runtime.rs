@@ -12,7 +12,7 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::hardware::HardwareInfo;
 use crate::inference::engine::{Activation, ForwardResult, ShardConfig as EngineShardConfig};
-use crate::inference::stage_backend::{StageBackendKind, StageExecutionBackend, encode_stage_prompt};
+use crate::inference::stage_backend::{StageBackendKind, StageExecutionBackend};
 
 const STAGE_RUNTIME_LISTEN_PORT: u16 = 9090;
 
@@ -152,6 +152,11 @@ pub async fn start_stage_prototype(
     let total_layers = resolve_total_layers(&spec.model_name)?;
 
     let stage_backend = StageBackendKind::parse(&config.experimental.stage_backend);
+    if matches!(stage_backend, StageBackendKind::LlamaCpp) {
+        anyhow::bail!(
+            "Stage backend `llamacpp` is reserved for true hidden-state forward work and is not ready yet; use `prototype` or `tail-llama`"
+        );
+    }
     let mut engine = StageExecutionBackend::new_for_hardware(hw, stage_backend);
     let shard_path = match stage_backend {
         StageBackendKind::Prototype => std::path::PathBuf::from(format!(
@@ -273,7 +278,7 @@ pub async fn start_stage_prototype(
 
                                         let result = {
                                             let engine = engine.lock().await;
-                                            engine.forward(input).await
+                                            engine.continue_forward(input).await
                                         };
 
                                         match result {
@@ -406,17 +411,11 @@ async fn handle_local_completion_command(
         engine.tokenize(&prompt).await?
     };
 
-    let initial_input = Activation {
-        request_id: request_id.clone(),
-        shape: vec![1, prompt_tokens.len().max(1), 2048],
-        data: encode_stage_prompt(&prompt, max_tokens)?,
-        seq_position: 0,
-        batch_index: 0,
-    };
-
     let head_result = {
         let engine = engine.lock().await;
-        engine.forward(initial_input).await?
+        engine
+            .begin_prompt(request_id.clone(), &prompt, max_tokens, 2048)
+            .await?
     };
 
     let activation = match head_result {

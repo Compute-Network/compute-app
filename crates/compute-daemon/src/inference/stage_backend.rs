@@ -76,6 +76,28 @@ impl StageExecutionBackend {
         }
     }
 
+    pub async fn begin_prompt(
+        &self,
+        request_id: String,
+        prompt: &str,
+        max_tokens: Option<u32>,
+        hidden_dim_hint: usize,
+    ) -> Result<ForwardResult> {
+        let token_count = self.tokenize(prompt).await?.len().max(1);
+        let ingress = Activation {
+            request_id,
+            shape: vec![1, token_count, hidden_dim_hint.max(1)],
+            data: encode_stage_prompt(prompt, max_tokens)?,
+            seq_position: 0,
+            batch_index: 0,
+        };
+        self.forward(ingress).await
+    }
+
+    pub async fn continue_forward(&self, input: Activation) -> Result<ForwardResult> {
+        self.forward(input).await
+    }
+
     pub async fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         match self {
             Self::Prototype(engine) => engine.tokenize(text),
@@ -516,6 +538,39 @@ mod tests {
         assert_eq!(payload.hidden_state_bytes, Some(512));
         assert_eq!(payload.hidden_dim, Some(256));
         assert_eq!(payload.hidden_state.len(), 512);
+    }
+
+    #[tokio::test]
+    async fn begin_prompt_creates_hidden_state_payload() {
+        let hw = crate::hardware::detect();
+        let mut backend = StageExecutionBackend::new_for_hardware(&hw, StageBackendKind::Prototype);
+        backend
+            .load_shard(&ShardConfig {
+                model_id: "gemma-4-e4b-q4".into(),
+                shard_path: "ignored".into(),
+                start_layer: 0,
+                end_layer: 13,
+                total_layers: 28,
+                is_first_stage: true,
+                is_last_stage: false,
+                max_batch_size: 2048,
+                context_length: 8192,
+            })
+            .await
+            .unwrap();
+
+        let activation = match backend
+            .begin_prompt("req".into(), "hello", Some(16), 2048)
+            .await
+            .unwrap()
+        {
+            ForwardResult::Activations(activation) => activation,
+            ForwardResult::Tokens(_) => panic!("expected activation output"),
+        };
+
+        let payload = parse_payload(&activation.data).unwrap();
+        assert_eq!(payload.kind, StagePayloadKind::HiddenStatesV1);
+        assert_eq!(payload.prompt.as_deref(), Some("hello"));
     }
 
     #[tokio::test]
