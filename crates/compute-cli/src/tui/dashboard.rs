@@ -64,12 +64,50 @@ fn model_entries() -> Vec<ModelEntry> {
             gguf_filename: "Qwen3.5-27B-UD-Q4_K_XL.gguf",
             hf_url: "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-UD-Q4_K_XL.gguf",
         },
+        ModelEntry {
+            id: "gemma-4-e4b-q4-stage-head",
+            label: "Gemma4 Stage 0-20 — 3.4GB (head)",
+            desc: "Pipeline head · layers 0-20",
+            gguf_filename: "packed-stage-0-20.tar",
+            hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-stages/resolve/main/packed-stage-0-20.tar",
+        },
+        ModelEntry {
+            id: "gemma-4-e4b-q4-stage-tail",
+            label: "Gemma4 Stage 21-41 — 3.4GB (tail)",
+            desc: "Pipeline tail · layers 21-41",
+            gguf_filename: "packed-stage-21-41.tar",
+            hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-stages/resolve/main/packed-stage-21-41.tar",
+        },
     ]
+}
+
+fn is_stage_entry(model_id: &str) -> bool {
+    model_id.contains("-stage-head") || model_id.contains("-stage-tail")
+}
+
+fn stage_extract_dir(filename: &str) -> std::path::PathBuf {
+    let stem = filename.trim_end_matches(".tar");
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".compute")
+        .join("stages")
+        .join("gemma-4-e4b-q4")
+        .join(stem)
 }
 
 fn is_model_downloaded(model_id: &str) -> bool {
     if model_id == "auto" {
         return true;
+    }
+    // Stage artifacts: check for extracted directory with index file
+    if is_stage_entry(model_id) {
+        for entry in model_entries() {
+            if entry.id == model_id && !entry.gguf_filename.is_empty() {
+                let dir = stage_extract_dir(entry.gguf_filename);
+                return dir.is_dir() && dir.join(".done").exists();
+            }
+        }
+        return false;
     }
     let cache_dir = dirs::home_dir()
         .unwrap_or_default()
@@ -1291,15 +1329,26 @@ impl Dashboard {
         let url = entry.hf_url.to_string();
         let filename = entry.gguf_filename.to_string();
         let model_id = entry.id.to_string();
+        let is_stage = is_stage_entry(entry.id);
 
         std::thread::spawn(move || {
-            let cache_dir = dirs::home_dir()
-                .unwrap_or_default()
-                .join(".compute")
-                .join("models");
-            let _ = std::fs::create_dir_all(&cache_dir);
-            let dest = cache_dir.join(&filename);
-            let tmp = dest.with_extension("tmp");
+            let (cache_dir, dest, tmp) = if is_stage {
+                let dir = stage_extract_dir(&filename);
+                let parent = dir.parent().unwrap_or(&dir).to_path_buf();
+                let _ = std::fs::create_dir_all(&parent);
+                let dest = parent.join(&filename);
+                let tmp = dest.with_extension("tmp");
+                (parent, dest, tmp)
+            } else {
+                let dir = dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".compute")
+                    .join("models");
+                let _ = std::fs::create_dir_all(&dir);
+                let dest = dir.join(&filename);
+                let tmp = dest.with_extension("tmp");
+                (dir, dest, tmp)
+            };
 
             let client = match reqwest::blocking::Client::builder()
                 .timeout(std::time::Duration::from_secs(7200))
@@ -1462,26 +1511,47 @@ impl Dashboard {
                 }
             }
 
-            // Verify GGUF magic header
-            {
-                use std::io::Read;
-                if let Ok(mut f) = std::fs::File::open(&tmp) {
-                    let mut magic = [0u8; 4];
-                    if f.read_exact(&mut magic).is_err() || magic != [0x47, 0x47, 0x55, 0x46] {
-                        let _ = std::fs::remove_file(&tmp);
+            if is_stage {
+                // Extract tar to stage directory
+                let extract_dir = stage_extract_dir(&filename);
+                let _ = std::fs::create_dir_all(&extract_dir);
+                let status = std::process::Command::new("tar")
+                    .arg("xf")
+                    .arg(&tmp)
+                    .arg("-C")
+                    .arg(&extract_dir)
+                    .status();
+                let _ = std::fs::remove_file(&tmp);
+                match status {
+                    Ok(s) if s.success() => {
+                        // Write .done marker
+                        let _ = std::fs::write(extract_dir.join(".done"), "");
+                        let _ = tx.send((model_id.clone(), 1.0));
+                    }
+                    _ => {
                         let _ = tx.send((model_id, -1.0));
                         return;
                     }
                 }
+            } else {
+                // Verify GGUF magic header
+                {
+                    use std::io::Read;
+                    if let Ok(mut f) = std::fs::File::open(&tmp) {
+                        let mut magic = [0u8; 4];
+                        if f.read_exact(&mut magic).is_err() || magic != [0x47, 0x47, 0x55, 0x46] {
+                            let _ = std::fs::remove_file(&tmp);
+                            let _ = tx.send((model_id, -1.0));
+                            return;
+                        }
+                    }
+                }
+                let _ = std::fs::rename(&tmp, &dest);
+                let _ = tx.send((model_id.clone(), 1.0));
+                let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+                config.models.active_model = model_id;
+                let _ = config.save();
             }
-
-            let _ = std::fs::rename(&tmp, &dest);
-
-            // Done — auto-activate
-            let _ = tx.send((model_id.clone(), 1.0));
-            let mut config = compute_daemon::config::Config::load().unwrap_or_default();
-            config.models.active_model = model_id;
-            let _ = config.save();
         });
     }
 
