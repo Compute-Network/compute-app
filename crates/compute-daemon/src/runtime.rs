@@ -136,7 +136,7 @@ impl DaemonRuntime {
 
         let stage_backend_kind = StageBackendKind::parse(&self.config.experimental.stage_backend);
         let prototype_stage_mode = self.config.experimental.stage_mode_enabled
-            && matches!(stage_backend_kind, StageBackendKind::Prototype | StageBackendKind::TailLlama);
+            && matches!(stage_backend_kind, StageBackendKind::Prototype | StageBackendKind::TailLlama | StageBackendKind::RealForward);
 
         // Pre-warm: start llama-server during splash so the model is ready for the first request.
         // Skip entirely for prototype stage mode, which does not use local llama-server.
@@ -268,6 +268,36 @@ impl DaemonRuntime {
                                 warn!("[stage] Ignoring stage assignment without explicit layer bounds");
                                 continue;
                             };
+
+                            if let Some(ref url) = assignment.artifact_url {
+                                if !crate::inference::stage_artifacts::is_stage_cached(
+                                    &assignment.model_name,
+                                    start_layer as u32,
+                                    end_layer as u32,
+                                ) {
+                                    info!("[stage] Downloading packed stage artifacts...");
+                                    match crate::inference::stage_artifacts::ensure_stage_artifacts(
+                                        &assignment.model_name,
+                                        start_layer as u32,
+                                        end_layer as u32,
+                                        url,
+                                        assignment.artifact_sha256.as_deref(),
+                                        assignment.artifact_size_bytes,
+                                    ).await {
+                                        Ok(path) => info!("[stage] Artifacts ready at {}", path.display()),
+                                        Err(e) => {
+                                            warn!("[stage] Failed to download stage artifacts: {e}");
+                                            let msg = serde_json::json!({
+                                                "type": "node_error",
+                                                "model_name": assignment.model_name,
+                                                "error": format!("stage artifact download failed: {e}"),
+                                            }).to_string();
+                                            let _ = ws_outbound_tx.send(msg).await;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
 
                             let spec = StagePrototypeSpec {
                                 pipeline_id: assignment.pipeline_id.clone(),
@@ -804,6 +834,11 @@ impl DaemonRuntime {
                 gpu_vram_free_mb: vram_free,
                 ip_address: advertised_host(&self.config),
                 last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
+                stage_backend_kind: if self.config.experimental.stage_mode_enabled {
+                    Some(StageBackendKind::parse(&self.config.experimental.stage_backend).as_str().to_string())
+                } else {
+                    None
+                },
             };
 
             let client = compute_network::client::OrchestratorClient::new(

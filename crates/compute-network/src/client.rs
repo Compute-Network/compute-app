@@ -66,6 +66,8 @@ pub struct HeartbeatPayload {
     pub ip_address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_heartbeat: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_backend_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +87,12 @@ pub struct PipelineAssignment {
     pub downstream_addr: Option<String>,
     pub stage_index: u32,
     pub total_stages: u32,
+    #[serde(default)]
+    pub artifact_url: Option<String>,
+    #[serde(default)]
+    pub artifact_sha256: Option<String>,
+    #[serde(default)]
+    pub artifact_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -38,6 +38,7 @@ chrono = "0.4"
 
 # Internal crates
 compute-network = { workspace = true }
+stage-forward-lab = { workspace = true }
 
 # Directories
 dirs = { workspace = true }

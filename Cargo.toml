@@ -4,6 +4,7 @@ members = [
     "crates/compute-daemon",
     "crates/compute-network",
     "crates/compute-solana",
+    "crates/stage-forward-lab",
 ]
 resolver = "2"
 
@@ -62,6 +63,7 @@ if-addrs = "0.13"
 compute-daemon = { path = "crates/compute-daemon" }
 compute-network = { path = "crates/compute-network" }
 compute-solana = { path = "crates/compute-solana" }
+stage-forward-lab = { path = "crates/stage-forward-lab" }
 
 [profile.release]
 lto = true

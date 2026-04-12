@@ -1025,6 +1025,7 @@ impl Dashboard {
             "experimental.stage_backend" => match config.experimental.stage_backend.as_str() {
                 "llamacpp" => "LlamaCpp".into(),
                 "tail-llama" => "TailLlama".into(),
+                "real_forward" | "real-forward" => "RealForward".into(),
                 _ => "Prototype".into(),
             },
             "logging.level" => config.logging.level.clone(),
@@ -1097,6 +1098,7 @@ impl Dashboard {
                         config.experimental.stage_backend = match config.experimental.stage_backend.as_str() {
                             "prototype" => "tail-llama".into(),
                             "tail-llama" => "llamacpp".into(),
+                            "llamacpp" => "real_forward".into(),
                             _ => "prototype".into(),
                         };
                     }

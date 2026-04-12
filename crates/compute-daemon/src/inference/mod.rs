@@ -14,5 +14,6 @@ pub mod engine;
 pub mod llamacpp;
 pub mod manager;
 pub mod shard;
+pub mod stage_artifacts;
 pub mod stage_backend;
 pub mod throttle;

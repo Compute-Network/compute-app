@@ -103,12 +103,12 @@ impl ModelCatalog {
                     id: "gemma-4-e4b-q4".into(),
                     name: "Gemma 4 E4B (Q4)".into(),
                     family: ModelFamily::Other("Gemma".into()),
-                    total_layers: 28,
+                    total_layers: 42,
                     vram_per_layer_mb: 110,
                     total_size_mb: 3000,
                     quantization: Quantization::Q4,
                     min_total_vram_mb: 5000,
-                    recommended_stages: 1,
+                    recommended_stages: 2,
                     source: "unsloth/gemma-4-E4B-it-GGUF".into(),
                 },
                 ModelDefinition {
@@ -329,9 +329,9 @@ mod tests {
         assert_eq!(manifest.model_id, "gemma-4-e4b-q4");
         assert_eq!(manifest.shards.len(), 2);
         assert_eq!(manifest.shards[0].start_layer, 0);
-        assert_eq!(manifest.shards[0].end_layer, 13);
-        assert_eq!(manifest.shards[1].start_layer, 14);
-        assert_eq!(manifest.shards[1].end_layer, 27);
+        assert_eq!(manifest.shards[0].end_layer, 20);
+        assert_eq!(manifest.shards[1].start_layer, 21);
+        assert_eq!(manifest.shards[1].end_layer, 41);
     }
 
     #[test]

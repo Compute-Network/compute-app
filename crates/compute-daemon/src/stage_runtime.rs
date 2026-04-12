@@ -176,6 +176,15 @@ pub async fn start_stage_prototype(
         }
         StageBackendKind::LlamaCpp => resolve_model_path(&spec.model_name)
             .with_context(|| format!("No local GGUF found for stage prototype model {}", spec.model_name))?,
+        StageBackendKind::RealForward => {
+            let stages_dir = dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".compute")
+                .join("stages")
+                .join(&spec.model_name)
+                .join(format!("packed-stage-{}-{}", spec.start_layer, spec.end_layer));
+            stages_dir
+        }
     };
     let shard_config = EngineShardConfig {
         model_id: spec.model_name.clone(),

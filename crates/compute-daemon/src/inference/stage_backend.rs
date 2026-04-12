@@ -6,12 +6,15 @@ use crate::inference::engine::{
     detect_backend, Activation, ForwardResult, GeneratedToken, InferenceEngine, ShardConfig,
 };
 use crate::inference::llamacpp::LlamaCppEngine;
+use stage_forward_lab::real_forward::RealGemmaBackend;
+use stage_forward_lab::{StageForwardBackend, StageLayout, StageTensor, PayloadKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageBackendKind {
     Prototype,
     TailLlama,
     LlamaCpp,
+    RealForward,
 }
 
 impl StageBackendKind {
@@ -19,6 +22,7 @@ impl StageBackendKind {
         match value.trim().to_ascii_lowercase().as_str() {
             "tail-llama" | "tailllama" | "tail_llama" | "hybrid" => Self::TailLlama,
             "llamacpp" | "llama.cpp" | "llama" => Self::LlamaCpp,
+            "real_forward" | "realforward" | "real-forward" | "real" => Self::RealForward,
             _ => Self::Prototype,
         }
     }
@@ -28,6 +32,7 @@ impl StageBackendKind {
             Self::Prototype => "prototype",
             Self::TailLlama => "tail-llama",
             Self::LlamaCpp => "llamacpp",
+            Self::RealForward => "real_forward",
         }
     }
 }
@@ -41,6 +46,7 @@ pub enum StageExecutionBackend {
     Prototype(PrototypeStageEngine),
     TailLlama(TailLlamaStageEngine),
     LlamaCpp(LlamaCppEngine),
+    RealForward(RealForwardEngine),
 }
 
 impl StageExecutionBackend {
@@ -49,6 +55,7 @@ impl StageExecutionBackend {
             StageBackendKind::Prototype => Self::Prototype(PrototypeStageEngine::default()),
             StageBackendKind::TailLlama => Self::TailLlama(TailLlamaStageEngine::new(hw)),
             StageBackendKind::LlamaCpp => Self::LlamaCpp(LlamaCppEngine::new(detect_backend(hw))),
+            StageBackendKind::RealForward => Self::RealForward(RealForwardEngine::new()),
         }
     }
 
@@ -57,6 +64,7 @@ impl StageExecutionBackend {
             Self::Prototype(engine) => engine.load_shard(config),
             Self::TailLlama(engine) => engine.load_shard(config).await,
             Self::LlamaCpp(engine) => engine.load_shard(config).await,
+            Self::RealForward(engine) => engine.load_shard(config),
         }
     }
 
@@ -65,6 +73,7 @@ impl StageExecutionBackend {
             Self::Prototype(engine) => engine.unload(),
             Self::TailLlama(engine) => engine.unload().await,
             Self::LlamaCpp(engine) => engine.unload().await,
+            Self::RealForward(engine) => engine.unload(),
         }
     }
 
@@ -73,6 +82,7 @@ impl StageExecutionBackend {
             Self::Prototype(engine) => engine.forward(input),
             Self::TailLlama(engine) => engine.forward(input).await,
             Self::LlamaCpp(engine) => engine.forward(input).await,
+            Self::RealForward(engine) => engine.forward(input),
         }
     }
 
@@ -83,6 +93,9 @@ impl StageExecutionBackend {
         max_tokens: Option<u32>,
         hidden_dim_hint: usize,
     ) -> Result<Activation> {
+        if let Self::RealForward(engine) = self {
+            return engine.begin_prompt(request_id, prompt, max_tokens, hidden_dim_hint);
+        }
         let token_count = self.tokenize(prompt).await?.len().max(1);
         let ingress = Activation {
             request_id,
@@ -108,6 +121,7 @@ impl StageExecutionBackend {
             Self::Prototype(engine) => engine.tokenize(text),
             Self::TailLlama(engine) => engine.tokenize(text),
             Self::LlamaCpp(engine) => engine.tokenize(text).await,
+            Self::RealForward(engine) => engine.tokenize(text),
         }
     }
 
@@ -116,6 +130,7 @@ impl StageExecutionBackend {
             Self::Prototype(engine) => engine.detokenize(tokens),
             Self::TailLlama(engine) => engine.detokenize(tokens),
             Self::LlamaCpp(engine) => engine.detokenize(tokens).await,
+            Self::RealForward(engine) => engine.detokenize(tokens),
         }
     }
 
@@ -124,6 +139,7 @@ impl StageExecutionBackend {
             Self::Prototype(_) => "prototype",
             Self::TailLlama(_) => "tail-llama",
             Self::LlamaCpp(_) => "llamacpp",
+            Self::RealForward(_) => "real_forward",
         }
     }
 }
@@ -442,6 +458,221 @@ impl TailLlamaStageEngine {
     fn detokenize(&self, tokens: &[u32]) -> Result<String> {
         self.passthrough.detokenize(tokens)
     }
+}
+
+pub struct RealForwardEngine {
+    backend: Option<RealGemmaBackend>,
+    shard_config: Option<ShardConfig>,
+}
+
+impl RealForwardEngine {
+    pub fn new() -> Self {
+        Self {
+            backend: None,
+            shard_config: None,
+        }
+    }
+
+    fn load_shard(&mut self, config: &ShardConfig) -> Result<()> {
+        let stage_dir = resolve_packed_stage_dir(config)?;
+        let index_name = find_stage_index(&stage_dir)?;
+        let index_path = stage_dir.join(&index_name);
+
+        let vocab_path = stage_dir.join("vocab.json");
+        let scores_path = stage_dir.join("vocab_scores.json");
+
+        let mut backend = RealGemmaBackend::new(&index_path);
+        if vocab_path.exists() {
+            let sp = if scores_path.exists() { Some(scores_path.as_path()) } else { None };
+            backend.load_tokenizer(&vocab_path, sp)?;
+        }
+        backend.load_layout(StageLayout {
+            model_id: config.model_id.clone(),
+            stage_id: format!("stage-{}-{}", config.start_layer, config.end_layer),
+            start_layer: config.start_layer as u32,
+            end_layer: config.end_layer as u32,
+            is_head: config.is_first_stage,
+            is_tail: config.is_last_stage,
+        })?;
+
+        self.backend = Some(backend);
+        self.shard_config = Some(config.clone());
+        Ok(())
+    }
+
+    fn unload(&mut self) -> Result<()> {
+        self.backend = None;
+        self.shard_config = None;
+        Ok(())
+    }
+
+    fn backend(&self) -> Result<&RealGemmaBackend> {
+        self.backend.as_ref().ok_or_else(|| anyhow::anyhow!("RealForward backend not loaded"))
+    }
+
+    fn config(&self) -> Result<&ShardConfig> {
+        self.shard_config.as_ref().ok_or_else(|| anyhow::anyhow!("No shard config"))
+    }
+
+    fn begin_prompt(
+        &self,
+        request_id: String,
+        prompt: &str,
+        max_tokens: Option<u32>,
+        _hidden_dim_hint: usize,
+    ) -> Result<Activation> {
+        let backend = self.backend()?;
+        let stage_tensor = backend.begin_prompt(&request_id, prompt, max_tokens, 0)?;
+
+        let envelope = StagePayloadEnvelope {
+            kind: StagePayloadKind::HiddenStatesV1,
+            prompt: Some(prompt.to_string()),
+            stages: stage_tensor.stage_trace.clone(),
+            max_tokens,
+            hidden_state_bytes: Some(stage_tensor.bytes.len()),
+            hidden_dim: Some(stage_tensor.hidden_dim),
+            hidden_state: stage_tensor.bytes,
+        };
+
+        Ok(Activation {
+            request_id,
+            shape: vec![1, 1, stage_tensor.hidden_dim],
+            data: serde_json::to_vec(&envelope)?,
+            seq_position: 0,
+            batch_index: 0,
+        })
+    }
+
+    fn forward(&self, input: Activation) -> Result<ForwardResult> {
+        let backend = self.backend()?;
+        let config = self.config()?;
+        let payload = parse_payload(&input.data)?;
+
+        if config.is_first_stage && payload.kind == StagePayloadKind::PromptV1 {
+            let prompt = payload.prompt.as_deref().unwrap_or("");
+            let stage_tensor = backend.begin_prompt(
+                &input.request_id, prompt, payload.max_tokens, 0,
+            )?;
+            let envelope = StagePayloadEnvelope {
+                kind: StagePayloadKind::HiddenStatesV1,
+                prompt: Some(prompt.to_string()),
+                stages: stage_tensor.stage_trace.clone(),
+                max_tokens: payload.max_tokens,
+                hidden_state_bytes: Some(stage_tensor.bytes.len()),
+                hidden_dim: Some(stage_tensor.hidden_dim),
+                hidden_state: stage_tensor.bytes,
+            };
+            return Ok(ForwardResult::Activations(Activation {
+                request_id: input.request_id,
+                shape: vec![1, 1, stage_tensor.hidden_dim],
+                data: serde_json::to_vec(&envelope)?,
+                seq_position: input.seq_position,
+                batch_index: input.batch_index,
+            }));
+        }
+
+        let hidden_dim = payload.hidden_dim.unwrap_or(2560);
+        let stage_tensor = StageTensor {
+            request_id: input.request_id.clone(),
+            kind: PayloadKind::HiddenState,
+            stage_trace: payload.stages.clone(),
+            hidden_dim,
+            bytes: payload.hidden_state,
+            prompt_text: payload.prompt.clone(),
+            max_tokens: payload.max_tokens,
+            continuation: None,
+            transient: None,
+            carry: None,
+        };
+
+        if config.is_last_stage {
+            let result = backend.continue_forward(stage_tensor)?;
+            let sample = backend.sample_tail(result)?;
+            let tokens: Vec<GeneratedToken> = sample.text.chars().enumerate().map(|(i, ch)| {
+                GeneratedToken {
+                    request_id: input.request_id.clone(),
+                    token_id: ch as u32,
+                    token_text: ch.to_string(),
+                    is_finished: i + ch.len_utf8() >= sample.text.len(),
+                    logprob: None,
+                }
+            }).collect();
+            if tokens.is_empty() {
+                return Ok(ForwardResult::Tokens(vec![GeneratedToken {
+                    request_id: input.request_id,
+                    token_id: 0,
+                    token_text: String::new(),
+                    is_finished: true,
+                    logprob: None,
+                }]));
+            }
+            return Ok(ForwardResult::Tokens(tokens));
+        }
+
+        let result = backend.continue_forward(stage_tensor)?;
+        let envelope = StagePayloadEnvelope {
+            kind: StagePayloadKind::HiddenStatesV1,
+            prompt: payload.prompt,
+            stages: result.stage_trace.clone(),
+            max_tokens: result.max_tokens,
+            hidden_state_bytes: Some(result.bytes.len()),
+            hidden_dim: Some(result.hidden_dim),
+            hidden_state: result.bytes,
+        };
+        Ok(ForwardResult::Activations(Activation {
+            request_id: input.request_id,
+            shape: vec![1, 1, result.hidden_dim],
+            data: serde_json::to_vec(&envelope)?,
+            seq_position: input.seq_position,
+            batch_index: input.batch_index,
+        }))
+    }
+
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
+        Ok(text.as_bytes().iter().map(|byte| *byte as u32).collect())
+    }
+
+    fn detokenize(&self, tokens: &[u32]) -> Result<String> {
+        let bytes: Vec<u8> = tokens.iter().map(|t| (*t).min(255) as u8).collect();
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+}
+
+fn resolve_packed_stage_dir(config: &ShardConfig) -> Result<std::path::PathBuf> {
+    let shard_path = std::path::Path::new(&config.shard_path);
+    if shard_path.is_dir() {
+        return Ok(shard_path.to_path_buf());
+    }
+    if shard_path.is_file() && shard_path.extension().map(|e| e == "json").unwrap_or(false) {
+        return shard_path.parent()
+            .map(|p| p.to_path_buf())
+            .ok_or_else(|| anyhow::anyhow!("Cannot resolve parent of {}", shard_path.display()));
+    }
+    let compute_dir = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".compute")
+        .join("stages")
+        .join(&config.model_id)
+        .join(format!("packed-stage-{}-{}", config.start_layer, config.end_layer));
+    if compute_dir.exists() {
+        return Ok(compute_dir);
+    }
+    anyhow::bail!(
+        "Could not find packed stage directory for {} layers {}-{} (tried {} and {})",
+        config.model_id, config.start_layer, config.end_layer,
+        shard_path.display(), compute_dir.display()
+    )
+}
+
+fn find_stage_index(dir: &std::path::Path) -> Result<String> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".index.json") {
+            return Ok(name);
+        }
+    }
+    anyhow::bail!("No .index.json file found in {}", dir.display())
 }
 
 #[cfg(test)]

@@ -86,6 +86,15 @@ pub struct AssignmentPush {
     /// For worker nodes (stage 1+): port to run rpc-server on
     #[serde(default)]
     pub rpc_port: Option<u16>,
+    /// Download URL for the packed stage artifact (real_forward backend)
+    #[serde(default)]
+    pub artifact_url: Option<String>,
+    /// Expected SHA256 of the packed stage artifact
+    #[serde(default)]
+    pub artifact_sha256: Option<String>,
+    /// Expected size of the packed artifact in bytes
+    #[serde(default)]
+    pub artifact_size_bytes: Option<u64>,
 }
 
 /// Channel for sending messages back through the WebSocket from other tasks
