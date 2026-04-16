@@ -28,15 +28,13 @@ impl GemmaTokenizer {
         }
 
         let bos_id = token_to_id.get("<bos>").copied().unwrap_or(2);
-        let eos_id = token_to_id.get("<eos>").copied().unwrap_or(1);
+        let eos_id = token_to_id
+            .get("<turn|>")
+            .copied()
+            .or_else(|| token_to_id.get("<eos>").copied())
+            .unwrap_or(1);
 
-        Ok(Self {
-            token_to_id,
-            id_to_token: tokens,
-            scores,
-            bos_id,
-            eos_id,
-        })
+        Ok(Self { token_to_id, id_to_token: tokens, scores, bos_id, eos_id })
     }
 
     pub fn id_to_token(&self) -> &[String] {
@@ -56,9 +54,7 @@ impl GemmaTokenizer {
     }
 
     pub fn decode(&self, id: u32) -> &str {
-        self.id_to_token.get(id as usize)
-            .map(String::as_str)
-            .unwrap_or("<?>")
+        self.id_to_token.get(id as usize).map(String::as_str).unwrap_or("<?>")
     }
 
     pub fn decode_ids(&self, ids: &[u32]) -> String {
@@ -149,11 +145,7 @@ impl GemmaTokenizer {
             }
         }
 
-        pieces.iter()
-            .map(|piece| {
-                self.token_to_id.get(piece).copied().unwrap_or(3)
-            })
-            .collect()
+        pieces.iter().map(|piece| self.token_to_id.get(piece).copied().unwrap_or(3)).collect()
     }
 }
 
@@ -188,18 +180,7 @@ mod tests {
 
     fn write_test_scores(dir: &Path) -> std::path::PathBuf {
         let scores: Vec<f32> = vec![
-            0.0, 0.0, 0.0, 0.0,
-            -1.0,
-            -2.0,
-            -2.0,
-            -2.0,
-            -2.0,
-            -0.5,
-            -1.5,
-            -1.5,
-            -0.3,
-            -1.0,
-            -0.2,
+            0.0, 0.0, 0.0, 0.0, -1.0, -2.0, -2.0, -2.0, -2.0, -0.5, -1.5, -1.5, -0.3, -1.0, -0.2,
             -0.1,
         ];
         let path = dir.join("scores.json");
@@ -229,5 +210,31 @@ mod tests {
 
         let ids = tok.encode_with_bos("Hello");
         assert_eq!(ids[0], 2);
+    }
+
+    #[test]
+    fn tokenizer_prefers_turn_token_as_eos_when_present() {
+        let temp = tempdir().unwrap();
+        let vocab = vec![
+            "<pad>".to_string(),
+            "<eos>".to_string(),
+            "<bos>".to_string(),
+            "<unk>".to_string(),
+            "<turn|>".to_string(),
+        ];
+        let vocab_path = temp.path().join("vocab.json");
+        std::fs::write(&vocab_path, serde_json::to_vec(&vocab).unwrap()).unwrap();
+
+        let tok = GemmaTokenizer::load(&vocab_path, None).unwrap();
+        assert_eq!(tok.eos_id(), 4);
+    }
+
+    #[test]
+    fn tokenizer_falls_back_to_eos_when_turn_token_is_absent() {
+        let temp = tempdir().unwrap();
+        let vocab_path = write_test_vocab(temp.path());
+        let tok = GemmaTokenizer::load(&vocab_path, None).unwrap();
+
+        assert_eq!(tok.eos_id(), 1);
     }
 }

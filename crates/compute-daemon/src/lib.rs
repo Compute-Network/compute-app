@@ -8,6 +8,8 @@ pub mod idle;
 pub mod inference;
 pub mod logging;
 pub mod metrics;
+pub mod prototype_chain;
+pub mod real_chain;
 pub mod relay;
 pub mod runtime;
 pub mod service;

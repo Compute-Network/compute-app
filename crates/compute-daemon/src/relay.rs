@@ -15,6 +15,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::inference::llama_stage_gateway::LlamaStageGatewayRelayClient;
 use crate::stage_runtime::StagePrototypeClient;
 use if_addrs::{IfAddr, get_if_addrs};
 use std::collections::BTreeSet;
@@ -105,7 +106,9 @@ fn detect_advertise_ip() -> Option<String> {
     socket.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).ok()?;
     let addr = socket.local_addr().ok()?;
     match addr.ip() {
-        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+            Some(ip.to_string())
+        }
         _ => None,
     }
 }
@@ -171,6 +174,8 @@ pub struct RelayClient {
     outbound_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>,
     /// Experimental stage runtime client for stage-based prototype requests.
     stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
+    /// External full-pipeline llama.cpp stage gateway client.
+    gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
 }
 
 impl RelayClient {
@@ -206,6 +211,7 @@ impl RelayClient {
         assignment_tx: tokio::sync::mpsc::Sender<AssignmentPush>,
         outbound_rx: tokio::sync::mpsc::Receiver<String>,
         stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
+        gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
     ) -> Self {
         // Convert https:// to wss:// (or http:// to ws://)
         let ws_url = config
@@ -232,6 +238,7 @@ impl RelayClient {
             assignment_tx,
             outbound_rx: Arc::new(tokio::sync::Mutex::new(outbound_rx)),
             stage_client,
+            gateway_client,
         }
     }
 
@@ -273,9 +280,8 @@ impl RelayClient {
                 .subsec_nanos() as u64;
             let jitter_ms = (jitter_nanos % (backoff.as_millis() as u64 / 2 + 1)) as i64
                 - (backoff.as_millis() as i64 / 4);
-            let actual_backoff = Duration::from_millis(
-                (backoff.as_millis() as i64 + jitter_ms).max(500) as u64
-            );
+            let actual_backoff =
+                Duration::from_millis((backoff.as_millis() as i64 + jitter_ms).max(500) as u64);
             info!("[relay] Reconnecting in {}ms...", actual_backoff.as_millis());
             sleep(actual_backoff).await;
             backoff = (backoff * 2).min(max_backoff);
@@ -287,12 +293,10 @@ impl RelayClient {
         self.is_connected.store(false, Ordering::Relaxed);
 
         // Connection timeout prevents hanging on unreachable orchestrator
-        let (ws_stream, _) = tokio::time::timeout(
-            Duration::from_secs(10),
-            connect_async(&self.ws_url),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("WebSocket connection timed out after 10s"))??;
+        let (ws_stream, _) =
+            tokio::time::timeout(Duration::from_secs(10), connect_async(&self.ws_url))
+                .await
+                .map_err(|_| anyhow::anyhow!("WebSocket connection timed out after 10s"))??;
         let (mut write, mut read) = ws_stream.split();
 
         // Send identify message
@@ -318,7 +322,8 @@ impl RelayClient {
         let outbound_rx = self.outbound_rx.clone();
         let mut outbound = outbound_rx.lock().await;
         let (response_tx, mut response_rx) = mpsc::channel::<String>(32);
-        let active_cancels = Arc::new(Mutex::new(std::collections::HashMap::<String, oneshot::Sender<()>>::new()));
+        let active_cancels =
+            Arc::new(Mutex::new(std::collections::HashMap::<String, oneshot::Sender<()>>::new()));
 
         // Process messages
         loop {
@@ -366,7 +371,10 @@ impl RelayClient {
                         Some("assignment") => {
                             match serde_json::from_str::<AssignmentPush>(&text) {
                                 Ok(assignment) => {
-                                    info!("[relay] Assignment push: pipeline={} model={}", assignment.pipeline_id, assignment.model_name);
+                                    info!(
+                                        "[relay] Assignment push: pipeline={} model={}",
+                                        assignment.pipeline_id, assignment.model_name
+                                    );
                                     // Reset health flag — new assignment may load a different model
                                     LLAMA_HEALTHY.store(false, Ordering::Relaxed);
                                     let _ = self.assignment_tx.try_send(assignment);
@@ -385,13 +393,13 @@ impl RelayClient {
 
                             self.is_active.store(true, Ordering::Relaxed);
                             self.active_requests.fetch_add(1, Ordering::Relaxed);
-                            let is_stream = req.body.get("stream")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
+                            let is_stream =
+                                req.body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
                             let start = std::time::Instant::now();
                             let response_tx = response_tx.clone();
                             let http_client = http_client.clone();
                             let stage_client = self.stage_client.clone();
+                            let gateway_client = self.gateway_client.clone();
                             let is_active = self.is_active.clone();
                             let active_requests = self.active_requests.clone();
                             let last_latency_ms = self.last_latency_ms.clone();
@@ -404,19 +412,31 @@ impl RelayClient {
                             tokio::spawn(async move {
                                 if is_stream {
                                     let final_response = handle_streaming_request(
-                                        &http_client, inference_port, &req, response_tx.clone(), cancel_rx, stage_client,
-                                    ).await;
+                                        &http_client,
+                                        inference_port,
+                                        &req,
+                                        response_tx.clone(),
+                                        cancel_rx,
+                                        stage_client,
+                                        gateway_client,
+                                    )
+                                    .await;
                                     let total_ms = start.elapsed().as_millis() as u64;
-                                    let remaining = active_requests.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                                    let remaining = active_requests
+                                        .fetch_sub(1, Ordering::Relaxed)
+                                        .saturating_sub(1);
                                     is_active.store(remaining > 0, Ordering::Relaxed);
                                     let network_latency = total_ms.min(200);
                                     last_latency_ms.store(network_latency, Ordering::Relaxed);
 
                                     if let Some(usage) = final_response.body.get("usage") {
-                                        let comp_tokens = usage.get("completion_tokens")
-                                            .and_then(|v| v.as_u64()).unwrap_or(0);
+                                        let comp_tokens = usage
+                                            .get("completion_tokens")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0);
                                         if comp_tokens > 0 && total_ms > 0 {
-                                            let tps = (comp_tokens as f64 / total_ms as f64) * 1000.0;
+                                            let tps =
+                                                (comp_tokens as f64 / total_ms as f64) * 1000.0;
                                             last_tps.store(tps.to_bits(), Ordering::Relaxed);
                                         }
                                     }
@@ -424,26 +444,78 @@ impl RelayClient {
                                         completed_requests.fetch_add(1, Ordering::Relaxed);
                                     }
 
-                                    if let Ok(response_json) = serde_json::to_string(&final_response) {
+                                    if let Ok(response_json) =
+                                        serde_json::to_string(&final_response)
+                                    {
                                         let _ = response_tx.send(response_json).await;
                                     }
                                 } else {
-                                    let response =
-                                        handle_inference_request(&http_client, inference_port, &req, cancel_rx, stage_client).await;
+                                    let response = handle_inference_request(
+                                        &http_client,
+                                        inference_port,
+                                        &req,
+                                        cancel_rx,
+                                        stage_client,
+                                        gateway_client,
+                                    )
+                                    .await;
                                     let total_ms = start.elapsed().as_millis() as u64;
-                                    let remaining = active_requests.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+                                    let remaining = active_requests
+                                        .fetch_sub(1, Ordering::Relaxed)
+                                        .saturating_sub(1);
                                     is_active.store(remaining > 0, Ordering::Relaxed);
 
-                                    let inference_ms = response.body.get("timings").map(|t| {
-                                        let prompt = t.get("prompt_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                        let predicted = t.get("predicted_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                        (prompt + predicted) as u64
-                                    }).unwrap_or(0);
-                                    last_latency_ms.store(total_ms.saturating_sub(inference_ms), Ordering::Relaxed);
+                                    let inference_ms = response
+                                        .body
+                                        .get("timings")
+                                        .map(|t| {
+                                            let prompt = t
+                                                .get("prompt_ms")
+                                                .and_then(|v| v.as_f64())
+                                                .unwrap_or(0.0);
+                                            let predicted = t
+                                                .get("predicted_ms")
+                                                .and_then(|v| v.as_f64())
+                                                .unwrap_or(0.0);
+                                            (prompt + predicted) as u64
+                                        })
+                                        .or_else(|| {
+                                            response
+                                                .body
+                                                .get("gateway_timings")
+                                                .and_then(|t| t.get("total_ms"))
+                                                .and_then(|v| v.as_u64())
+                                        })
+                                        .unwrap_or(0);
+                                    last_latency_ms.store(
+                                        total_ms.saturating_sub(inference_ms),
+                                        Ordering::Relaxed,
+                                    );
 
-                                    if let Some(tps) = response.body.get("timings")
+                                    let gateway_tps =
+                                        response.body.get("usage").and_then(|usage| {
+                                            let completion_tokens = usage
+                                                .get("completion_tokens")
+                                                .and_then(|v| v.as_u64())?;
+                                            let total_ms = response
+                                                .body
+                                                .get("gateway_timings")
+                                                .and_then(|t| t.get("total_ms"))
+                                                .and_then(|v| v.as_u64())?;
+                                            if completion_tokens == 0 || total_ms == 0 {
+                                                return None;
+                                            }
+                                            Some(
+                                                (completion_tokens as f64 / total_ms as f64)
+                                                    * 1000.0,
+                                            )
+                                        });
+                                    if let Some(tps) = response
+                                        .body
+                                        .get("timings")
                                         .and_then(|t| t.get("predicted_per_second"))
                                         .and_then(|v| v.as_f64())
+                                        .or(gateway_tps)
                                     {
                                         last_tps.store(tps.to_bits(), Ordering::Relaxed);
                                     }
@@ -467,7 +539,8 @@ impl RelayClient {
                                     continue;
                                 }
                             };
-                            if let Some(cancel_tx) = active_cancels.lock().await.remove(&cancel.id) {
+                            if let Some(cancel_tx) = active_cancels.lock().await.remove(&cancel.id)
+                            {
                                 let _ = cancel_tx.send(());
                                 info!("[relay] Cancelled request {}", cancel.id);
                             }
@@ -550,7 +623,18 @@ async fn handle_streaming_request(
     response_tx: mpsc::Sender<String>,
     mut cancel_rx: oneshot::Receiver<()>,
     stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
+    gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
 ) -> RelayResponse {
+    if let Some(gateway_client) = gateway_client.lock().await.clone() {
+        return handle_stage_gateway_streaming_request(
+            &gateway_client,
+            request,
+            response_tx,
+            &mut cancel_rx,
+        )
+        .await;
+    }
+
     if stage_client.lock().await.is_some() {
         return RelayResponse {
             id: request.id.clone(),
@@ -594,10 +678,7 @@ async fn handle_streaming_request(
 
     let status = resp.status().as_u16();
     if status != 200 {
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_default();
+        let body = resp.text().await.unwrap_or_default();
         return RelayResponse {
             id: request.id.clone(),
             r#type: "inference_response".into(),
@@ -653,7 +734,8 @@ async fn handle_streaming_request(
                 // Build JSON manually to avoid struct serialization overhead
                 let chunk_json = format!(
                     r#"{{"id":"{}","type":"inference_stream_chunk","chunk":"{}\\n\\n"}}"#,
-                    request.id, line.replace('\\', "\\\\").replace('"', "\\\"")
+                    request.id,
+                    line.replace('\\', "\\\\").replace('"', "\\\"")
                 );
                 let _ = response_tx.send(chunk_json).await;
 
@@ -667,10 +749,14 @@ async fn handle_streaming_request(
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                         if let Some(usage) = parsed.get("usage") {
                             last_usage = Some(usage.clone());
-                            prompt_tokens = usage.get("prompt_tokens")
-                                .and_then(|v| v.as_u64()).unwrap_or(prompt_tokens);
-                            completion_tokens = usage.get("completion_tokens")
-                                .and_then(|v| v.as_u64()).unwrap_or(completion_tokens);
+                            prompt_tokens = usage
+                                .get("prompt_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(prompt_tokens);
+                            completion_tokens = usage
+                                .get("completion_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(completion_tokens);
                         }
                     }
                 }
@@ -701,18 +787,108 @@ async fn handle_streaming_request(
     }
 }
 
+async fn handle_stage_gateway_streaming_request(
+    gateway_client: &LlamaStageGatewayRelayClient,
+    request: &RelayRequest,
+    response_tx: mpsc::Sender<String>,
+    cancel_rx: &mut oneshot::Receiver<()>,
+) -> RelayResponse {
+    let mut session = match gateway_client
+        .begin_chat_stream(request.id.clone(), &request.body)
+        .await
+    {
+        Ok(session) => session,
+        Err(err) => {
+            return RelayResponse {
+                id: request.id.clone(),
+                r#type: "inference_response".into(),
+                status: 502,
+                body: serde_json::json!({"error": format!("Stage gateway stream start failed: {err}")}),
+            };
+        }
+    };
+
+    loop {
+        let progress = tokio::select! {
+            _ = &mut *cancel_rx => {
+                let _ = gateway_client.clear_stream(request.id.clone()).await;
+                return RelayResponse {
+                    id: request.id.clone(),
+                    r#type: "inference_response".into(),
+                    status: 499,
+                    body: serde_json::json!({"error": "Request cancelled by client"}),
+                };
+            }
+            result = gateway_client.step_chat_stream(&mut session) => result
+        };
+
+        let progress = match progress {
+            Ok(progress) => progress,
+            Err(err) => {
+                let _ = gateway_client.clear_stream(request.id.clone()).await;
+                return RelayResponse {
+                    id: request.id.clone(),
+                    r#type: "inference_response".into(),
+                    status: 502,
+                    body: serde_json::json!({"error": format!("Stage gateway streaming failed: {err}")}),
+                };
+            }
+        };
+
+        for chunk in progress.chunks {
+            let chunk_json = serde_json::json!({
+                "id": request.id,
+                "type": "inference_stream_chunk",
+                "chunk": chunk,
+            })
+            .to_string();
+            let _ = response_tx.send(chunk_json).await;
+        }
+
+        if let Some(completion) = progress.completion {
+            return RelayResponse {
+                id: request.id.clone(),
+                r#type: "inference_response".into(),
+                status: 200,
+                body: serde_json::json!({
+                    "stream_complete": true,
+                    "usage": completion.body["usage"].clone(),
+                    "prototype_stage_mode": false,
+                    "llama_stage_gateway": true,
+                    "gateway_timings": completion.body["gateway_timings"].clone(),
+                }),
+            };
+        }
+    }
+}
+
 async fn handle_inference_request(
     client: &reqwest::Client,
     port: u16,
     request: &RelayRequest,
     mut cancel_rx: oneshot::Receiver<()>,
     stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
+    gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
 ) -> RelayResponse {
-    info!(
-        "[relay] Received inference request {} path={} stream=false",
-        request.id, request.path
-    );
-    if let Some(stage_client) = wait_for_stage_head_client(&stage_client, Duration::from_secs(2)).await {
+    info!("[relay] Received inference request {} path={} stream=false", request.id, request.path);
+    if let Some(gateway_client) = gateway_client.lock().await.clone() {
+        info!("[relay] Routing request {} to stage gateway", request.id);
+        return tokio::select! {
+            _ = &mut cancel_rx => {
+                RelayResponse {
+                    id: request.id.clone(),
+                    r#type: "inference_response".into(),
+                    status: 499,
+                    body: serde_json::json!({"error": "Request cancelled by client"}),
+                }
+            }
+            result = handle_stage_gateway_request(&gateway_client, request) => result
+        };
+    }
+
+    if let Some(stage_client) =
+        wait_for_stage_head_client(&stage_client, Duration::from_secs(2)).await
+    {
         info!("[relay] Routing request {} to stage prototype head", request.id);
         return tokio::select! {
             _ = &mut cancel_rx => {
@@ -771,11 +947,19 @@ async fn handle_inference_request(
                 let body_text = resp.text().await.unwrap_or_default();
 
                 if status != 200 {
-                    warn!("[relay] llama-server responded {status}: {}", &body_text[..body_text.len().min(1000)]);
+                    warn!(
+                        "[relay] llama-server responded {status}: {}",
+                        &body_text[..body_text.len().min(1000)]
+                    );
                 }
 
                 if status == 503 && attempt < max_retries {
-                    info!("[relay] llama-server busy (503), retry {}/{} in {}ms", attempt + 1, max_retries, 500 * (attempt + 1));
+                    info!(
+                        "[relay] llama-server busy (503), retry {}/{} in {}ms",
+                        attempt + 1,
+                        max_retries,
+                        500 * (attempt + 1)
+                    );
                     tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
                     continue;
                 }
@@ -797,7 +981,11 @@ async fn handle_inference_request(
             }
             Err(e) => {
                 if attempt < max_retries {
-                    info!("[relay] llama-server unreachable, retry {}/{}", attempt + 1, max_retries);
+                    info!(
+                        "[relay] llama-server unreachable, retry {}/{}",
+                        attempt + 1,
+                        max_retries
+                    );
                     tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
                     continue;
                 }
@@ -838,6 +1026,7 @@ async fn handle_stage_prototype_request(
     request: &RelayRequest,
 ) -> RelayResponse {
     let prompt = extract_request_prompt(&request.body);
+    let stop_sequences = extract_stop_sequences(&request.body);
     let max_tokens = request
         .body
         .get("max_tokens")
@@ -852,46 +1041,65 @@ async fn handle_stage_prototype_request(
         max_tokens
     );
 
-    match stage_client
-        .complete_prompt(request.id.clone(), prompt, max_tokens)
-        .await
+    match stage_client.complete_prompt(request.id.clone(), prompt, max_tokens, stop_sequences).await
     {
         Ok(result) => {
             info!(
                 "[stage] Head completed request {} completion_tokens={}",
-                request.id,
-                result.completion_tokens
+                request.id, result.completion_tokens
             );
             RelayResponse {
-            id: request.id.clone(),
-            r#type: "inference_response".into(),
-            status: 200,
-            body: serde_json::json!({
-                "id": request.id,
-                "object": "chat.completion",
-                "model": result.model_name,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": result.content,
+                id: request.id.clone(),
+                r#type: "inference_response".into(),
+                status: 200,
+                body: serde_json::json!({
+                    "id": request.id,
+                    "object": "chat.completion",
+                    "model": result.model_name,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": result.content,
+                        },
+                        "finish_reason": result.finish_reason
+                    }],
+                    "usage": {
+                        "prompt_tokens": result.prompt_tokens,
+                        "completion_tokens": result.completion_tokens,
+                        "total_tokens": result.total_tokens,
                     },
-                    "finish_reason": "stop"
-                }],
-                "usage": {
-                    "prompt_tokens": result.prompt_tokens,
-                    "completion_tokens": result.completion_tokens,
-                    "total_tokens": result.total_tokens,
-                },
-                "prototype_stage_mode": true,
-            }),
+                    "prototype_stage_mode": true,
+                }),
+            }
         }
-        },
         Err(err) => RelayResponse {
             id: request.id.clone(),
             r#type: "inference_response".into(),
             status: 502,
             body: serde_json::json!({"error": format!("Stage prototype request failed: {err}")}),
+        },
+    }
+}
+
+async fn handle_stage_gateway_request(
+    gateway_client: &LlamaStageGatewayRelayClient,
+    request: &RelayRequest,
+) -> RelayResponse {
+    info!("[gateway] Handling request {} via relay gateway", request.id);
+
+    match gateway_client.complete_chat_request(request.id.clone(), &request.body).await {
+        Ok(completion) => RelayResponse {
+            id: request.id.clone(),
+            r#type: "inference_response".into(),
+            status: 200,
+            body: completion.body,
+        },
+        Err(err) => RelayResponse {
+            id: request.id.clone(),
+            r#type: "inference_response".into(),
+            status: 502,
+            body: serde_json::json!({"error": format!("Stage gateway request failed: {err}")}),
         },
     }
 }
@@ -903,10 +1111,7 @@ fn extract_request_prompt(body: &serde_json::Value) -> String {
 
     if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
         for message in messages.iter().rev() {
-            let role = message
-                .get("role")
-                .and_then(|value| value.as_str())
-                .unwrap_or("user");
+            let role = message.get("role").and_then(|value| value.as_str()).unwrap_or("user");
             if role != "user" {
                 continue;
             }
@@ -922,7 +1127,9 @@ fn extract_request_prompt(body: &serde_json::Value) -> String {
                         .iter()
                         .filter_map(|part| {
                             if part.get("type").and_then(|value| value.as_str()) == Some("text") {
-                                part.get("text").and_then(|value| value.as_str()).map(str::to_string)
+                                part.get("text")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_string)
                             } else {
                                 None
                             }
@@ -950,18 +1157,16 @@ fn extract_request_prompt(body: &serde_json::Value) -> String {
                         .iter()
                         .filter_map(|part| {
                             if part.get("type").and_then(|value| value.as_str()) == Some("text") {
-                                part.get("text").and_then(|value| value.as_str()).map(str::to_string)
+                                part.get("text")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_string)
                             } else {
                                 None
                             }
                         })
                         .collect::<Vec<_>>()
                         .join(" ");
-                    if text.is_empty() {
-                        None
-                    } else {
-                        Some(format!("{role}: {text}"))
-                    }
+                    if text.is_empty() { None } else { Some(format!("{role}: {text}")) }
                 } else {
                     None
                 }
@@ -976,9 +1181,22 @@ fn extract_request_prompt(body: &serde_json::Value) -> String {
     String::new()
 }
 
+fn extract_stop_sequences(body: &serde_json::Value) -> Vec<String> {
+    match body.get("stop") {
+        Some(serde_json::Value::String(stop)) if !stop.is_empty() => vec![stop.clone()],
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .filter_map(|value| value.as_str())
+            .filter(|stop| !stop.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_request_prompt;
+    use super::{extract_request_prompt, extract_stop_sequences};
 
     #[test]
     fn extract_request_prompt_prefers_prompt_field() {
@@ -1029,5 +1247,14 @@ mod tests {
             ]
         });
         assert_eq!(extract_request_prompt(&body), "Second request");
+    }
+
+    #[test]
+    fn extract_stop_sequences_supports_string_and_array() {
+        let single = serde_json::json!({ "stop": "END" });
+        assert_eq!(extract_stop_sequences(&single), vec!["END".to_string()]);
+
+        let many = serde_json::json!({ "stop": ["A", "", "B", 3] });
+        assert_eq!(extract_stop_sequences(&many), vec!["A".to_string(), "B".to_string()]);
     }
 }

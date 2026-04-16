@@ -181,12 +181,7 @@ impl GgufFile {
             }
             let ggml_type = read_u32(&mut cursor)?;
             let offset = read_u64(&mut cursor)?;
-            tensors.push(TensorInfo {
-                name,
-                dimensions,
-                ggml_type,
-                offset,
-            });
+            tensors.push(TensorInfo { name, dimensions, ggml_type, offset });
         }
 
         let alignment = metadata
@@ -220,10 +215,7 @@ impl GgufFile {
         let mut blocks = BTreeSet::new();
         for tensor in &self.tensors {
             if let Some(rest) = tensor.name.strip_prefix("blk.") {
-                if let Some(idx) = rest
-                    .split('.')
-                    .next()
-                    .and_then(|part| part.parse::<u32>().ok())
+                if let Some(idx) = rest.split('.').next().and_then(|part| part.parse::<u32>().ok())
                 {
                     blocks.insert(idx);
                 }
@@ -261,15 +253,17 @@ impl GgufFile {
 
     pub fn metadata_f32_array(&self, key: &str) -> Option<Vec<f32>> {
         match self.metadata.get(key) {
-            Some(MetadataValue::Array(arr)) => {
-                Some(arr.iter().map(|v| match v {
-                    MetadataValue::Float32(f) => *f,
-                    MetadataValue::Float64(f) => *f as f32,
-                    MetadataValue::Int32(i) => *i as f32,
-                    MetadataValue::Uint32(u) => *u as f32,
-                    _ => 0.0,
-                }).collect())
-            }
+            Some(MetadataValue::Array(arr)) => Some(
+                arr.iter()
+                    .map(|v| match v {
+                        MetadataValue::Float32(f) => *f,
+                        MetadataValue::Float64(f) => *f as f32,
+                        MetadataValue::Int32(i) => *i as f32,
+                        MetadataValue::Uint32(u) => *u as f32,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -316,11 +310,7 @@ impl GgufFile {
             let extra = if stage_index < remainder { 1 } else { 0 };
             let span = base + extra;
             let end = start + span - 1;
-            result.push(StageSplit {
-                stage_index,
-                start_layer: start,
-                end_layer: end,
-            });
+            result.push(StageSplit { stage_index, start_layer: start, end_layer: end });
             start = end + 1;
         }
         Some(result)
@@ -329,9 +319,7 @@ impl GgufFile {
     pub fn tensor_byte_len(&self, tensor_name: &str) -> Option<u64> {
         let mut ordered = self.tensors.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|tensor| tensor.offset);
-        let idx = ordered
-            .iter()
-            .position(|tensor| tensor.name == tensor_name)?;
+        let idx = ordered.iter().position(|tensor| tensor.name == tensor_name)?;
         let current = ordered[idx];
         let next_offset = ordered
             .get(idx + 1)
@@ -348,10 +336,7 @@ impl GgufFile {
     }
 
     pub fn tensor_slice(&self, tensor_name: &str) -> Option<TensorSlice> {
-        let tensor = self
-            .tensors
-            .iter()
-            .find(|tensor| tensor.name == tensor_name)?;
+        let tensor = self.tensors.iter().find(|tensor| tensor.name == tensor_name)?;
         Some(TensorSlice {
             name: tensor_name.to_string(),
             file_offset: self.tensor_file_offset(tensor_name)?,
@@ -389,19 +374,13 @@ impl GgufFile {
             })
             .collect();
 
-        StageTensorPlan {
-            splits: splits.to_vec(),
-            planned_tensors,
-        }
+        StageTensorPlan { splits: splits.to_vec(), planned_tensors }
     }
 }
 
 impl StageTensorPlan {
     pub fn total_bytes(&self) -> u64 {
-        self.planned_tensors
-            .iter()
-            .map(|tensor| tensor.byte_len)
-            .sum()
+        self.planned_tensors.iter().map(|tensor| tensor.byte_len).sum()
     }
 
     pub fn stage_bytes(&self, stage_index: u32) -> u64 {
@@ -487,10 +466,7 @@ impl StageTensorPlan {
                         .iter()
                         .map(|tensor| tensor.name.clone())
                         .collect(),
-                    total_bytes: prompt_ingress_tensors
-                        .iter()
-                        .map(|tensor| tensor.byte_len)
-                        .sum(),
+                    total_bytes: prompt_ingress_tensors.iter().map(|tensor| tensor.byte_len).sum(),
                 },
                 positional: TensorGroup {
                     name: "positional".into(),
@@ -498,10 +474,7 @@ impl StageTensorPlan {
                         .iter()
                         .map(|tensor| tensor.name.clone())
                         .collect(),
-                    total_bytes: positional_tensors
-                        .iter()
-                        .map(|tensor| tensor.byte_len)
-                        .sum(),
+                    total_bytes: positional_tensors.iter().map(|tensor| tensor.byte_len).sum(),
                 },
                 replicated_aux: TensorGroup {
                     name: "replicated_aux".into(),
@@ -509,10 +482,7 @@ impl StageTensorPlan {
                         .iter()
                         .map(|tensor| tensor.name.clone())
                         .collect(),
-                    total_bytes: replicated_aux_tensors
-                        .iter()
-                        .map(|tensor| tensor.byte_len)
-                        .sum(),
+                    total_bytes: replicated_aux_tensors.iter().map(|tensor| tensor.byte_len).sum(),
                 },
                 owned: TensorGroup {
                     name: format!("stage{}_owned", split.stage_index + 1),
@@ -530,10 +500,7 @@ impl StageTensorPlan {
                 tail_only: TensorGroup {
                     name: "tail_only".into(),
                     tensor_names: if split.stage_index + 1 == self.splits.len() as u32 {
-                        tail_only_tensors
-                            .iter()
-                            .map(|tensor| tensor.name.clone())
-                            .collect()
+                        tail_only_tensors.iter().map(|tensor| tensor.name.clone()).collect()
                     } else {
                         Vec::new()
                     },
@@ -549,10 +516,7 @@ impl StageTensorPlan {
                         .iter()
                         .map(|tensor| tensor.name.clone())
                         .collect(),
-                    total_bytes: unknown_global_tensors
-                        .iter()
-                        .map(|tensor| tensor.byte_len)
-                        .sum(),
+                    total_bytes: unknown_global_tensors.iter().map(|tensor| tensor.byte_len).sum(),
                 },
             })
             .collect();
@@ -572,11 +536,8 @@ impl StageTensorPlan {
                     required.extend(stage.tail_only.tensor_names.iter().cloned());
                 }
 
-                let optional = if idx == 0 {
-                    Vec::new()
-                } else {
-                    stage.prompt_ingress.tensor_names.clone()
-                };
+                let optional =
+                    if idx == 0 { Vec::new() } else { stage.prompt_ingress.tensor_names.clone() };
 
                 StageRuntimePlan {
                     stage_index: stage.stage_index,
@@ -618,9 +579,7 @@ impl StageTensorPlan {
             .collect();
 
         ModelShardManifest {
-            model_name: file
-                .metadata_string("general.name")
-                .unwrap_or_else(|| "unknown".into()),
+            model_name: file.metadata_string("general.name").unwrap_or_else(|| "unknown".into()),
             architecture: file.architecture().unwrap_or("unknown").to_string(),
             hidden_size: file.hidden_size(),
             feed_forward_size: file.feed_forward_length(),
@@ -645,31 +604,22 @@ impl StageTensorPlan {
             std::fs::write(&stage_path, serde_json::to_vec_pretty(stage)?)?;
             stage_manifest_paths.push(stage_path);
 
-            let prompt_ingress_list = out_dir.join(format!(
-                "stage-{}-prompt-ingress.txt",
-                stage.stage_index + 1
-            ));
+            let prompt_ingress_list =
+                out_dir.join(format!("stage-{}-prompt-ingress.txt", stage.stage_index + 1));
             let positional_list =
                 out_dir.join(format!("stage-{}-positional.txt", stage.stage_index + 1));
-            let replicated_aux_list = out_dir.join(format!(
-                "stage-{}-replicated-aux.txt",
-                stage.stage_index + 1
-            ));
+            let replicated_aux_list =
+                out_dir.join(format!("stage-{}-replicated-aux.txt", stage.stage_index + 1));
             let owned_list = out_dir.join(format!("stage-{}-owned.txt", stage.stage_index + 1));
             let tail_list = out_dir.join(format!("stage-{}-tail-only.txt", stage.stage_index + 1));
-            let unknown_global_list = out_dir.join(format!(
-                "stage-{}-unknown-global.txt",
-                stage.stage_index + 1
-            ));
+            let unknown_global_list =
+                out_dir.join(format!("stage-{}-unknown-global.txt", stage.stage_index + 1));
 
             std::fs::write(
                 prompt_ingress_list,
                 stage.prompt_ingress.tensor_names.join("\n") + "\n",
             )?;
-            std::fs::write(
-                positional_list,
-                stage.positional.tensor_names.join("\n") + "\n",
-            )?;
+            std::fs::write(positional_list, stage.positional.tensor_names.join("\n") + "\n")?;
             std::fs::write(
                 replicated_aux_list,
                 stage.replicated_aux.tensor_names.join("\n") + "\n",
@@ -688,23 +638,13 @@ impl StageTensorPlan {
             std::fs::write(&runtime_path, serde_json::to_vec_pretty(runtime)?)?;
             runtime_plan_paths.push(runtime_path);
 
-            let required_list = out_dir.join(format!(
-                "runtime-stage-{}-required.txt",
-                runtime.stage_index + 1
-            ));
-            let optional_list = out_dir.join(format!(
-                "runtime-stage-{}-optional.txt",
-                runtime.stage_index + 1
-            ));
+            let required_list =
+                out_dir.join(format!("runtime-stage-{}-required.txt", runtime.stage_index + 1));
+            let optional_list =
+                out_dir.join(format!("runtime-stage-{}-optional.txt", runtime.stage_index + 1));
 
-            std::fs::write(
-                required_list,
-                runtime.required.tensor_names.join("\n") + "\n",
-            )?;
-            std::fs::write(
-                optional_list,
-                runtime.optional.tensor_names.join("\n") + "\n",
-            )?;
+            std::fs::write(required_list, runtime.required.tensor_names.join("\n") + "\n")?;
+            std::fs::write(optional_list, runtime.optional.tensor_names.join("\n") + "\n")?;
 
             let slice_manifest = StageRuntimeSliceManifest {
                 stage_index: runtime.stage_index,
@@ -730,10 +670,8 @@ impl StageTensorPlan {
                     })
                     .collect::<Result<Vec<_>>>()?,
             };
-            let slice_path = out_dir.join(format!(
-                "runtime-stage-{}-slices.json",
-                runtime.stage_index + 1
-            ));
+            let slice_path =
+                out_dir.join(format!("runtime-stage-{}-slices.json", runtime.stage_index + 1));
             std::fs::write(&slice_path, serde_json::to_vec_pretty(&slice_manifest)?)?;
             runtime_slice_paths.push(slice_path);
         }
@@ -750,11 +688,7 @@ impl StageTensorPlan {
 
 fn classify_tensor_role(name: &str) -> TensorRole {
     if let Some(rest) = name.strip_prefix("blk.") {
-        if let Some(idx) = rest
-            .split('.')
-            .next()
-            .and_then(|part| part.parse::<u32>().ok())
-        {
+        if let Some(idx) = rest.split('.').next().and_then(|part| part.parse::<u32>().ok()) {
             return TensorRole::Layer { layer_index: idx };
         }
     }
@@ -788,11 +722,7 @@ fn align_to(value: u64, alignment: u64) -> u64 {
         return value;
     }
     let rem = value % alignment;
-    if rem == 0 {
-        value
-    } else {
-        value + (alignment - rem)
-    }
+    if rem == 0 { value } else { value + (alignment - rem) }
 }
 
 fn metadata_value_to_string(value: &MetadataValue) -> String {
@@ -808,11 +738,7 @@ fn metadata_value_to_string(value: &MetadataValue) -> String {
         MetadataValue::String(v) => v.clone(),
         MetadataValue::Array(values) => format!(
             "[{}]",
-            values
-                .iter()
-                .map(metadata_value_to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
+            values.iter().map(metadata_value_to_string).collect::<Vec<_>>().join(", ")
         ),
         MetadataValue::Uint64(v) => v.to_string(),
         MetadataValue::Int64(v) => v.to_string(),
@@ -978,16 +904,8 @@ mod tests {
         assert_eq!(
             file.suggest_even_stage_split(2).unwrap(),
             vec![
-                StageSplit {
-                    stage_index: 0,
-                    start_layer: 0,
-                    end_layer: 13
-                },
-                StageSplit {
-                    stage_index: 1,
-                    start_layer: 14,
-                    end_layer: 27
-                },
+                StageSplit { stage_index: 0, start_layer: 0, end_layer: 13 },
+                StageSplit { stage_index: 1, start_layer: 14, end_layer: 27 },
             ]
         );
     }
@@ -998,26 +916,14 @@ mod tests {
             classify_tensor_role("blk.7.attn_q.weight"),
             TensorRole::Layer { layer_index: 7 }
         );
-        assert_eq!(
-            classify_tensor_role("token_embd.weight"),
-            TensorRole::PromptIngress
-        );
-        assert_eq!(
-            classify_tensor_role("output_norm.weight"),
-            TensorRole::TailOnly
-        );
-        assert_eq!(
-            classify_tensor_role("rope_freqs.weight"),
-            TensorRole::Positional
-        );
+        assert_eq!(classify_tensor_role("token_embd.weight"), TensorRole::PromptIngress);
+        assert_eq!(classify_tensor_role("output_norm.weight"), TensorRole::TailOnly);
+        assert_eq!(classify_tensor_role("rope_freqs.weight"), TensorRole::Positional);
         assert_eq!(
             classify_tensor_role("per_layer_token_embd.weight"),
             TensorRole::SharedAuxiliary
         );
-        assert_eq!(
-            classify_tensor_role("general.weird"),
-            TensorRole::UnknownGlobal
-        );
+        assert_eq!(classify_tensor_role("general.weird"), TensorRole::UnknownGlobal);
     }
 
     #[test]
@@ -1029,10 +935,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -1058,46 +961,23 @@ mod tests {
         };
 
         let splits = vec![
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ];
         let plan = file.plan_for_splits(&splits);
         let manifest = plan.build_manifest(&file);
 
         assert_eq!(manifest.model_name, "Toy");
         assert_eq!(manifest.stages.len(), 2);
-        assert_eq!(
-            manifest.stages[0].prompt_ingress.tensor_names,
-            vec!["token_embd.weight"]
-        );
-        assert_eq!(
-            manifest.stages[0].owned.tensor_names,
-            vec!["blk.0.attn_q.weight"]
-        );
+        assert_eq!(manifest.stages[0].prompt_ingress.tensor_names, vec!["token_embd.weight"]);
+        assert_eq!(manifest.stages[0].owned.tensor_names, vec!["blk.0.attn_q.weight"]);
         assert!(manifest.stages[1].owned.tensor_names.is_empty());
-        assert_eq!(
-            manifest.stages[1].tail_only.tensor_names,
-            vec!["output_norm.weight"]
-        );
+        assert_eq!(manifest.stages[1].tail_only.tensor_names, vec!["output_norm.weight"]);
         assert_eq!(manifest.runtime_plan.len(), 2);
         assert_eq!(manifest.runtime_plan[0].role, "head");
         assert_eq!(manifest.runtime_plan[1].role, "tail");
-        assert_eq!(
-            manifest.runtime_plan[1].required.tensor_names,
-            vec!["output_norm.weight"]
-        );
-        assert_eq!(
-            manifest.runtime_plan[1].optional.tensor_names,
-            vec!["token_embd.weight"]
-        );
+        assert_eq!(manifest.runtime_plan[1].required.tensor_names, vec!["output_norm.weight"]);
+        assert_eq!(manifest.runtime_plan[1].optional.tensor_names, vec!["token_embd.weight"]);
     }
 
     #[test]
@@ -1110,10 +990,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -1139,16 +1016,8 @@ mod tests {
         };
 
         let splits = vec![
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ];
         let plan = file.plan_for_splits(&splits);
         let written = plan.write_bundle(&file, temp.path()).unwrap();

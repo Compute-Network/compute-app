@@ -3,6 +3,7 @@ members = [
     "crates/compute-cli",
     "crates/compute-daemon",
     "crates/compute-network",
+    "crates/llama-stage-backend",
     "crates/compute-solana",
     "crates/stage-forward-lab",
 ]
@@ -62,6 +63,7 @@ if-addrs = "0.13"
 # Internal crates
 compute-daemon = { path = "crates/compute-daemon" }
 compute-network = { path = "crates/compute-network" }
+llama-stage-backend = { path = "crates/llama-stage-backend" }
 compute-solana = { path = "crates/compute-solana" }
 stage-forward-lab = { path = "crates/stage-forward-lab" }
 

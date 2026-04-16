@@ -14,14 +14,33 @@ fn main() -> Result<()> {
         PathBuf::from("out/gemma-e4b-2stage/packed-stage-2/stage-2-required.index.json")
     });
     let prompt = args.get(3).cloned().unwrap_or_else(|| "Hello".to_string());
-    let vocab_path = PathBuf::from("out/gemma-e4b-2stage/vocab.json");
-    let scores_path = PathBuf::from("out/gemma-e4b-2stage/vocab_scores.json");
+    let arg4_is_cap = args.get(4).and_then(|value| value.parse::<usize>().ok()).is_some();
+    let vocab_path = if arg4_is_cap {
+        PathBuf::from("out/gemma-e4b-2stage/vocab.json")
+    } else {
+        args.get(4)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("out/gemma-e4b-2stage/vocab.json"))
+    };
+    let layer_cap_arg = if arg4_is_cap { 4 } else { 5 };
+    let vocab_cap_arg = if arg4_is_cap { 5 } else { 6 };
+    let layer_cap = args.get(layer_cap_arg).and_then(|value| value.parse::<usize>().ok());
+    let vocab_cap = args.get(vocab_cap_arg).and_then(|value| value.parse::<usize>().ok());
+    let scores_path = vocab_path
+        .parent()
+        .map(|parent| parent.join("vocab_scores.json"))
+        .unwrap_or_else(|| PathBuf::from("out/gemma-e4b-2stage/vocab_scores.json"));
 
     println!("=== Single-Node Reference (Sequential 2-Stage) ===");
     println!("prompt   : {:?}", prompt);
+    println!("vocab    : {}", vocab_path.display());
+    println!("layer cap: {:?}", layer_cap);
+    println!("vocab cap: {:?}", vocab_cap);
     println!();
 
     let mut head = RealGemmaBackend::new(&stage1_path);
+    head.set_debug_layer_cap(layer_cap);
+    head.set_debug_vocab_cap(vocab_cap);
     if vocab_path.exists() {
         let sp = if scores_path.exists() { Some(scores_path.as_path()) } else { None };
         head.load_tokenizer(&vocab_path, sp)?;
@@ -36,6 +55,8 @@ fn main() -> Result<()> {
     })?;
 
     let mut tail = RealGemmaBackend::new(&stage2_path);
+    tail.set_debug_layer_cap(layer_cap);
+    tail.set_debug_vocab_cap(vocab_cap);
     if vocab_path.exists() {
         let sp = if scores_path.exists() { Some(scores_path.as_path()) } else { None };
         tail.load_tokenizer(&vocab_path, sp)?;
@@ -53,20 +74,36 @@ fn main() -> Result<()> {
     let t_2stage = Instant::now();
 
     let head_output = head.begin_prompt("ref-req", &prompt, Some(1), 0)?;
-    let head_state: Vec<f32> = head_output.bytes.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let head_state: Vec<f32> =
+        RealGemmaBackend::decode_hidden_states_payload(&head_output.bytes, head_output.hidden_dim)?
+            .into_iter()
+            .flatten()
+            .collect();
 
     let tail_output = tail.continue_forward(head_output)?;
-    let tail_state: Vec<f32> = tail_output.bytes.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let tail_state: Vec<f32> =
+        RealGemmaBackend::decode_hidden_states_payload(&tail_output.bytes, tail_output.hidden_dim)?
+            .into_iter()
+            .flatten()
+            .collect();
 
-    let sample = tail.sample_tail(tail_output)?;
+    let t_trace_sample = Instant::now();
+    let (sample, trace) = tail.sample_tail_with_trace(tail_output, 5)?;
+    let trace_sample_ms = t_trace_sample.elapsed().as_millis();
     let two_stage_ms = t_2stage.elapsed().as_millis();
 
     println!("total time     : {}ms", two_stage_ms);
     println!("sampled text   : {:?}", sample.text);
+    println!("sample ids     : {:?}", sample.token_ids);
+    println!("trace+sample   : {}ms", trace_sample_ms);
+    println!("logits tensor  : {}", trace.projection_tensor);
+    println!("selected id    : {} ({:.6})", trace.selected_token_id, trace.selected_score);
+    println!(
+        "trace/sample id: {}",
+        sample.token_ids.first().copied() == Some(trace.selected_token_id)
+    );
+    println!("top logits     : {:?}", trace.top_logits);
+    println!("trace json     : {}", serde_json::to_string(&trace)?);
     println!("head rms       : {:.4}", rms(&head_state));
     println!("tail rms       : {:.4}", rms(&tail_state));
     println!("head preview   : {:?}", &head_state[..4]);
@@ -77,20 +114,40 @@ fn main() -> Result<()> {
     let t_single = Instant::now();
 
     let head_output2 = head.begin_prompt("ref-req-2", &prompt, Some(1), 0)?;
-    let head_state2: Vec<f32> = head_output2.bytes.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let head_state2: Vec<f32> = RealGemmaBackend::decode_hidden_states_payload(
+        &head_output2.bytes,
+        head_output2.hidden_dim,
+    )?
+    .into_iter()
+    .flatten()
+    .collect();
 
     let tail_output2 = tail.continue_forward(head_output2)?;
-    let tail_state2: Vec<f32> = tail_output2.bytes.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let tail_state2: Vec<f32> = RealGemmaBackend::decode_hidden_states_payload(
+        &tail_output2.bytes,
+        tail_output2.hidden_dim,
+    )?
+    .into_iter()
+    .flatten()
+    .collect();
 
-    let sample2 = tail.sample_tail(tail_output2)?;
+    let t_trace_sample2 = Instant::now();
+    let (sample2, trace2) = tail.sample_tail_with_trace(tail_output2, 5)?;
+    let trace_sample2_ms = t_trace_sample2.elapsed().as_millis();
     let single_ms = t_single.elapsed().as_millis();
 
     println!("total time     : {}ms", single_ms);
     println!("sampled text   : {:?}", sample2.text);
+    println!("sample ids     : {:?}", sample2.token_ids);
+    println!("trace+sample   : {}ms", trace_sample2_ms);
+    println!("logits tensor  : {}", trace2.projection_tensor);
+    println!("selected id    : {} ({:.6})", trace2.selected_token_id, trace2.selected_score);
+    println!(
+        "trace/sample id: {}",
+        sample2.token_ids.first().copied() == Some(trace2.selected_token_id)
+    );
+    println!("top logits     : {:?}", trace2.top_logits);
+    println!("trace json     : {}", serde_json::to_string(&trace2)?);
     println!("head rms       : {:.4}", rms(&head_state2));
     println!("tail rms       : {:.4}", rms(&tail_state2));
     println!("head preview   : {:?}", &head_state2[..4]);
@@ -111,15 +168,15 @@ fn main() -> Result<()> {
     } else {
         println!("FAIL: non-deterministic execution detected");
         if !head_match {
-            let diff: f32 = head_state.iter().zip(head_state2.iter())
-                .map(|(a, b)| (a - b).abs())
-                .sum::<f32>() / head_state.len() as f32;
+            let diff: f32 =
+                head_state.iter().zip(head_state2.iter()).map(|(a, b)| (a - b).abs()).sum::<f32>()
+                    / head_state.len() as f32;
             println!("  head mean abs diff: {:.8}", diff);
         }
         if !tail_match {
-            let diff: f32 = tail_state.iter().zip(tail_state2.iter())
-                .map(|(a, b)| (a - b).abs())
-                .sum::<f32>() / tail_state.len() as f32;
+            let diff: f32 =
+                tail_state.iter().zip(tail_state2.iter()).map(|(a, b)| (a - b).abs()).sum::<f32>()
+                    / tail_state.len() as f32;
             println!("  tail mean abs diff: {:.8}", diff);
         }
     }

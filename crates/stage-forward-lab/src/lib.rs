@@ -6,10 +6,54 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub mod gguf;
+pub mod prompt_suite;
+pub mod prompting;
 pub mod quants;
 pub mod real_forward;
 pub mod real_math;
 pub mod tokenizer;
+
+const STAGE_TENSOR_BYTES_MAGIC: [u8; 4] = *b"stb1";
+const STAGE_TENSOR_BYTES_HEADER_LEN: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageTensorByteSections<'a> {
+    pub hidden_bytes: &'a [u8],
+    pub aux_bytes: Option<&'a [u8]>,
+}
+
+pub fn stage_tensor_byte_sections(bytes: &[u8]) -> Option<StageTensorByteSections<'_>> {
+    if bytes.len() < STAGE_TENSOR_BYTES_HEADER_LEN || bytes[..4] != STAGE_TENSOR_BYTES_MAGIC {
+        return None;
+    }
+    let hidden_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    let aux_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    let total_len = STAGE_TENSOR_BYTES_HEADER_LEN + hidden_len + aux_len;
+    if total_len != bytes.len() {
+        return None;
+    }
+    let hidden_start = STAGE_TENSOR_BYTES_HEADER_LEN;
+    let hidden_end = hidden_start + hidden_len;
+    let aux_bytes = if aux_len == 0 { None } else { Some(&bytes[hidden_end..]) };
+    Some(StageTensorByteSections { hidden_bytes: &bytes[hidden_start..hidden_end], aux_bytes })
+}
+
+pub fn encode_stage_tensor_bytes(hidden_bytes: &[u8], aux_bytes: Option<&[u8]>) -> Vec<u8> {
+    let Some(aux_bytes) = aux_bytes.filter(|bytes| !bytes.is_empty()) else {
+        return hidden_bytes.to_vec();
+    };
+
+    let hidden_len = u32::try_from(hidden_bytes.len()).unwrap_or(u32::MAX);
+    let aux_len = u32::try_from(aux_bytes.len()).unwrap_or(u32::MAX);
+    let mut framed =
+        Vec::with_capacity(STAGE_TENSOR_BYTES_HEADER_LEN + hidden_bytes.len() + aux_bytes.len());
+    framed.extend_from_slice(&STAGE_TENSOR_BYTES_MAGIC);
+    framed.extend_from_slice(&hidden_len.to_le_bytes());
+    framed.extend_from_slice(&aux_len.to_le_bytes());
+    framed.extend_from_slice(hidden_bytes);
+    framed.extend_from_slice(aux_bytes);
+    framed
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PayloadKind {
@@ -33,7 +77,9 @@ pub struct StageTensor {
 
 impl StageTensor {
     pub fn hidden_state_len(&self) -> usize {
-        self.bytes.len()
+        stage_tensor_byte_sections(&self.bytes)
+            .map(|sections| sections.hidden_bytes.len())
+            .unwrap_or(self.bytes.len())
     }
 }
 
@@ -85,12 +131,19 @@ pub struct StageLayout {
     pub is_tail: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageSample {
     pub request_id: String,
     pub model_id: String,
     pub text: String,
+    pub token_ids: Vec<u32>,
     pub completion_tokens: u32,
+}
+
+impl StageSample {
+    pub fn text_token_ids(text: &str) -> Vec<u32> {
+        text.chars().map(|ch| ch as u32).collect()
+    }
 }
 
 pub const STAGE_FORWARD_FRAME_VERSION: u32 = 1;
@@ -241,17 +294,11 @@ pub struct StageCarryPolicy {
 
 impl StageCarryPolicy {
     pub fn attention_only() -> Self {
-        Self {
-            carry_attention: true,
-            carry_ffn: false,
-        }
+        Self { carry_attention: true, carry_ffn: false }
     }
 
     pub fn full() -> Self {
-        Self {
-            carry_attention: true,
-            carry_ffn: true,
-        }
+        Self { carry_attention: true, carry_ffn: true }
     }
 
     pub fn for_boundary(layout: &StageLayout, continuation: Option<&StageContinuation>) -> Self {
@@ -260,10 +307,7 @@ impl StageCarryPolicy {
         } else if !layout.is_head && !layout.is_tail {
             Self::full()
         } else {
-            Self {
-                carry_attention: false,
-                carry_ffn: false,
-            }
+            Self { carry_attention: false, carry_ffn: false }
         };
 
         if let Some(continuation) = continuation {
@@ -491,16 +535,12 @@ pub struct StageResumeReceipt {
 
 impl StageForwardFrame {
     fn carry_with_policy(&self, policy: &StageCarryPolicy) -> Option<StageCarryState> {
-        self.state
-            .carry
-            .as_ref()
-            .map(|carry| carry.with_policy(policy))
-            .or_else(|| {
-                self.state
-                    .transient
-                    .as_ref()
-                    .map(|transient| StageCarryState::from_transient(transient, policy))
-            })
+        self.state.carry.as_ref().map(|carry| carry.with_policy(policy)).or_else(|| {
+            self.state
+                .transient
+                .as_ref()
+                .map(|transient| StageCarryState::from_transient(transient, policy))
+        })
     }
 
     pub fn from_tensor(
@@ -639,17 +679,11 @@ impl StageForwardFrame {
         );
         let capabilities = StageResumeCapabilities::from_execution_programs(
             execution_programs,
-            self.state
-                .continuation
-                .as_ref()
-                .and_then(|continuation| continuation.next_layer_index),
+            self.state.continuation.as_ref().and_then(|continuation| continuation.next_layer_index),
         );
         let budgets = StageResumeBudgets::from_execution_programs(
             execution_programs,
-            self.state
-                .continuation
-                .as_ref()
-                .and_then(|continuation| continuation.next_layer_index),
+            self.state.continuation.as_ref().and_then(|continuation| continuation.next_layer_index),
             &capabilities,
         );
         let carry = self
@@ -670,11 +704,7 @@ impl StageForwardFrame {
             },
             state: StageTransferStateEnvelope {
                 continuation: self.state.continuation.clone(),
-                transient: self
-                    .state
-                    .transient
-                    .as_ref()
-                    .map(StageTransferTransientState::from),
+                transient: self.state.transient.as_ref().map(StageTransferTransientState::from),
                 carry,
             },
         }
@@ -696,11 +726,7 @@ impl StageForwardFrame {
             },
             state: StageTransferStateEnvelope {
                 continuation: self.state.continuation.clone(),
-                transient: self
-                    .state
-                    .transient
-                    .as_ref()
-                    .map(StageTransferTransientState::from),
+                transient: self.state.transient.as_ref().map(StageTransferTransientState::from),
                 carry: self.carry_with_policy(policy),
             },
         }
@@ -724,9 +750,7 @@ impl StageBoundaryPlan {
     fn attention_provenance_distance(
         provenance: &Option<AttentionCheckpointProvenance>,
     ) -> Option<u32> {
-        provenance
-            .as_ref()
-            .map(|provenance| provenance.layer_distance_to_boundary)
+        provenance.as_ref().map(|provenance| provenance.layer_distance_to_boundary)
     }
 
     pub fn from_frame_with_execution(
@@ -812,18 +836,10 @@ impl StageBoundaryPlan {
             frame,
             frame,
             carry_policy,
-            continuation
-                .map(|continuation| continuation.has_attention_path)
-                .unwrap_or(false),
-            continuation
-                .map(|continuation| continuation.has_attention_path)
-                .unwrap_or(false),
-            continuation
-                .map(|continuation| continuation.has_attention_path)
-                .unwrap_or(false),
-            continuation
-                .map(|continuation| continuation.has_attention_path)
-                .unwrap_or(false),
+            continuation.map(|continuation| continuation.has_attention_path).unwrap_or(false),
+            continuation.map(|continuation| continuation.has_attention_path).unwrap_or(false),
+            continuation.map(|continuation| continuation.has_attention_path).unwrap_or(false),
+            continuation.map(|continuation| continuation.has_attention_path).unwrap_or(false),
             None,
             None,
             None,
@@ -833,18 +849,10 @@ impl StageBoundaryPlan {
             None,
             None,
             StageResumeContractSummary::default(),
-            continuation
-                .map(|continuation| continuation.has_attention_path)
-                .unwrap_or(false),
-            continuation
-                .map(|continuation| continuation.has_attention_path)
-                .unwrap_or(false),
-            continuation
-                .map(|continuation| continuation.has_ffn_path)
-                .unwrap_or(false),
-            continuation
-                .map(|continuation| continuation.has_projection_path)
-                .unwrap_or(false),
+            continuation.map(|continuation| continuation.has_attention_path).unwrap_or(false),
+            continuation.map(|continuation| continuation.has_attention_path).unwrap_or(false),
+            continuation.map(|continuation| continuation.has_ffn_path).unwrap_or(false),
+            continuation.map(|continuation| continuation.has_projection_path).unwrap_or(false),
         )
     }
 
@@ -872,12 +880,8 @@ impl StageBoundaryPlan {
     ) -> Self {
         let continuation = frame.state.continuation.as_ref();
         let attention_provenance =
-            capability_frame
-                .state
-                .carry
-                .as_ref()
-                .and_then(|carry| carry.attention.as_ref())
-                .map(|attention| {
+            capability_frame.state.carry.as_ref().and_then(|carry| carry.attention.as_ref()).map(
+                |attention| {
                     (
                         attention.projection.as_ref().and_then(|projection| {
                             Self::attention_provenance_distance(&projection.q_provenance)
@@ -895,7 +899,8 @@ impl StageBoundaryPlan {
                             Self::attention_provenance_distance(&mix.value_provenance)
                         }),
                     )
-                });
+                },
+            );
         let attention_substates = if carry_policy.carry_attention {
             capability_frame
                 .state
@@ -925,58 +930,46 @@ impl StageBoundaryPlan {
                                 .max(projection.k_lane_indices.len())
                                 .max(projection.v_lane_indices.len())
                         }),
-                        attention
-                            .mix
-                            .as_ref()
-                            .map(|mix| mix.score_lane_indices.len()),
-                        attention
-                            .mix
-                            .as_ref()
-                            .map(|mix| mix.value_lane_indices.len()),
+                        attention.mix.as_ref().map(|mix| mix.score_lane_indices.len()),
+                        attention.mix.as_ref().map(|mix| mix.value_lane_indices.len()),
                         attention.mix.as_ref().map(|mix| {
-                            mix.score_lane_indices
-                                .len()
-                                .max(mix.value_lane_indices.len())
+                            mix.score_lane_indices.len().max(mix.value_lane_indices.len())
                         }),
                     )
                 })
                 .or_else(|| {
-                    capability_frame
-                        .state
-                        .transient
-                        .as_ref()
-                        .and_then(|transient| {
-                            transient.attention.as_ref().map(|attention| {
-                                (
-                                    attention.width,
+                    capability_frame.state.transient.as_ref().and_then(|transient| {
+                        transient.attention.as_ref().map(|attention| {
+                            (
+                                attention.width,
+                                attention
+                                    .q_preview
+                                    .len()
+                                    .max(attention.k_preview.len())
+                                    .max(attention.v_preview.len())
+                                    .max(attention.score_preview.len())
+                                    .max(attention.value_preview.len()),
+                                Some(attention.q_preview.len()),
+                                Some(attention.k_preview.len()),
+                                Some(attention.v_preview.len()),
+                                Some(
                                     attention
                                         .q_preview
                                         .len()
                                         .max(attention.k_preview.len())
-                                        .max(attention.v_preview.len())
-                                        .max(attention.score_preview.len())
+                                        .max(attention.v_preview.len()),
+                                ),
+                                Some(attention.score_preview.len()),
+                                Some(attention.value_preview.len()),
+                                Some(
+                                    attention
+                                        .score_preview
+                                        .len()
                                         .max(attention.value_preview.len()),
-                                    Some(attention.q_preview.len()),
-                                    Some(attention.k_preview.len()),
-                                    Some(attention.v_preview.len()),
-                                    Some(
-                                        attention
-                                            .q_preview
-                                            .len()
-                                            .max(attention.k_preview.len())
-                                            .max(attention.v_preview.len()),
-                                    ),
-                                    Some(attention.score_preview.len()),
-                                    Some(attention.value_preview.len()),
-                                    Some(
-                                        attention
-                                            .score_preview
-                                            .len()
-                                            .max(attention.value_preview.len()),
-                                    ),
-                                )
-                            })
+                                ),
+                            )
                         })
+                    })
                 })
         } else {
             None
@@ -993,21 +986,17 @@ impl StageBoundaryPlan {
                 .as_ref()
                 .and_then(|carry| carry.ffn.as_ref().map(|ffn| (ffn.width, ffn.lane_count())))
                 .or_else(|| {
-                    capability_frame
-                        .state
-                        .transient
-                        .as_ref()
-                        .and_then(|transient| {
-                            transient.ffn.as_ref().map(|ffn| {
-                                (
-                                    ffn.width,
-                                    ffn.gate_preview
-                                        .len()
-                                        .max(ffn.up_preview.len())
-                                        .max(ffn.activation_preview.len()),
-                                )
-                            })
+                    capability_frame.state.transient.as_ref().and_then(|transient| {
+                        transient.ffn.as_ref().map(|ffn| {
+                            (
+                                ffn.width,
+                                ffn.gate_preview
+                                    .len()
+                                    .max(ffn.up_preview.len())
+                                    .max(ffn.activation_preview.len()),
+                            )
                         })
+                    })
                 })
         } else {
             None
@@ -1083,14 +1072,15 @@ impl StageBoundaryPlan {
     }
 
     pub fn validate_against_transfer(&self, frame: &StageTransferFrame) -> Result<()> {
-        self.resumable_attention_contract
-            .validate_against_freshness(StageResumeFreshnessPolicy {
+        self.resumable_attention_contract.validate_against_freshness(
+            StageResumeFreshnessPolicy {
                 attention_q_max_distance: self.resumable_attention_q_max_distance,
                 attention_k_max_distance: self.resumable_attention_k_max_distance,
                 attention_v_max_distance: self.resumable_attention_v_max_distance,
                 attention_score_max_distance: self.resumable_attention_score_max_distance,
                 attention_value_max_distance: self.resumable_attention_value_max_distance,
-            })?;
+            },
+        )?;
         if self.source_stage_id != frame.route.source_stage_id {
             bail!(
                 "Boundary plan source stage {} does not match transfer source stage {}",
@@ -1127,12 +1117,8 @@ impl StageBoundaryPlan {
             );
         }
         let transfer_carry = frame.state.carry.as_ref();
-        let has_attention = transfer_carry
-            .and_then(|carry| carry.attention.as_ref())
-            .is_some();
-        let has_ffn = transfer_carry
-            .and_then(|carry| carry.ffn.as_ref())
-            .is_some();
+        let has_attention = transfer_carry.and_then(|carry| carry.attention.as_ref()).is_some();
+        let has_ffn = transfer_carry.and_then(|carry| carry.ffn.as_ref()).is_some();
         if self.expects_attention_carry != has_attention {
             bail!(
                 "Boundary plan expects attention carry={} but transfer has {}",
@@ -1191,10 +1177,9 @@ impl StageBoundaryPlan {
                 transfer_mix.is_some()
             );
         }
-        if let (Some(projection), Some(expected_lanes)) = (
-            transfer_projection,
-            self.expected_attention_projection_lanes,
-        ) {
+        if let (Some(projection), Some(expected_lanes)) =
+            (transfer_projection, self.expected_attention_projection_lanes)
+        {
             let actual_lanes = projection
                 .q_lane_indices
                 .len()
@@ -1288,10 +1273,7 @@ impl StageBoundaryPlan {
         }
         if let (Some(mix), Some(expected_lanes)) = (transfer_mix, self.expected_attention_mix_lanes)
         {
-            let actual_lanes = mix
-                .score_lane_indices
-                .len()
-                .max(mix.value_lane_indices.len());
+            let actual_lanes = mix.score_lane_indices.len().max(mix.value_lane_indices.len());
             if actual_lanes != expected_lanes {
                 bail!(
                     "Boundary plan expects attention mix lanes {} but transfer has {}",
@@ -1352,10 +1334,9 @@ impl StageBoundaryPlan {
                 );
             }
         }
-        if let (Some(ffn), Some(expected_width)) = (
-            transfer_carry.and_then(|carry| carry.ffn.as_ref()),
-            self.expected_ffn_width,
-        ) {
+        if let (Some(ffn), Some(expected_width)) =
+            (transfer_carry.and_then(|carry| carry.ffn.as_ref()), self.expected_ffn_width)
+        {
             if ffn.width != expected_width {
                 bail!(
                     "Boundary plan expects ffn width {} but transfer has {}",
@@ -1364,10 +1345,9 @@ impl StageBoundaryPlan {
                 );
             }
         }
-        if let (Some(ffn), Some(expected_lanes)) = (
-            transfer_carry.and_then(|carry| carry.ffn.as_ref()),
-            self.expected_ffn_lanes,
-        ) {
+        if let (Some(ffn), Some(expected_lanes)) =
+            (transfer_carry.and_then(|carry| carry.ffn.as_ref()), self.expected_ffn_lanes)
+        {
             if ffn.lane_count() != expected_lanes {
                 bail!(
                     "Boundary plan expects ffn lanes {} but transfer has {}",
@@ -1832,8 +1812,7 @@ impl TransientSignature {
         let rms =
             (preview.iter().map(|value| value * value).sum::<f32>() / preview_len as f32).sqrt();
         let checksum = preview.iter().fold(0u64, |acc, value| {
-            acc.wrapping_mul(16777619)
-                .wrapping_add(value.to_bits() as u64)
+            acc.wrapping_mul(16777619).wrapping_add(value.to_bits() as u64)
         });
 
         Self {
@@ -1884,12 +1863,8 @@ impl CarryableAttentionState {
         projection: Option<&CarryableAttentionProjectionState>,
         mix: Option<&CarryableAttentionMixState>,
     ) -> StageResumeContractSummary {
-        Self {
-            contract,
-            projection: projection.cloned(),
-            mix: mix.cloned(),
-        }
-        .contract_for_present_substates()
+        Self { contract, projection: projection.cloned(), mix: mix.cloned() }
+            .contract_for_present_substates()
     }
 
     fn contract_for_present_substates(&self) -> StageResumeContractSummary {
@@ -2139,17 +2114,9 @@ impl CarryableAttentionState {
     }
 
     fn clamp_lanes(lane_indices: &[usize], vectors: &[&[f32]], budget: usize) -> Vec<usize> {
-        let available = vectors
-            .iter()
-            .map(|values| values.len())
-            .max()
-            .unwrap_or(0)
-            .min(lane_indices.len());
-        lane_indices
-            .iter()
-            .take(available.min(budget))
-            .copied()
-            .collect()
+        let available =
+            vectors.iter().map(|values| values.len()).max().unwrap_or(0).min(lane_indices.len());
+        lane_indices.iter().take(available.min(budget)).copied().collect()
     }
 
     fn pick_lanes(values: &[f32], lane_count: usize) -> Vec<f32> {
@@ -2295,11 +2262,7 @@ impl CarryableAttentionState {
     pub fn mix_lane_count(&self) -> usize {
         self.mix
             .as_ref()
-            .map(|mix| {
-                mix.score_lane_indices
-                    .len()
-                    .max(mix.value_lane_indices.len())
-            })
+            .map(|mix| mix.score_lane_indices.len().max(mix.value_lane_indices.len()))
             .unwrap_or(0)
     }
 
@@ -2354,12 +2317,7 @@ impl CarryableFfnState {
                 lane_indices: self.lane_indices.iter().take(lane_count).copied().collect(),
                 gate_head: self.gate_head.iter().take(lane_count).copied().collect(),
                 up_head: self.up_head.iter().take(lane_count).copied().collect(),
-                activation_head: self
-                    .activation_head
-                    .iter()
-                    .take(lane_count)
-                    .copied()
-                    .collect(),
+                activation_head: self.activation_head.iter().take(lane_count).copied().collect(),
             })
         }
     }
@@ -2386,10 +2344,7 @@ impl CarryableFfnState {
 
     pub fn lane_count(&self) -> usize {
         if self.lane_indices.is_empty() {
-            self.gate_head
-                .len()
-                .max(self.up_head.len())
-                .max(self.activation_head.len())
+            self.gate_head.len().max(self.up_head.len()).max(self.activation_head.len())
         } else {
             self.lane_indices.len()
         }
@@ -2398,35 +2353,25 @@ impl CarryableFfnState {
 
 impl StageCarryState {
     fn age_attention_by_layers(&self, layers: u32) -> Self {
-        let attention = self
-            .attention
-            .as_ref()
-            .map(|attention| CarryableAttentionState {
-                contract: attention.contract,
-                projection: attention.projection.as_ref().map(|projection| {
-                    let mut aged = projection.clone();
-                    aged.q_provenance = aged.q_provenance.as_ref().map(|p| p.age_by_layers(layers));
-                    aged.k_provenance = aged.k_provenance.as_ref().map(|p| p.age_by_layers(layers));
-                    aged.v_provenance = aged.v_provenance.as_ref().map(|p| p.age_by_layers(layers));
-                    aged
-                }),
-                mix: attention.mix.as_ref().map(|mix| {
-                    let mut aged = mix.clone();
-                    aged.score_provenance = aged
-                        .score_provenance
-                        .as_ref()
-                        .map(|p| p.age_by_layers(layers));
-                    aged.value_provenance = aged
-                        .value_provenance
-                        .as_ref()
-                        .map(|p| p.age_by_layers(layers));
-                    aged
-                }),
-            });
-        Self {
-            attention,
-            ffn: self.ffn.clone(),
-        }
+        let attention = self.attention.as_ref().map(|attention| CarryableAttentionState {
+            contract: attention.contract,
+            projection: attention.projection.as_ref().map(|projection| {
+                let mut aged = projection.clone();
+                aged.q_provenance = aged.q_provenance.as_ref().map(|p| p.age_by_layers(layers));
+                aged.k_provenance = aged.k_provenance.as_ref().map(|p| p.age_by_layers(layers));
+                aged.v_provenance = aged.v_provenance.as_ref().map(|p| p.age_by_layers(layers));
+                aged
+            }),
+            mix: attention.mix.as_ref().map(|mix| {
+                let mut aged = mix.clone();
+                aged.score_provenance =
+                    aged.score_provenance.as_ref().map(|p| p.age_by_layers(layers));
+                aged.value_provenance =
+                    aged.value_provenance.as_ref().map(|p| p.age_by_layers(layers));
+                aged
+            }),
+        });
+        Self { attention, ffn: self.ffn.clone() }
     }
 
     pub fn with_resume_contract(
@@ -2458,31 +2403,16 @@ impl StageCarryState {
             }
         });
         let ffn = self.ffn.as_ref().and_then(|ffn| {
-            if capabilities.ffn_path {
-                ffn.with_lane_budget(budgets.ffn_lanes)
-            } else {
-                None
-            }
+            if capabilities.ffn_path { ffn.with_lane_budget(budgets.ffn_lanes) } else { None }
         });
-        if attention.is_none() && ffn.is_none() {
-            None
-        } else {
-            Some(Self { attention, ffn })
-        }
+        if attention.is_none() && ffn.is_none() { None } else { Some(Self { attention, ffn }) }
     }
 
     pub fn with_resume_capabilities(&self, capabilities: &StageResumeCapabilities) -> Option<Self> {
         let attention = self.attention.as_ref().and_then(|attention| {
-            let projection = if capabilities.attention_projection {
-                attention.projection.clone()
-            } else {
-                None
-            };
-            let mix = if capabilities.attention_mix {
-                attention.mix.clone()
-            } else {
-                None
-            };
+            let projection =
+                if capabilities.attention_projection { attention.projection.clone() } else { None };
+            let mix = if capabilities.attention_mix { attention.mix.clone() } else { None };
             if projection.is_none() {
                 return None;
             }
@@ -2496,40 +2426,21 @@ impl StageCarryState {
                 mix,
             })
         });
-        let ffn = if capabilities.ffn_path {
-            self.ffn.clone()
-        } else {
-            None
-        };
-        if attention.is_none() && ffn.is_none() {
-            None
-        } else {
-            Some(Self { attention, ffn })
-        }
+        let ffn = if capabilities.ffn_path { self.ffn.clone() } else { None };
+        if attention.is_none() && ffn.is_none() { None } else { Some(Self { attention, ffn }) }
     }
 
     pub fn with_policy(&self, policy: &StageCarryPolicy) -> Self {
         Self {
-            attention: if policy.carry_attention {
-                self.attention.clone()
-            } else {
-                None
-            },
-            ffn: if policy.carry_ffn {
-                self.ffn.clone()
-            } else {
-                None
-            },
+            attention: if policy.carry_attention { self.attention.clone() } else { None },
+            ffn: if policy.carry_ffn { self.ffn.clone() } else { None },
         }
     }
 
     pub fn from_transient(value: &StageTransientState, policy: &StageCarryPolicy) -> Self {
         Self {
             attention: if policy.carry_attention {
-                value
-                    .attention
-                    .as_ref()
-                    .map(CarryableAttentionState::from_attention)
+                value.attention.as_ref().map(CarryableAttentionState::from_attention)
             } else {
                 None
             },
@@ -2542,10 +2453,8 @@ impl StageCarryState {
     }
 
     pub fn to_transient_state(&self) -> Option<StageTransientState> {
-        let attention = self
-            .attention
-            .as_ref()
-            .and_then(CarryableAttentionState::to_attention_continuation);
+        let attention =
+            self.attention.as_ref().and_then(CarryableAttentionState::to_attention_continuation);
         let ffn = self.ffn.as_ref().map(|ffn| FfnContinuation {
             width: ffn.width,
             lane_indices: ffn.lane_indices.clone(),
@@ -2591,11 +2500,8 @@ impl StageTransferFrame {
                 self.payload.stage_trace.last()
             );
         }
-        if let Some(attention) = self
-            .state
-            .carry
-            .as_ref()
-            .and_then(|carry| carry.attention.as_ref())
+        if let Some(attention) =
+            self.state.carry.as_ref().and_then(|carry| carry.attention.as_ref())
         {
             if attention.width() == 0 {
                 bail!("Attention carry width must be non-zero");
@@ -2632,25 +2538,13 @@ impl StageTransferFrame {
                 {
                     bail!("Attention projection carry vectors must match projection lane count");
                 }
-                if projection
-                    .q_lane_indices
-                    .iter()
-                    .any(|lane| *lane >= projection.width)
-                {
+                if projection.q_lane_indices.iter().any(|lane| *lane >= projection.width) {
                     bail!("Attention q carry lane index exceeds width");
                 }
-                if projection
-                    .k_lane_indices
-                    .iter()
-                    .any(|lane| *lane >= projection.width)
-                {
+                if projection.k_lane_indices.iter().any(|lane| *lane >= projection.width) {
                     bail!("Attention k carry lane index exceeds width");
                 }
-                if projection
-                    .v_lane_indices
-                    .iter()
-                    .any(|lane| *lane >= projection.width)
-                {
+                if projection.v_lane_indices.iter().any(|lane| *lane >= projection.width) {
                     bail!("Attention projection carry lane index exceeds width");
                 }
             }
@@ -2679,12 +2573,7 @@ impl StageTransferFrame {
                 }
             }
         }
-        if let Some(ffn) = self
-            .state
-            .carry
-            .as_ref()
-            .and_then(|carry| carry.ffn.as_ref())
-        {
+        if let Some(ffn) = self.state.carry.as_ref().and_then(|carry| carry.ffn.as_ref()) {
             if ffn.width == 0 {
                 bail!("FFN carry width must be non-zero");
             }
@@ -2692,11 +2581,7 @@ impl StageTransferFrame {
                 bail!("FFN carry must include at least one lane");
             }
             if ffn.lane_count() > ffn.width {
-                bail!(
-                    "FFN carry lane count {} exceeds width {}",
-                    ffn.lane_count(),
-                    ffn.width
-                );
+                bail!("FFN carry lane count {} exceeds width {}", ffn.lane_count(), ffn.width);
             }
             if ffn.gate_head.len() != ffn.lane_count()
                 || ffn.up_head.len() != ffn.lane_count()
@@ -2726,10 +2611,7 @@ impl StageTransferFrame {
         };
         tensor.continuation = self.state.continuation;
         tensor.carry = self.state.carry;
-        tensor.transient = tensor
-            .carry
-            .as_ref()
-            .and_then(StageCarryState::to_transient_state);
+        tensor.transient = tensor.carry.as_ref().and_then(StageCarryState::to_transient_state);
         tensor
     }
 }
@@ -2737,6 +2619,8 @@ impl StageTransferFrame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedRuntimeStage {
     pub stage_index: u32,
+    pub start_layer: u32,
+    pub end_layer: u32,
     pub role: String,
     pub required: BTreeSet<String>,
     pub optional: BTreeSet<String>,
@@ -2884,9 +2768,7 @@ pub struct ExecutionOp {
 
 impl ExecutionOp {
     fn blend_mode(weight: f32) -> ExecutionResumeBlendMode {
-        ExecutionResumeBlendMode::Blend {
-            weight_milli: (weight * 1000.0).round() as u16,
-        }
+        ExecutionResumeBlendMode::Blend { weight_milli: (weight * 1000.0).round() as u16 }
     }
 
     fn resume_contract_for_kind(kind: ExecutionOpKind) -> ExecutionResumeContract {
@@ -2937,9 +2819,9 @@ impl ExecutionOp {
             recompute_phase: contract.recompute_phase,
             blend_strength: match contract.blend_mode {
                 ExecutionResumeBlendMode::Overwrite => None,
-                ExecutionResumeBlendMode::Blend { weight_milli } => Some(
-                    StageResumeFreshnessPolicy::blend_strength_for_weight_milli(weight_milli),
-                ),
+                ExecutionResumeBlendMode::Blend { weight_milli } => {
+                    Some(StageResumeFreshnessPolicy::blend_strength_for_weight_milli(weight_milli))
+                }
             },
             blend_weight_milli: match contract.blend_mode {
                 ExecutionResumeBlendMode::Overwrite => None,
@@ -2958,12 +2840,7 @@ impl ExecutionOp {
     fn descriptors_for_contract(
         contract: &ExecutionResumeContract,
     ) -> Vec<ExecutionResumeDescriptor> {
-        contract
-            .attention
-            .iter()
-            .copied()
-            .map(Self::descriptor_for_attention_contract)
-            .collect()
+        contract.attention.iter().copied().map(Self::descriptor_for_attention_contract).collect()
     }
 
     #[cfg(test)]
@@ -2979,13 +2856,7 @@ impl ExecutionOp {
         binding_reason: &'static str,
     ) -> Self {
         let resume_contract = Self::resume_contract_for_kind(kind.clone());
-        Self {
-            kind,
-            tensor_names,
-            binding,
-            binding_reason,
-            resume_contract,
-        }
+        Self { kind, tensor_names, binding, binding_reason, resume_contract }
     }
 
     fn attention_resume_descriptors(&self) -> Vec<ExecutionResumeDescriptor> {
@@ -3146,11 +3017,24 @@ impl LoadedRuntimeBundle {
 
         let mut stages = Vec::with_capacity(manifest.runtime_plan.len());
         for runtime in &manifest.runtime_plan {
+            let stage_manifest_path = root.join(format!("stage-{}.json", runtime.stage_index + 1));
             let runtime_path = root.join(format!("runtime-stage-{}.json", runtime.stage_index + 1));
+            let stage_manifest: gguf::StageManifest = serde_json::from_str(
+                &fs::read_to_string(&stage_manifest_path).map_err(|err| {
+                    anyhow::anyhow!("Failed to read {}: {err}", stage_manifest_path.display())
+                })?,
+            )?;
             let file_runtime: gguf::StageRuntimePlan =
                 serde_json::from_str(&fs::read_to_string(&runtime_path).map_err(|err| {
                     anyhow::anyhow!("Failed to read {}: {err}", runtime_path.display())
                 })?)?;
+            if stage_manifest.stage_index != runtime.stage_index {
+                bail!(
+                    "Stage manifest {} does not match runtime stage index {}",
+                    stage_manifest_path.display(),
+                    runtime.stage_index + 1
+                );
+            }
             if &file_runtime != runtime {
                 bail!(
                     "Runtime plan file {} does not match top-level manifest for stage {}",
@@ -3159,18 +3043,12 @@ impl LoadedRuntimeBundle {
                 );
             }
 
-            let required_path = root.join(format!(
-                "runtime-stage-{}-required.txt",
-                runtime.stage_index + 1
-            ));
-            let optional_path = root.join(format!(
-                "runtime-stage-{}-optional.txt",
-                runtime.stage_index + 1
-            ));
-            let slices_path = root.join(format!(
-                "runtime-stage-{}-slices.json",
-                runtime.stage_index + 1
-            ));
+            let required_path =
+                root.join(format!("runtime-stage-{}-required.txt", runtime.stage_index + 1));
+            let optional_path =
+                root.join(format!("runtime-stage-{}-optional.txt", runtime.stage_index + 1));
+            let slices_path =
+                root.join(format!("runtime-stage-{}-slices.json", runtime.stage_index + 1));
 
             let required = read_tensor_set(&required_path)?;
             let optional = read_tensor_set(&optional_path)?;
@@ -3183,16 +3061,10 @@ impl LoadedRuntimeBundle {
                 runtime.required.tensor_names.iter().cloned().collect();
             let expected_optional: BTreeSet<_> =
                 runtime.optional.tensor_names.iter().cloned().collect();
-            let slice_required: BTreeSet<_> = slices
-                .required
-                .iter()
-                .map(|slice| slice.name.clone())
-                .collect();
-            let slice_optional: BTreeSet<_> = slices
-                .optional
-                .iter()
-                .map(|slice| slice.name.clone())
-                .collect();
+            let slice_required: BTreeSet<_> =
+                slices.required.iter().map(|slice| slice.name.clone()).collect();
+            let slice_optional: BTreeSet<_> =
+                slices.optional.iter().map(|slice| slice.name.clone()).collect();
 
             if required != expected_required {
                 bail!(
@@ -3218,6 +3090,8 @@ impl LoadedRuntimeBundle {
 
             stages.push(LoadedRuntimeStage {
                 stage_index: runtime.stage_index,
+                start_layer: stage_manifest.start_layer,
+                end_layer: stage_manifest.end_layer,
                 role: runtime.role.clone(),
                 required,
                 optional,
@@ -3228,19 +3102,11 @@ impl LoadedRuntimeBundle {
             });
         }
 
-        Ok(Self {
-            model_name: manifest.model_name,
-            architecture: manifest.architecture,
-            stages,
-        })
+        Ok(Self { model_name: manifest.model_name, architecture: manifest.architecture, stages })
     }
 
     pub fn validate_against_gguf(&self, file: &gguf::GgufFile) -> Result<()> {
-        let known: BTreeSet<_> = file
-            .tensors
-            .iter()
-            .map(|tensor| tensor.name.as_str())
-            .collect();
+        let known: BTreeSet<_> = file.tensors.iter().map(|tensor| tensor.name.as_str()).collect();
         for stage in &self.stages {
             for name in stage.required.iter().chain(stage.optional.iter()) {
                 if !known.contains(name.as_str()) {
@@ -3256,9 +3122,7 @@ impl LoadedRuntimeBundle {
     }
 
     pub fn stage(&self, stage_index: u32) -> Option<&LoadedRuntimeStage> {
-        self.stages
-            .iter()
-            .find(|stage| stage.stage_index == stage_index)
+        self.stages.iter().find(|stage| stage.stage_index == stage_index)
     }
 }
 
@@ -3279,35 +3143,46 @@ impl StageResidencyAdapter {
         let stage = bundle.stage(stage_index).cloned().ok_or_else(|| {
             anyhow::anyhow!("Stage {} not found in runtime bundle", stage_index + 1)
         })?;
-        Ok(Self {
-            bundle,
-            gguf_path,
-            gguf,
-            stage,
-        })
+        Ok(Self { bundle, gguf_path, gguf, stage })
+    }
+
+    pub fn stage_index(&self) -> u32 {
+        self.stage.stage_index
+    }
+
+    pub fn start_layer(&self) -> u32 {
+        self.stage.start_layer
+    }
+
+    pub fn end_layer(&self) -> u32 {
+        self.stage.end_layer
+    }
+
+    pub fn stage_role(&self) -> &str {
+        &self.stage.role
+    }
+
+    pub fn default_required_pack_dir_name(&self) -> String {
+        format!("packed-stage-{}-{}", self.start_layer(), self.end_layer())
+    }
+
+    pub fn default_materialized_dir_name(&self) -> String {
+        format!("materialized-stage-{}-{}", self.start_layer(), self.end_layer())
     }
 
     pub fn read_required_tensor(&self, tensor_name: &str) -> Result<Vec<u8>> {
-        let slice = self
-            .stage
-            .required_slices
-            .iter()
-            .find(|slice| slice.name == tensor_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Tensor {} is not required for this stage", tensor_name)
-            })?;
+        let slice =
+            self.stage.required_slices.iter().find(|slice| slice.name == tensor_name).ok_or_else(
+                || anyhow::anyhow!("Tensor {} is not required for this stage", tensor_name),
+            )?;
         self.read_slice(slice)
     }
 
     pub fn read_optional_tensor(&self, tensor_name: &str) -> Result<Vec<u8>> {
-        let slice = self
-            .stage
-            .optional_slices
-            .iter()
-            .find(|slice| slice.name == tensor_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Tensor {} is not optional for this stage", tensor_name)
-            })?;
+        let slice =
+            self.stage.optional_slices.iter().find(|slice| slice.name == tensor_name).ok_or_else(
+                || anyhow::anyhow!("Tensor {} is not optional for this stage", tensor_name),
+            )?;
         self.read_slice(slice)
     }
 
@@ -3325,14 +3200,9 @@ impl StageResidencyAdapter {
 
     pub fn pack_required_tensors(&self, out_dir: &Path) -> Result<PackedStageArtifact> {
         fs::create_dir_all(out_dir)?;
-        let pack_path = out_dir.join(format!(
-            "stage-{}-required.pack",
-            self.stage.stage_index + 1
-        ));
-        let index_path = out_dir.join(format!(
-            "stage-{}-required.index.json",
-            self.stage.stage_index + 1
-        ));
+        let pack_path = out_dir.join(format!("stage-{}-required.pack", self.stage.stage_index + 1));
+        let index_path =
+            out_dir.join(format!("stage-{}-required.index.json", self.stage.stage_index + 1));
         let mut pack_file = fs::File::create(&pack_path)
             .map_err(|err| anyhow::anyhow!("Failed to create {}: {err}", pack_path.display()))?;
 
@@ -3364,29 +3234,19 @@ impl StageResidencyAdapter {
         };
         fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
 
-        Ok(PackedStageArtifact {
-            pack_path,
-            index_path,
-            index,
-        })
+        Ok(PackedStageArtifact { pack_path, index_path, index })
     }
 
     pub fn pack_all_tensors(&self, out_dir: &Path) -> Result<PackedStageArtifact> {
         fs::create_dir_all(out_dir)?;
-        let pack_path = out_dir.join(format!(
-            "stage-{}-required.pack",
-            self.stage.stage_index + 1
-        ));
-        let index_path = out_dir.join(format!(
-            "stage-{}-required.index.json",
-            self.stage.stage_index + 1
-        ));
+        let pack_path = out_dir.join(format!("stage-{}-required.pack", self.stage.stage_index + 1));
+        let index_path =
+            out_dir.join(format!("stage-{}-required.index.json", self.stage.stage_index + 1));
         let mut pack_file = fs::File::create(&pack_path)
             .map_err(|err| anyhow::anyhow!("Failed to create {}: {err}", pack_path.display()))?;
 
-        let all_slices: Vec<_> = self.stage.required_slices.iter()
-            .chain(self.stage.optional_slices.iter())
-            .collect();
+        let all_slices: Vec<_> =
+            self.stage.required_slices.iter().chain(self.stage.optional_slices.iter()).collect();
 
         let mut pack_offset = 0u64;
         let mut tensors = Vec::with_capacity(all_slices.len());
@@ -3416,11 +3276,7 @@ impl StageResidencyAdapter {
         };
         fs::write(&index_path, serde_json::to_vec_pretty(&index)?)?;
 
-        Ok(PackedStageArtifact {
-            pack_path,
-            index_path,
-            index,
-        })
+        Ok(PackedStageArtifact { pack_path, index_path, index })
     }
 
     fn read_slice(&self, slice: &gguf::TensorSlice) -> Result<Vec<u8>> {
@@ -3478,20 +3334,14 @@ impl PackedStageArtifact {
                 index.total_bytes
             );
         }
-        Ok(Self {
-            pack_path,
-            index_path: index_path.to_path_buf(),
-            index,
-        })
+        Ok(Self { pack_path, index_path: index_path.to_path_buf(), index })
     }
 
     pub fn read_tensor(&self, tensor_name: &str) -> Result<Vec<u8>> {
-        let entry = self
-            .index
-            .tensors
-            .iter()
-            .find(|entry| entry.name == tensor_name)
-            .ok_or_else(|| anyhow::anyhow!("Tensor {} not found in packed stage", tensor_name))?;
+        let entry =
+            self.index.tensors.iter().find(|entry| entry.name == tensor_name).ok_or_else(|| {
+                anyhow::anyhow!("Tensor {} not found in packed stage", tensor_name)
+            })?;
         let mut file = fs::File::open(&self.pack_path)?;
         file.seek(SeekFrom::Start(entry.pack_offset))?;
         let mut buf = vec![0u8; entry.byte_len as usize];
@@ -3582,19 +3432,11 @@ impl StageTensorStore {
 
         let layers: Vec<StageLayerView> = layers
             .into_iter()
-            .map(|(layer_index, tensors)| StageLayerView {
-                layer_index,
-                tensors,
-            })
+            .map(|(layer_index, tensors)| StageLayerView { layer_index, tensors })
             .collect();
-        let operator_layers = layers
-            .iter()
-            .map(|layer| build_operator_view(layer))
-            .collect::<Vec<_>>();
-        let execution_layers = operator_layers
-            .iter()
-            .map(build_execution_spec)
-            .collect::<Vec<_>>();
+        let operator_layers =
+            layers.iter().map(|layer| build_operator_view(layer)).collect::<Vec<_>>();
+        let execution_layers = operator_layers.iter().map(build_execution_spec).collect::<Vec<_>>();
         let execution_programs = operator_layers
             .iter()
             .zip(execution_layers.iter())
@@ -3626,51 +3468,29 @@ impl StageResumeCapabilities {
                     program.runnable_sketch && program.layer_index >= resume_entry_layer
                 })
             })
-            .or_else(|| {
-                execution_programs
-                    .iter()
-                    .find(|program| program.runnable_sketch)
-            });
+            .or_else(|| execution_programs.iter().find(|program| program.runnable_sketch));
         let Some(entry_program) = entry_program else {
             return Self::default();
         };
 
-        let has_attention_q = entry_program
-            .ops
-            .iter()
-            .any(|op| matches!(op.kind, ExecutionOpKind::AttentionQ));
-        let has_attention_k = entry_program
-            .ops
-            .iter()
-            .any(|op| matches!(op.kind, ExecutionOpKind::AttentionK));
-        let has_attention_v = entry_program
-            .ops
-            .iter()
-            .any(|op| matches!(op.kind, ExecutionOpKind::AttentionV));
-        let has_attention_out = entry_program
-            .ops
-            .iter()
-            .any(|op| matches!(op.kind, ExecutionOpKind::AttentionOut));
-        let has_ffn_gate = entry_program
-            .ops
-            .iter()
-            .any(|op| matches!(op.kind, ExecutionOpKind::FfnGate));
-        let has_ffn_up = entry_program
-            .ops
-            .iter()
-            .any(|op| matches!(op.kind, ExecutionOpKind::FfnUp));
-        let has_ffn_down = entry_program
-            .ops
-            .iter()
-            .any(|op| matches!(op.kind, ExecutionOpKind::FfnDown));
-        let has_input_gate = entry_program
-            .ops
-            .iter()
-            .any(|op| matches!(op.kind, ExecutionOpKind::InputGate));
-        let has_projection = entry_program
-            .ops
-            .iter()
-            .any(|op| matches!(op.kind, ExecutionOpKind::Projection));
+        let has_attention_q =
+            entry_program.ops.iter().any(|op| matches!(op.kind, ExecutionOpKind::AttentionQ));
+        let has_attention_k =
+            entry_program.ops.iter().any(|op| matches!(op.kind, ExecutionOpKind::AttentionK));
+        let has_attention_v =
+            entry_program.ops.iter().any(|op| matches!(op.kind, ExecutionOpKind::AttentionV));
+        let has_attention_out =
+            entry_program.ops.iter().any(|op| matches!(op.kind, ExecutionOpKind::AttentionOut));
+        let has_ffn_gate =
+            entry_program.ops.iter().any(|op| matches!(op.kind, ExecutionOpKind::FfnGate));
+        let has_ffn_up =
+            entry_program.ops.iter().any(|op| matches!(op.kind, ExecutionOpKind::FfnUp));
+        let has_ffn_down =
+            entry_program.ops.iter().any(|op| matches!(op.kind, ExecutionOpKind::FfnDown));
+        let has_input_gate =
+            entry_program.ops.iter().any(|op| matches!(op.kind, ExecutionOpKind::InputGate));
+        let has_projection =
+            entry_program.ops.iter().any(|op| matches!(op.kind, ExecutionOpKind::Projection));
 
         let attention_projection = has_attention_q && has_attention_k && has_attention_v;
         let attention_mix = attention_projection && has_attention_out;
@@ -3704,11 +3524,7 @@ impl StageResumeBudgets {
                     program.runnable_sketch && program.layer_index >= resume_entry_layer
                 })
             })
-            .or_else(|| {
-                execution_programs
-                    .iter()
-                    .find(|program| program.runnable_sketch)
-            });
+            .or_else(|| execution_programs.iter().find(|program| program.runnable_sketch));
         let Some(entry_program) = entry_program else {
             return Self::default();
         };
@@ -3731,20 +3547,15 @@ impl StageResumeBudgets {
         } else {
             None
         };
-        let projection_lanes = q_lanes
-            .zip(k_lanes)
-            .zip(v_lanes)
-            .map(|((q, k), v)| q.min(k).min(v));
+        let projection_lanes = q_lanes.zip(k_lanes).zip(v_lanes).map(|((q, k), v)| q.min(k).min(v));
         let mix_width = entry_program
             .q_out_dim
             .or(entry_program.k_out_dim)
             .or(entry_program.v_out_dim)
             .or(entry_program.hidden_dim)
             .map(|width| width as usize);
-        let ffn_width = entry_program
-            .ffn_inner_dim
-            .or(entry_program.hidden_dim)
-            .map(|width| width as usize);
+        let ffn_width =
+            entry_program.ffn_inner_dim.or(entry_program.hidden_dim).map(|width| width as usize);
 
         Self {
             attention_q_lanes: q_lanes,
@@ -3757,9 +3568,7 @@ impl StageResumeBudgets {
             },
             attention_mix_lanes: if capabilities.attention_mix {
                 mix_width.map(|width| {
-                    ATTENTION_MIX_CARRY_BUDGET
-                        .min(width)
-                        .min(projection_lanes.unwrap_or(0))
+                    ATTENTION_MIX_CARRY_BUDGET.min(width).min(projection_lanes.unwrap_or(0))
                 })
             } else {
                 None
@@ -3789,10 +3598,7 @@ impl StageResumeFreshnessPolicy {
 
     fn max_distance_for_resume_path(path: Option<AttentionSliceResumePath>) -> Option<u32> {
         match path {
-            Some(AttentionSliceResumePath {
-                blend_strength: None,
-                ..
-            }) => Some(0),
+            Some(AttentionSliceResumePath { blend_strength: None, .. }) => Some(0),
             Some(AttentionSliceResumePath {
                 blend_strength: Some(AttentionBlendStrength::WeakBlend),
                 ..
@@ -4076,11 +3882,7 @@ enum PackedTensorClass {
 
 fn classify_packed_tensor(name: &str) -> PackedTensorClass {
     if let Some(rest) = name.strip_prefix("blk.") {
-        if let Some(idx) = rest
-            .split('.')
-            .next()
-            .and_then(|part| part.parse::<u32>().ok())
-        {
+        if let Some(idx) = rest.split('.').next().and_then(|part| part.parse::<u32>().ok()) {
             return PackedTensorClass::Layer(idx);
         }
     }
@@ -4096,10 +3898,8 @@ fn classify_packed_tensor(name: &str) -> PackedTensorClass {
 }
 
 fn build_operator_view(layer: &StageLayerView) -> LayerOperatorView {
-    let mut view = LayerOperatorView {
-        layer_index: layer.layer_index,
-        ..LayerOperatorView::default()
-    };
+    let mut view =
+        LayerOperatorView { layer_index: layer.layer_index, ..LayerOperatorView::default() };
 
     for entry in &layer.tensors {
         let name = entry.name.as_str();
@@ -4146,21 +3946,15 @@ fn build_operator_view(layer: &StageLayerView) -> LayerOperatorView {
 }
 
 fn weight_out_dim(entry: &Option<PackedTensorEntry>) -> Option<u64> {
-    entry
-        .as_ref()
-        .and_then(|entry| entry.dimensions.first().copied())
+    entry.as_ref().and_then(|entry| entry.dimensions.first().copied())
 }
 
 fn weight_in_dim(entry: &Option<PackedTensorEntry>) -> Option<u64> {
-    entry
-        .as_ref()
-        .and_then(|entry| entry.dimensions.get(1).copied())
+    entry.as_ref().and_then(|entry| entry.dimensions.get(1).copied())
 }
 
 fn norm_dim(entry: &Option<PackedTensorEntry>) -> Option<u64> {
-    entry
-        .as_ref()
-        .and_then(|entry| entry.dimensions.first().copied())
+    entry.as_ref().and_then(|entry| entry.dimensions.first().copied())
 }
 
 fn build_execution_spec(layer: &LayerOperatorView) -> LayerExecutionSpec {
@@ -4238,19 +4032,10 @@ fn classify_binding(entries: &[&PackedTensorEntry]) -> (ExecutionBinding, &'stat
     let any_quantized = entries.iter().any(|entry| entry.ggml_type != 0);
     let any_matrix = entries.iter().any(|entry| entry.dimensions.len() >= 2);
     match (any_quantized, any_matrix) {
-        (true, true) => (
-            ExecutionBinding::QuantizedMatrix,
-            "quantized matrix tensors",
-        ),
+        (true, true) => (ExecutionBinding::QuantizedMatrix, "quantized matrix tensors"),
         (true, false) => (ExecutionBinding::Mixed, "non-f32 non-matrix tensors"),
-        (false, true) => (
-            ExecutionBinding::Mixed,
-            "matrix tensors without numeric binding",
-        ),
-        (false, false) => (
-            ExecutionBinding::Unsupported,
-            "unsupported tensor shape/type",
-        ),
+        (false, true) => (ExecutionBinding::Mixed, "matrix tensors without numeric binding"),
+        (false, false) => (ExecutionBinding::Unsupported, "unsupported tensor shape/type"),
     }
 }
 
@@ -4419,11 +4204,7 @@ fn build_execution_program(
         let (binding, binding_reason) = classify_binding(&refs);
         ops.push(ExecutionOp::new(
             ExecutionOpKind::Unknown,
-            layer
-                .unknown
-                .iter()
-                .map(|entry| entry.name.clone())
-                .collect(),
+            layer.unknown.iter().map(|entry| entry.name.clone()).collect(),
             binding,
             binding_reason,
         ));
@@ -4491,9 +4272,7 @@ pub struct DeterministicStubBackend {
 
 impl DeterministicStubBackend {
     fn layout(&self) -> Result<&StageLayout> {
-        self.layout
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No stage layout loaded"))
+        self.layout.as_ref().ok_or_else(|| anyhow::anyhow!("No stage layout loaded"))
     }
 
     fn synthesize_hidden_state(
@@ -4566,11 +4345,7 @@ impl StageForwardBackend for DeterministicStubBackend {
         if layout.is_head {
             bail!("Head stage should use begin_prompt, not continue_forward");
         }
-        if input
-            .stage_trace
-            .iter()
-            .any(|stage| stage == &layout.stage_id)
-        {
+        if input.stage_trace.iter().any(|stage| stage == &layout.stage_id) {
             bail!("Stage {} already applied to payload", layout.stage_id);
         }
 
@@ -4606,23 +4381,18 @@ impl StageForwardBackend for DeterministicStubBackend {
         let prompt = input.prompt_text.unwrap_or_default();
         let trace = input.stage_trace.join(" -> ");
         let take = input.max_tokens.unwrap_or(48).min(96);
-        let digest = input
-            .bytes
-            .iter()
-            .take(16)
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let digest =
+            input.bytes.iter().take(16).map(|byte| format!("{byte:02x}")).collect::<String>();
 
+        let text = format!("{} :: {} :: {} :: {}", prompt, trace, layout.model_id, digest)
+            .chars()
+            .take(take as usize)
+            .collect::<String>();
         Ok(StageSample {
             request_id: input.request_id,
             model_id: layout.model_id.clone(),
-            text: format!(
-                "{} :: {} :: {} :: {}",
-                prompt, trace, layout.model_id, digest
-            )
-            .chars()
-            .take(take as usize)
-            .collect(),
+            token_ids: StageSample::text_token_ids(&text),
+            text,
             completion_tokens: take,
         })
     }
@@ -4635,9 +4405,7 @@ pub struct ToyLinearBackend {
 
 impl ToyLinearBackend {
     fn layout(&self) -> Result<&StageLayout> {
-        self.layout
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No stage layout loaded"))
+        self.layout.as_ref().ok_or_else(|| anyhow::anyhow!("No stage layout loaded"))
     }
 
     fn encode_hidden_state(values: &[f32]) -> Vec<u8> {
@@ -4810,6 +4578,7 @@ impl StageForwardBackend for ToyLinearBackend {
             request_id: input.request_id,
             model_id: layout.model_id.clone(),
             completion_tokens: text.chars().count() as u32,
+            token_ids: StageSample::text_token_ids(&text),
             text,
         })
     }
@@ -4826,6 +4595,7 @@ pub fn run_toy_single_node_reference(prompt: &str, max_tokens: Option<u32>) -> S
         request_id: "single-node-reference".into(),
         model_id: "toy-linear-4l".into(),
         completion_tokens: text.chars().count() as u32,
+        token_ids: StageSample::text_token_ids(&text),
         text,
     }
 }
@@ -4877,11 +4647,7 @@ impl LayerScratch {
         typed_weight: Option<f32>,
         legacy_weight: f32,
     ) -> Option<f32> {
-        if self.attention_contract.is_empty() {
-            Some(legacy_weight)
-        } else {
-            typed_weight
-        }
+        if self.attention_contract.is_empty() { Some(legacy_weight) } else { typed_weight }
     }
 }
 
@@ -4979,21 +4745,15 @@ impl PackedResidencySketchBackend {
     }
 
     fn layout(&self) -> Result<&StageLayout> {
-        self.layout
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No stage layout loaded"))
+        self.layout.as_ref().ok_or_else(|| anyhow::anyhow!("No stage layout loaded"))
     }
 
     fn store(&self) -> Result<&StageTensorStore> {
-        self.store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No stage tensor store loaded"))
+        self.store.as_ref().ok_or_else(|| anyhow::anyhow!("No stage tensor store loaded"))
     }
 
     fn model_view(&self) -> Result<&StageModelView> {
-        self.model_view
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No stage model view loaded"))
+        self.model_view.as_ref().ok_or_else(|| anyhow::anyhow!("No stage model view loaded"))
     }
 
     fn expected_attention_carry_width(view: &StageModelView) -> Option<usize> {
@@ -5012,11 +4772,7 @@ impl PackedResidencySketchBackend {
                     })
             })
             .and_then(|program| {
-                program
-                    .q_out_dim
-                    .or(program.k_out_dim)
-                    .or(program.v_out_dim)
-                    .or(program.hidden_dim)
+                program.q_out_dim.or(program.k_out_dim).or(program.v_out_dim).or(program.hidden_dim)
             })
             .map(|width| width as usize)
     }
@@ -5204,10 +4960,9 @@ impl PackedResidencySketchBackend {
                 "ffn carry requested but target stage has no runnable ffn path",
             );
         }
-        if let (Some(expected_lanes), Some(max_lanes)) = (
-            request.boundary.expected_attention_q_lanes,
-            budgets.attention_q_lanes,
-        ) {
+        if let (Some(expected_lanes), Some(max_lanes)) =
+            (request.boundary.expected_attention_q_lanes, budgets.attention_q_lanes)
+        {
             if expected_lanes > max_lanes {
                 return StageResumeDecision::reject(
                     Some(layout.stage_id.clone()),
@@ -5221,10 +4976,9 @@ impl PackedResidencySketchBackend {
                 );
             }
         }
-        if let (Some(expected_distance), Some(max_distance)) = (
-            request.boundary.expected_attention_q_distance,
-            freshness.attention_q_max_distance,
-        ) {
+        if let (Some(expected_distance), Some(max_distance)) =
+            (request.boundary.expected_attention_q_distance, freshness.attention_q_max_distance)
+        {
             if expected_distance > max_distance {
                 return StageResumeDecision::reject(
                     Some(layout.stage_id.clone()),
@@ -5238,10 +4992,9 @@ impl PackedResidencySketchBackend {
                 );
             }
         }
-        if let (Some(expected_lanes), Some(max_lanes)) = (
-            request.boundary.expected_attention_k_lanes,
-            budgets.attention_k_lanes,
-        ) {
+        if let (Some(expected_lanes), Some(max_lanes)) =
+            (request.boundary.expected_attention_k_lanes, budgets.attention_k_lanes)
+        {
             if expected_lanes > max_lanes {
                 return StageResumeDecision::reject(
                     Some(layout.stage_id.clone()),
@@ -5255,10 +5008,9 @@ impl PackedResidencySketchBackend {
                 );
             }
         }
-        if let (Some(expected_distance), Some(max_distance)) = (
-            request.boundary.expected_attention_k_distance,
-            freshness.attention_k_max_distance,
-        ) {
+        if let (Some(expected_distance), Some(max_distance)) =
+            (request.boundary.expected_attention_k_distance, freshness.attention_k_max_distance)
+        {
             if expected_distance > max_distance {
                 return StageResumeDecision::reject(
                     Some(layout.stage_id.clone()),
@@ -5272,10 +5024,9 @@ impl PackedResidencySketchBackend {
                 );
             }
         }
-        if let (Some(expected_lanes), Some(max_lanes)) = (
-            request.boundary.expected_attention_v_lanes,
-            budgets.attention_v_lanes,
-        ) {
+        if let (Some(expected_lanes), Some(max_lanes)) =
+            (request.boundary.expected_attention_v_lanes, budgets.attention_v_lanes)
+        {
             if expected_lanes > max_lanes {
                 return StageResumeDecision::reject(
                     Some(layout.stage_id.clone()),
@@ -5289,10 +5040,9 @@ impl PackedResidencySketchBackend {
                 );
             }
         }
-        if let (Some(expected_distance), Some(max_distance)) = (
-            request.boundary.expected_attention_v_distance,
-            freshness.attention_v_max_distance,
-        ) {
+        if let (Some(expected_distance), Some(max_distance)) =
+            (request.boundary.expected_attention_v_distance, freshness.attention_v_max_distance)
+        {
             if expected_distance > max_distance {
                 return StageResumeDecision::reject(
                     Some(layout.stage_id.clone()),
@@ -5323,10 +5073,9 @@ impl PackedResidencySketchBackend {
                 );
             }
         }
-        if let (Some(expected_lanes), Some(max_lanes)) = (
-            request.boundary.expected_attention_mix_lanes,
-            budgets.attention_mix_lanes,
-        ) {
+        if let (Some(expected_lanes), Some(max_lanes)) =
+            (request.boundary.expected_attention_mix_lanes, budgets.attention_mix_lanes)
+        {
             if expected_lanes > max_lanes {
                 return StageResumeDecision::reject(
                     Some(layout.stage_id.clone()),
@@ -5491,10 +5240,7 @@ impl PackedResidencySketchBackend {
         if !receipt.accepted {
             bail!(
                 "{}",
-                receipt
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "resume request rejected".to_string())
+                receipt.reason.clone().unwrap_or_else(|| "resume request rejected".to_string())
             );
         }
 
@@ -5548,10 +5294,7 @@ impl PackedResidencySketchBackend {
             }),
             has_projection_path: model_view.execution_programs.iter().any(|program| {
                 program.ops.iter().any(|op| {
-                    matches!(
-                        op.kind,
-                        ExecutionOpKind::InputGate | ExecutionOpKind::Projection
-                    )
+                    matches!(op.kind, ExecutionOpKind::InputGate | ExecutionOpKind::Projection)
                 })
             }),
         }
@@ -5571,10 +5314,8 @@ impl PackedResidencySketchBackend {
         for idx in 0..width {
             let a = seed[idx % seed.len()];
             let b = stage_id.as_bytes()[idx % stage_id.len()];
-            out[idx] = a
-                .wrapping_add(b)
-                .wrapping_add((idx % 251) as u8)
-                .rotate_left((idx % 7) as u32);
+            out[idx] =
+                a.wrapping_add(b).wrapping_add((idx % 251) as u8).rotate_left((idx % 7) as u32);
         }
         out
     }
@@ -5604,9 +5345,7 @@ impl PackedResidencySketchBackend {
 
     fn prompt_state(prompt: &str, view: &StageModelView, stage_id: &str, width: usize) -> Vec<f32> {
         let seed = Self::prompt_seed(prompt, view, stage_id, width);
-        seed.into_iter()
-            .map(|byte| ((byte as f32) / 255.0) * 2.0 - 1.0)
-            .collect()
+        seed.into_iter().map(|byte| ((byte as f32) / 255.0) * 2.0 - 1.0).collect()
     }
 
     fn continue_state(input: &[f32], stage_id: &str) -> Vec<f32> {
@@ -5627,9 +5366,7 @@ impl PackedResidencySketchBackend {
             .iter()
             .take(take)
             .enumerate()
-            .fold(0u64, |acc, (idx, byte)| {
-                acc + ((*byte as u64) * ((idx as u64 % 13) + 1))
-            });
+            .fold(0u64, |acc, (idx, byte)| acc + ((*byte as u64) * ((idx as u64 % 13) + 1)));
         let dim_mix = entry.dimensions.iter().copied().sum::<u64>() + entry.ggml_type as u64;
         let scalar = (((acc + dim_mix) % 4096) as f32 / 4096.0) * 2.0 - 1.0;
         Ok(scalar)
@@ -5764,9 +5501,7 @@ impl PackedResidencySketchBackend {
             return;
         }
 
-        let input = (0..cols)
-            .map(|idx| state[idx % state.len()])
-            .collect::<Vec<_>>();
+        let input = (0..cols).map(|idx| state[idx % state.len()]).collect::<Vec<_>>();
         let mut output = vec![0.0f32; rows];
         for row in 0..rows {
             let mut acc = 0.0f32;
@@ -5794,9 +5529,7 @@ impl PackedResidencySketchBackend {
         if rows == 0 || cols == 0 || matrix.len() != rows * cols || state.is_empty() {
             return Vec::new();
         }
-        let input = (0..cols)
-            .map(|idx| state[idx % state.len()])
-            .collect::<Vec<_>>();
+        let input = (0..cols).map(|idx| state[idx % state.len()]).collect::<Vec<_>>();
         let mut output = vec![0.0f32; rows];
         for row in 0..rows {
             let mut acc = 0.0f32;
@@ -5817,9 +5550,7 @@ impl PackedResidencySketchBackend {
         let Some((rows, cols, matrix)) = Self::try_decode_numeric_matrix(store, entry)? else {
             return Ok(None);
         };
-        Ok(Some(Self::apply_numeric_matrix_project(
-            state, rows, cols, &matrix,
-        )))
+        Ok(Some(Self::apply_numeric_matrix_project(state, rows, cols, &matrix)))
     }
 
     fn try_project_decoded_attention_output_matrix(
@@ -5828,13 +5559,7 @@ impl PackedResidencySketchBackend {
         state: &[f32],
         scratch: &LayerScratch,
         salt: &[u8],
-    ) -> Result<
-        Option<(
-            Option<AttentionScratchState>,
-            Option<AttentionMixState>,
-            Vec<f32>,
-        )>,
-    > {
+    ) -> Result<Option<(Option<AttentionScratchState>, Option<AttentionMixState>, Vec<f32>)>> {
         let Some((rows, cols, matrix)) = Self::try_decode_numeric_matrix(store, entry)? else {
             return Ok(None);
         };
@@ -5863,9 +5588,7 @@ impl PackedResidencySketchBackend {
         let Some((rows, cols, matrix)) = Self::try_decode_numeric_matrix(store, entry)? else {
             return Ok(None);
         };
-        Ok(Some(Self::apply_numeric_matrix_project(
-            state, rows, cols, &matrix,
-        )))
+        Ok(Some(Self::apply_numeric_matrix_project(state, rows, cols, &matrix)))
     }
 
     fn try_project_decoded_ffn_down_matrix(
@@ -5898,9 +5621,7 @@ impl PackedResidencySketchBackend {
         let Some((rows, cols, matrix)) = Self::try_decode_numeric_matrix(store, entry)? else {
             return Ok(None);
         };
-        Ok(Some(Self::apply_numeric_matrix_project(
-            state, rows, cols, &matrix,
-        )))
+        Ok(Some(Self::apply_numeric_matrix_project(state, rows, cols, &matrix)))
     }
 
     fn try_project_decoded_projection_matrix(
@@ -5979,9 +5700,7 @@ impl PackedResidencySketchBackend {
         let values = if output_dim == 0 || attn.v.is_empty() {
             Vec::new()
         } else {
-            (0..output_dim)
-                .map(|idx| attn.v[idx % attn.v.len()])
-                .collect()
+            (0..output_dim).map(|idx| attn.v[idx % attn.v.len()]).collect()
         };
         AttentionMixState { scores, values }
     }
@@ -6040,18 +5759,13 @@ impl PackedResidencySketchBackend {
     }
 
     fn build_ffn_state(scratch: &LayerScratch) -> Option<FfnScratchState> {
-        Some(FfnScratchState {
-            gate: scratch.ffn_gate.clone()?,
-            up: scratch.ffn_up.clone()?,
-        })
+        Some(FfnScratchState { gate: scratch.ffn_gate.clone()?, up: scratch.ffn_up.clone()? })
     }
 
     fn build_ffn_mix_state(ffn: &FfnScratchState) -> FfnMixState {
         let len = ffn.gate.len().max(ffn.up.len());
         if len == 0 {
-            return FfnMixState {
-                activations: Vec::new(),
-            };
+            return FfnMixState { activations: Vec::new() };
         }
         let mut activations = vec![0.0f32; len];
         for idx in 0..len {
@@ -6136,36 +5850,20 @@ impl PackedResidencySketchBackend {
             if let Some(mix) = &attention.mix {
                 scratch.attn_score_lane_indices = Some(mix.score_lane_indices.clone());
                 scratch.attn_value_lane_indices = Some(mix.value_lane_indices.clone());
-                scratch.attn_score = Some(Self::scattered_values(
-                    &mix.scores,
-                    &mix.score_lane_indices,
-                    mix.width,
-                ));
-                scratch.attn_value = Some(Self::scattered_values(
-                    &mix.values,
-                    &mix.value_lane_indices,
-                    mix.width,
-                ));
+                scratch.attn_score =
+                    Some(Self::scattered_values(&mix.scores, &mix.score_lane_indices, mix.width));
+                scratch.attn_value =
+                    Some(Self::scattered_values(&mix.values, &mix.value_lane_indices, mix.width));
             }
         }
         if let Some(ffn) = &carry.ffn {
             let lane_indices = ffn.lane_indices.clone();
             scratch.ffn_lane_indices = Some(lane_indices.clone());
-            scratch.ffn_gate = Some(Self::scattered_values(
-                &ffn.gate_head,
-                &lane_indices,
-                ffn.width,
-            ));
-            scratch.ffn_up = Some(Self::scattered_values(
-                &ffn.up_head,
-                &lane_indices,
-                ffn.width,
-            ));
-            scratch.ffn_activation = Some(Self::scattered_values(
-                &ffn.activation_head,
-                &lane_indices,
-                ffn.width,
-            ));
+            scratch.ffn_gate =
+                Some(Self::scattered_values(&ffn.gate_head, &lane_indices, ffn.width));
+            scratch.ffn_up = Some(Self::scattered_values(&ffn.up_head, &lane_indices, ffn.width));
+            scratch.ffn_activation =
+                Some(Self::scattered_values(&ffn.activation_head, &lane_indices, ffn.width));
         }
         Ok(scratch)
     }
@@ -6233,11 +5931,7 @@ impl PackedResidencySketchBackend {
         let projection = checkpoint.projection.as_ref()?;
         let mix = checkpoint.mix.as_ref()?;
         Some(AttentionContinuation {
-            width: projection
-                .q
-                .len()
-                .max(projection.k.len())
-                .max(projection.v.len()),
+            width: projection.q.len().max(projection.k.len()).max(projection.v.len()),
             lane_indices: (0..Self::preview(&projection.q).len()).collect(),
             q_preview: Self::preview(&projection.q),
             k_preview: Self::preview(&projection.k),
@@ -6253,11 +5947,7 @@ impl PackedResidencySketchBackend {
         let checkpoint = checkpoint?;
         let projection = checkpoint.projection.as_ref()?;
         let mix = checkpoint.mix.as_ref()?;
-        let attention_width = projection
-            .q
-            .len()
-            .max(projection.k.len())
-            .max(projection.v.len());
+        let attention_width = projection.q.len().max(projection.k.len()).max(projection.v.len());
         Some(CarryableAttentionState {
             contract: StageResumeContractSummary::current_attention_defaults(),
             projection: Some(CarryableAttentionProjectionState {
@@ -6436,10 +6126,8 @@ impl PackedResidencySketchBackend {
     ) -> Result<(Option<StageTransientState>, Option<StageCarryState>)> {
         let layer_salt = format!("{stage_id}:layer:{}", layer.layer_index);
         let base = layer_salt.as_bytes();
-        let mut scratch = resume_carry
-            .map(Self::scratch_from_resume_carry)
-            .transpose()?
-            .unwrap_or_default();
+        let mut scratch =
+            resume_carry.map(Self::scratch_from_resume_carry).transpose()?.unwrap_or_default();
         let mut last_attention_state: Option<AttentionScratchState> = None;
         let mut last_attention_mix: Option<AttentionMixState> = None;
         let mut last_attention_q_provenance: Option<AttentionCheckpointProvenance> = None;
@@ -6731,23 +6419,15 @@ impl Default for PackedResidencySketchBackend {
 
 impl ArtifactBackedToyBackend {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            artifact_path: path.into(),
-            layout: None,
-            artifact: None,
-        }
+        Self { artifact_path: path.into(), layout: None, artifact: None }
     }
 
     fn layout(&self) -> Result<&StageLayout> {
-        self.layout
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No stage layout loaded"))
+        self.layout.as_ref().ok_or_else(|| anyhow::anyhow!("No stage layout loaded"))
     }
 
     fn artifact(&self) -> Result<&ToyShardArtifact> {
-        self.artifact
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No shard artifact loaded"))
+        self.artifact.as_ref().ok_or_else(|| anyhow::anyhow!("No shard artifact loaded"))
     }
 
     fn prompt_embedding(prompt: &str, hidden_dim: usize) -> Vec<f32> {
@@ -6976,6 +6656,7 @@ impl StageForwardBackend for ArtifactBackedToyBackend {
             request_id: input.request_id,
             model_id: layout.model_id.clone(),
             completion_tokens: text.chars().count() as u32,
+            token_ids: StageSample::text_token_ids(&text),
             text,
         })
     }
@@ -7157,11 +6838,7 @@ impl StageForwardBackend for PackedResidencySketchBackend {
             .zip(model_view.execution_programs.iter())
             .take(execution_layer_count)
         {
-            let resume_seed = if last_transient.is_none() {
-                resume_carry.as_ref()
-            } else {
-                None
-            };
+            let resume_seed = if last_transient.is_none() { resume_carry.as_ref() } else { None };
             let (transient, carry) = Self::execute_layer_program(
                 store,
                 &mut state,
@@ -7222,6 +6899,7 @@ impl StageForwardBackend for PackedResidencySketchBackend {
         Ok(StageSample {
             request_id: input.request_id,
             model_id: layout.model_id.clone(),
+            token_ids: StageSample::text_token_ids(&text),
             text,
             completion_tokens,
         })
@@ -7291,14 +6969,7 @@ pub fn write_sample_toy_artifacts(dir: &Path) -> Result<(PathBuf, PathBuf, PathB
             },
         ],
         projection: Some(ToyProjectionArtifact {
-            vocab: vec![
-                "A".into(),
-                "B".into(),
-                "C".into(),
-                "D".into(),
-                "E".into(),
-                "F".into(),
-            ],
+            vocab: vec!["A".into(), "B".into(), "C".into(), "D".into(), "E".into(), "F".into()],
             weights: vec![
                 vec![0.9, 0.3, 0.2, 0.1],
                 vec![0.2, 0.8, 0.1, 0.4],
@@ -7317,12 +6988,7 @@ pub fn write_sample_toy_artifacts(dir: &Path) -> Result<(PathBuf, PathBuf, PathB
         start_layer: 0,
         end_layer: 3,
         total_layers: 4,
-        layers: head
-            .layers
-            .iter()
-            .chain(tail.layers.iter())
-            .cloned()
-            .collect(),
+        layers: head.layers.iter().chain(tail.layers.iter()).cloned().collect(),
         projection: tail.projection.clone(),
     };
 
@@ -7355,6 +7021,7 @@ pub fn run_artifact_single_node_reference(
         request_id: "artifact-single-reference".into(),
         model_id: artifact.model_id,
         completion_tokens: text.chars().count() as u32,
+        token_ids: StageSample::text_token_ids(&text),
         text,
     })
 }
@@ -7437,9 +7104,7 @@ mod tests {
         let mut backend = DeterministicStubBackend::default();
         backend.load_layout(head_layout()).unwrap();
 
-        let tensor = backend
-            .begin_prompt("req-1", "hello", Some(32), 2048)
-            .unwrap();
+        let tensor = backend.begin_prompt("req-1", "hello", Some(32), 2048).unwrap();
 
         assert_eq!(tensor.kind, PayloadKind::HiddenState);
         assert_eq!(tensor.prompt_text.as_deref(), Some("hello"));
@@ -7478,9 +7143,8 @@ mod tests {
         let mut tail = DeterministicStubBackend::default();
         tail.load_layout(tail_layout()).unwrap();
 
-        let head_tensor = head
-            .begin_prompt("req-1", "reply exactly STAGE LAB", Some(64), 2048)
-            .unwrap();
+        let head_tensor =
+            head.begin_prompt("req-1", "reply exactly STAGE LAB", Some(64), 2048).unwrap();
         let tail_tensor = tail.continue_forward(head_tensor).unwrap();
         let sample = tail.sample_tail(tail_tensor).unwrap();
 
@@ -7498,9 +7162,7 @@ mod tests {
         let mut tail = ToyLinearBackend::default();
         tail.load_layout(toy_tail_layout()).unwrap();
 
-        let stage1 = head
-            .begin_prompt("toy-req", prompt, Some(12), TOY_HIDDEN_DIM)
-            .unwrap();
+        let stage1 = head.begin_prompt("toy-req", prompt, Some(12), TOY_HIDDEN_DIM).unwrap();
         let stage2 = tail.continue_forward(stage1).unwrap();
         let distributed = tail.sample_tail(stage2).unwrap();
         let single = run_toy_single_node_reference(prompt, Some(12));
@@ -7537,9 +7199,7 @@ mod tests {
         })
         .unwrap();
 
-        let stage1 = head
-            .begin_prompt("artifact-req", prompt, Some(12), 4)
-            .unwrap();
+        let stage1 = head.begin_prompt("artifact-req", prompt, Some(12), 4).unwrap();
         let stage2 = tail.continue_forward(stage1).unwrap();
         let distributed = tail.sample_tail(stage2).unwrap();
         let single = run_artifact_single_node_reference(&full_path, prompt, Some(12)).unwrap();
@@ -7558,10 +7218,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -7586,16 +7243,8 @@ mod tests {
             ],
         };
         let plan = file.plan_for_splits(&[
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ]);
         plan.write_bundle(&file, temp.path()).unwrap();
 
@@ -7605,27 +7254,9 @@ mod tests {
         assert_eq!(bundle.stages.len(), 2);
         assert_eq!(bundle.stage(0).unwrap().role, "head");
         assert_eq!(bundle.stage(1).unwrap().role, "tail");
-        assert!(
-            bundle
-                .stage(0)
-                .unwrap()
-                .required
-                .contains("token_embd.weight")
-        );
-        assert!(
-            bundle
-                .stage(1)
-                .unwrap()
-                .required
-                .contains("output_norm.weight")
-        );
-        assert!(
-            bundle
-                .stage(1)
-                .unwrap()
-                .optional
-                .contains("token_embd.weight")
-        );
+        assert!(bundle.stage(0).unwrap().required.contains("token_embd.weight"));
+        assert!(bundle.stage(1).unwrap().required.contains("output_norm.weight"));
+        assert!(bundle.stage(1).unwrap().optional.contains("token_embd.weight"));
         assert_eq!(bundle.stage(0).unwrap().required_slices.len(), 2);
         assert_eq!(bundle.stage(1).unwrap().required_slices.len(), 1);
         assert_eq!(bundle.stage(1).unwrap().optional_slices.len(), 1);
@@ -7646,10 +7277,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -7674,16 +7302,8 @@ mod tests {
             ],
         };
         let plan = file.plan_for_splits(&[
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ]);
         plan.write_bundle(&file, temp.path()).unwrap();
 
@@ -7715,10 +7335,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -7743,16 +7360,8 @@ mod tests {
             ],
         };
         let plan = file.plan_for_splits(&[
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ]);
         plan.write_bundle(&file, temp.path()).unwrap();
 
@@ -7785,10 +7394,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -7813,16 +7419,8 @@ mod tests {
             ],
         };
         let plan = file.plan_for_splits(&[
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ]);
         plan.write_bundle(&file, temp.path()).unwrap();
 
@@ -7869,10 +7467,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -7897,16 +7492,8 @@ mod tests {
             ],
         };
         let plan = file.plan_for_splits(&[
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ]);
         plan.write_bundle(&file, temp.path()).unwrap();
 
@@ -7927,9 +7514,8 @@ mod tests {
         let mut tail = PackedResidencySketchBackend::new(tail_pack.index_path);
         tail.load_layout(packed_tail_layout()).unwrap();
 
-        let stage1 = head
-            .begin_prompt("packed-req", "reply exactly STAGE PACK", Some(12), 0)
-            .unwrap();
+        let stage1 =
+            head.begin_prompt("packed-req", "reply exactly STAGE PACK", Some(12), 0).unwrap();
         let stage1_cont = stage1.continuation.clone().unwrap();
         assert_eq!(stage1_cont.version, 1);
         assert_eq!(stage1_cont.stage_role, "head");
@@ -7941,10 +7527,7 @@ mod tests {
         let stage2_cont = stage2.continuation.clone().unwrap();
         assert_eq!(stage2_cont.version, 1);
         assert_eq!(stage2_cont.stage_role, "tail");
-        assert_eq!(
-            stage2_cont.completed_layers,
-            stage2_cont.operator_layers as u32
-        );
+        assert_eq!(stage2_cont.completed_layers, stage2_cont.operator_layers as u32);
         assert_eq!(stage2_cont.next_layer_index, None);
         assert!(stage2.transient.is_none());
         let sample = tail.sample_tail(stage2).unwrap();
@@ -7967,10 +7550,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -7995,16 +7575,8 @@ mod tests {
             ],
         };
         let plan = file.plan_for_splits(&[
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ]);
         plan.write_bundle(&file, temp.path()).unwrap();
 
@@ -8018,9 +7590,8 @@ mod tests {
             PackedResidencySketchBackend::new(head_pack.index_path).with_debug_layer_cap(0);
         head.load_layout(packed_head_layout()).unwrap();
 
-        let stage1 = head
-            .begin_prompt("packed-req", "reply exactly STAGE PACK", Some(12), 0)
-            .unwrap();
+        let stage1 =
+            head.begin_prompt("packed-req", "reply exactly STAGE PACK", Some(12), 0).unwrap();
         let cont = stage1.continuation.unwrap();
         assert_eq!(cont.completed_layers, 0);
         assert_eq!(cont.next_layer_index, Some(0));
@@ -8772,10 +8343,7 @@ mod tests {
         assert!(plan.resumable_attention_q);
         assert!(!plan.resumable_attention_k);
         assert!(!plan.resumable_attention_v);
-        assert_eq!(
-            plan.resumable_attention_q_lanes,
-            Some(ATTENTION_PROJECTION_CARRY_BUDGET)
-        );
+        assert_eq!(plan.resumable_attention_q_lanes, Some(ATTENTION_PROJECTION_CARRY_BUDGET));
         assert_eq!(plan.resumable_attention_k_lanes, None);
         assert_eq!(plan.resumable_attention_v_lanes, None);
         assert!(!plan.resumable_attention_projection);
@@ -8904,10 +8472,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -8932,16 +8497,8 @@ mod tests {
             ],
         };
         let plan = file.plan_for_splits(&[
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ]);
         plan.write_bundle(&file, temp.path()).unwrap();
 
@@ -8967,10 +8524,7 @@ mod tests {
                 next_layer_index: Some(1),
                 expected_payload_kind: PayloadKind::HiddenState,
                 expected_hidden_dim: 64,
-                carry_policy: StageCarryPolicy {
-                    carry_attention: false,
-                    carry_ffn: false,
-                },
+                carry_policy: StageCarryPolicy { carry_attention: false, carry_ffn: false },
                 expects_attention_carry: false,
                 expects_ffn_carry: false,
                 expected_attention_width: None,
@@ -9067,10 +8621,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -9095,16 +8646,8 @@ mod tests {
             ],
         };
         let plan = file.plan_for_splits(&[
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ]);
         plan.write_bundle(&file, temp.path()).unwrap();
 
@@ -9130,10 +8673,7 @@ mod tests {
                 next_layer_index: Some(999),
                 expected_payload_kind: PayloadKind::HiddenState,
                 expected_hidden_dim: 64,
-                carry_policy: StageCarryPolicy {
-                    carry_attention: false,
-                    carry_ffn: false,
-                },
+                carry_policy: StageCarryPolicy { carry_attention: false, carry_ffn: false },
                 expects_attention_carry: false,
                 expects_ffn_carry: false,
                 expected_attention_width: None,
@@ -9212,13 +8752,7 @@ mod tests {
 
         let decision = tail.admit_resume_request(&request);
         assert!(!decision.accepted);
-        assert!(
-            decision
-                .reason
-                .as_deref()
-                .unwrap_or_default()
-                .contains("next-layer mismatch")
-        );
+        assert!(decision.reason.as_deref().unwrap_or_default().contains("next-layer mismatch"));
     }
 
     #[test]
@@ -9235,10 +8769,7 @@ mod tests {
             tensor_data_offset: 0,
             metadata: BTreeMap::from([
                 ("general.name".into(), MetadataValue::String("Toy".into())),
-                (
-                    "general.architecture".into(),
-                    MetadataValue::String("toy".into()),
-                ),
+                ("general.architecture".into(), MetadataValue::String("toy".into())),
                 ("llama.block_count".into(), MetadataValue::Uint32(2)),
             ]),
             tensors: vec![
@@ -9263,16 +8794,8 @@ mod tests {
             ],
         };
         let plan = file.plan_for_splits(&[
-            StageSplit {
-                stage_index: 0,
-                start_layer: 0,
-                end_layer: 0,
-            },
-            StageSplit {
-                stage_index: 1,
-                start_layer: 1,
-                end_layer: 1,
-            },
+            StageSplit { stage_index: 0, start_layer: 0, end_layer: 0 },
+            StageSplit { stage_index: 1, start_layer: 1, end_layer: 1 },
         ]);
         plan.write_bundle(&file, temp.path()).unwrap();
 
@@ -9282,21 +8805,18 @@ mod tests {
                 .unwrap();
         let tail_adapter =
             StageResidencyAdapter::from_parts(bundle, gguf_path.clone(), file.clone(), 1).unwrap();
-        let head_pack = head_adapter
-            .pack_required_tensors(&temp.path().join("packed-head"))
-            .unwrap();
-        let tail_pack = tail_adapter
-            .pack_required_tensors(&temp.path().join("packed-tail"))
-            .unwrap();
+        let head_pack =
+            head_adapter.pack_required_tensors(&temp.path().join("packed-head")).unwrap();
+        let tail_pack =
+            tail_adapter.pack_required_tensors(&temp.path().join("packed-tail")).unwrap();
 
         let mut head = PackedResidencySketchBackend::new(head_pack.index_path);
         head.load_layout(packed_head_layout()).unwrap();
         let mut tail = PackedResidencySketchBackend::new(tail_pack.index_path);
         tail.load_layout(packed_tail_layout()).unwrap();
 
-        let stage1 = head
-            .begin_prompt("packed-req", "reply exactly STAGE PACK", Some(12), 0)
-            .unwrap();
+        let stage1 =
+            head.begin_prompt("packed-req", "reply exactly STAGE PACK", Some(12), 0).unwrap();
         let direct = tail.continue_forward(stage1.clone()).unwrap();
 
         let frame = StageForwardFrame::from_tensor(
@@ -9331,12 +8851,7 @@ mod tests {
         let pack_path = temp.path().join("stage-2-required.pack");
         let index_path = temp.path().join("stage-2-required.index.json");
         let tensors = vec![
-            (
-                "blk.1.attn_norm.weight",
-                vec![1.0f32, 0.9, 1.1, 1.05],
-                vec![4u64],
-                0u32,
-            ),
+            ("blk.1.attn_norm.weight", vec![1.0f32, 0.9, 1.1, 1.05], vec![4u64], 0u32),
             (
                 "blk.1.attn_q.weight",
                 vec![
@@ -9373,12 +8888,7 @@ mod tests {
                 vec![4u64, 4u64],
                 0u32,
             ),
-            (
-                "blk.1.ffn_norm.weight",
-                vec![1.0f32, 1.0, 1.0, 1.0],
-                vec![4u64],
-                0u32,
-            ),
+            ("blk.1.ffn_norm.weight", vec![1.0f32, 1.0, 1.0, 1.0], vec![4u64], 0u32),
             (
                 "blk.1.ffn_gate.weight",
                 vec![
@@ -9565,14 +9075,8 @@ mod tests {
 
         let tensor = transfer.into_stage_tensor();
         let transient = tensor.transient.unwrap();
-        assert_eq!(
-            transient.attention.as_ref().unwrap().q_preview,
-            vec![0.1, -0.2]
-        );
-        assert_eq!(
-            transient.ffn.as_ref().unwrap().activation_preview,
-            vec![0.5, 0.6]
-        );
+        assert_eq!(transient.attention.as_ref().unwrap().q_preview, vec![0.1, -0.2]);
+        assert_eq!(transient.ffn.as_ref().unwrap().activation_preview, vec![0.5, 0.6]);
     }
 
     #[test]
@@ -9635,12 +9139,8 @@ mod tests {
             .as_ref()
             .and_then(|transient| transient.attention.as_ref())
             .unwrap();
-        let ffn = transfer
-            .state
-            .transient
-            .as_ref()
-            .and_then(|transient| transient.ffn.as_ref())
-            .unwrap();
+        let ffn =
+            transfer.state.transient.as_ref().and_then(|transient| transient.ffn.as_ref()).unwrap();
 
         assert_eq!(attention.width, 8);
         assert_eq!(attention.preview_len, 10);
@@ -9651,41 +9151,20 @@ mod tests {
         assert!(ffn.rms_milli > 0);
         assert_ne!(ffn.checksum, 0);
 
-        let carry_attention = transfer
-            .state
-            .carry
-            .as_ref()
-            .and_then(|carry| carry.attention.as_ref())
-            .unwrap();
+        let carry_attention =
+            transfer.state.carry.as_ref().and_then(|carry| carry.attention.as_ref()).unwrap();
         assert_eq!(carry_attention.width(), 8);
         assert_eq!(carry_attention.lane_count(), 2);
         assert_eq!(carry_attention.projection_lane_count(), 2);
         assert_eq!(carry_attention.mix_lane_count(), 2);
-        assert_eq!(
-            carry_attention.projection.as_ref().unwrap().q,
-            vec![0.1, -0.2]
-        );
-        assert_eq!(
-            carry_attention.mix.as_ref().unwrap().scores,
-            vec![0.7, -0.8]
-        );
-        assert!(
-            transfer
-                .state
-                .carry
-                .as_ref()
-                .and_then(|carry| carry.ffn.as_ref())
-                .is_none()
-        );
+        assert_eq!(carry_attention.projection.as_ref().unwrap().q, vec![0.1, -0.2]);
+        assert_eq!(carry_attention.mix.as_ref().unwrap().scores, vec![0.7, -0.8]);
+        assert!(transfer.state.carry.as_ref().and_then(|carry| carry.ffn.as_ref()).is_none());
 
         let full_transfer = frame.to_transfer_frame_with_policy(&StageCarryPolicy::full());
         full_transfer.validate().unwrap();
-        let carry_ffn = full_transfer
-            .state
-            .carry
-            .as_ref()
-            .and_then(|carry| carry.ffn.as_ref())
-            .unwrap();
+        let carry_ffn =
+            full_transfer.state.carry.as_ref().and_then(|carry| carry.ffn.as_ref()).unwrap();
         assert_eq!(carry_ffn.width, 8);
         assert_eq!(carry_ffn.lane_count(), 2);
         assert_eq!(carry_ffn.gate_head, vec![0.1, 0.2]);
@@ -9706,35 +9185,14 @@ mod tests {
 
         let carry = CarryableAttentionState::from_attention(&attention);
         assert_eq!(carry.width(), 16);
-        assert_eq!(
-            carry.projection_lane_count(),
-            ATTENTION_PROJECTION_CARRY_BUDGET
-        );
+        assert_eq!(carry.projection_lane_count(), ATTENTION_PROJECTION_CARRY_BUDGET);
         assert_eq!(carry.mix_lane_count(), ATTENTION_MIX_CARRY_BUDGET);
-        assert_eq!(
-            carry.projection.as_ref().unwrap().q_lane_indices,
-            vec![0, 2, 4, 6]
-        );
-        assert_eq!(
-            carry.projection.as_ref().unwrap().k_lane_indices,
-            vec![0, 2, 4, 6]
-        );
-        assert_eq!(
-            carry.projection.as_ref().unwrap().v_lane_indices,
-            vec![0, 2, 4, 6]
-        );
-        assert_eq!(
-            carry.mix.as_ref().unwrap().score_lane_indices,
-            vec![0, 2, 4, 6, 8, 10, 12, 14]
-        );
-        assert_eq!(
-            carry.mix.as_ref().unwrap().value_lane_indices,
-            vec![0, 2, 4, 6, 8, 10, 12, 14]
-        );
-        assert_eq!(
-            carry.projection.as_ref().unwrap().q,
-            vec![0.1, 0.2, 0.3, 0.4]
-        );
+        assert_eq!(carry.projection.as_ref().unwrap().q_lane_indices, vec![0, 2, 4, 6]);
+        assert_eq!(carry.projection.as_ref().unwrap().k_lane_indices, vec![0, 2, 4, 6]);
+        assert_eq!(carry.projection.as_ref().unwrap().v_lane_indices, vec![0, 2, 4, 6]);
+        assert_eq!(carry.mix.as_ref().unwrap().score_lane_indices, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(carry.mix.as_ref().unwrap().value_lane_indices, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(carry.projection.as_ref().unwrap().q, vec![0.1, 0.2, 0.3, 0.4]);
         assert_eq!(
             carry.mix.as_ref().unwrap().scores,
             vec![2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8]
@@ -9743,14 +9201,8 @@ mod tests {
         let roundtrip = carry.to_attention_continuation().unwrap();
         assert_eq!(roundtrip.width, 16);
         assert_eq!(roundtrip.lane_indices, vec![0, 2, 4, 6, 8, 10, 12, 14]);
-        assert_eq!(
-            roundtrip.q_preview,
-            vec![0.1, 0.2, 0.3, 0.4, 0.0, 0.0, 0.0, 0.0]
-        );
-        assert_eq!(
-            roundtrip.score_preview,
-            vec![2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8]
-        );
+        assert_eq!(roundtrip.q_preview, vec![0.1, 0.2, 0.3, 0.4, 0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(roundtrip.score_preview, vec![2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8]);
     }
 
     #[test]
@@ -9835,27 +9287,14 @@ mod tests {
 
         let transfer = frame.to_transfer_frame_for_execution_boundary(&layout, &programs);
         let plan = frame.to_boundary_plan_for_execution_boundary(&layout, &programs);
-        let carry = transfer
-            .state
-            .carry
-            .as_ref()
-            .and_then(|carry| carry.attention.as_ref())
-            .unwrap();
+        let carry =
+            transfer.state.carry.as_ref().and_then(|carry| carry.attention.as_ref()).unwrap();
 
         assert_eq!(carry.projection_lane_count(), 2);
         assert_eq!(carry.mix_lane_count(), 2);
-        assert_eq!(
-            carry.projection.as_ref().unwrap().q_lane_indices,
-            vec![0, 1]
-        );
-        assert_eq!(
-            carry.projection.as_ref().unwrap().k_lane_indices,
-            vec![0, 1]
-        );
-        assert_eq!(
-            carry.projection.as_ref().unwrap().v_lane_indices,
-            vec![0, 1]
-        );
+        assert_eq!(carry.projection.as_ref().unwrap().q_lane_indices, vec![0, 1]);
+        assert_eq!(carry.projection.as_ref().unwrap().k_lane_indices, vec![0, 1]);
+        assert_eq!(carry.projection.as_ref().unwrap().v_lane_indices, vec![0, 1]);
         assert_eq!(carry.mix.as_ref().unwrap().score_lane_indices, vec![0, 1]);
         assert_eq!(carry.mix.as_ref().unwrap().value_lane_indices, vec![0, 1]);
         assert_eq!(plan.expected_attention_q_lanes, Some(2));
@@ -9952,22 +9391,12 @@ mod tests {
 
         let transfer = frame.to_transfer_frame_for_execution_boundary(&layout, &programs);
         let plan = frame.to_boundary_plan_for_execution_boundary(&layout, &programs);
-        let carry = transfer
-            .state
-            .carry
-            .as_ref()
-            .and_then(|carry| carry.attention.as_ref())
-            .unwrap();
+        let carry =
+            transfer.state.carry.as_ref().and_then(|carry| carry.attention.as_ref()).unwrap();
 
-        assert_eq!(
-            carry.projection_lane_count(),
-            ATTENTION_PROJECTION_CARRY_BUDGET
-        );
+        assert_eq!(carry.projection_lane_count(), ATTENTION_PROJECTION_CARRY_BUDGET);
         assert_eq!(carry.mix_lane_count(), ATTENTION_PROJECTION_CARRY_BUDGET);
-        assert_eq!(
-            plan.expected_attention_mix_lanes,
-            Some(ATTENTION_PROJECTION_CARRY_BUDGET)
-        );
+        assert_eq!(plan.expected_attention_mix_lanes, Some(ATTENTION_PROJECTION_CARRY_BUDGET));
     }
 
     #[test]
@@ -10042,33 +9471,14 @@ mod tests {
         let frame =
             StageForwardFrame::from_tensor("gemma-4-e4b-q4", &layout, tensor, Some("21-41".into()));
         let transfer = frame.to_transfer_frame();
-        let carry = transfer
-            .state
-            .carry
-            .as_ref()
-            .and_then(|carry| carry.attention.as_ref())
-            .unwrap();
+        let carry =
+            transfer.state.carry.as_ref().and_then(|carry| carry.attention.as_ref()).unwrap();
 
-        assert_eq!(
-            carry.projection.as_ref().unwrap().q_lane_indices,
-            vec![1, 3]
-        );
-        assert_eq!(
-            carry.projection.as_ref().unwrap().k_lane_indices,
-            vec![1, 3]
-        );
-        assert_eq!(
-            carry.projection.as_ref().unwrap().v_lane_indices,
-            vec![1, 3]
-        );
-        assert_eq!(
-            carry.mix.as_ref().unwrap().score_lane_indices,
-            vec![1, 3, 5]
-        );
-        assert_eq!(
-            carry.mix.as_ref().unwrap().value_lane_indices,
-            vec![1, 3, 5]
-        );
+        assert_eq!(carry.projection.as_ref().unwrap().q_lane_indices, vec![1, 3]);
+        assert_eq!(carry.projection.as_ref().unwrap().k_lane_indices, vec![1, 3]);
+        assert_eq!(carry.projection.as_ref().unwrap().v_lane_indices, vec![1, 3]);
+        assert_eq!(carry.mix.as_ref().unwrap().score_lane_indices, vec![1, 3, 5]);
+        assert_eq!(carry.mix.as_ref().unwrap().value_lane_indices, vec![1, 3, 5]);
         assert_eq!(carry.projection.as_ref().unwrap().q, vec![0.1, 0.2]);
         assert_eq!(carry.mix.as_ref().unwrap().scores, vec![0.7, 0.8, 0.9]);
     }
@@ -10109,18 +9519,9 @@ mod tests {
         assert_eq!(scratch.attn_v_lane_indices, Some(vec![1, 6]));
         assert_eq!(scratch.attn_score_lane_indices, Some(vec![0, 3, 7]));
         assert_eq!(scratch.attn_value_lane_indices, Some(vec![0, 3, 7]));
-        assert_eq!(
-            scratch.attn_q,
-            Some(vec![0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.2, 0.0])
-        );
-        assert_eq!(
-            scratch.attn_score,
-            Some(vec![1.0, 0.0, 0.0, 1.1, 0.0, 0.0, 0.0, 1.2])
-        );
-        assert_eq!(
-            scratch.attn_value,
-            Some(vec![2.0, 0.0, 0.0, 2.1, 0.0, 0.0, 0.0, 2.2])
-        );
+        assert_eq!(scratch.attn_q, Some(vec![0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.2, 0.0]));
+        assert_eq!(scratch.attn_score, Some(vec![1.0, 0.0, 0.0, 1.1, 0.0, 0.0, 0.0, 1.2]));
+        assert_eq!(scratch.attn_value, Some(vec![2.0, 0.0, 0.0, 2.1, 0.0, 0.0, 0.0, 2.2]));
     }
 
     #[test]
@@ -10548,10 +9949,7 @@ mod tests {
         )
         .unwrap();
         let store = StageTensorStore::load(&index_path).unwrap();
-        let scratch = LayerScratch {
-            input_gate: Some(vec![0.0, 1.0]),
-            ..LayerScratch::default()
-        };
+        let scratch = LayerScratch { input_gate: Some(vec![0.0, 1.0]), ..LayerScratch::default() };
 
         let projected = PackedResidencySketchBackend::try_project_decoded_projection_matrix(
             &store,
@@ -10602,11 +10000,7 @@ mod tests {
             ffn_lanes: None,
         };
 
-        assert!(
-            carry
-                .with_resume_contract(&capabilities, &budgets)
-                .is_none()
-        );
+        assert!(carry.with_resume_contract(&capabilities, &budgets).is_none());
         assert!(carry.with_resume_capabilities(&capabilities).is_none());
     }
 
@@ -10661,53 +10055,14 @@ mod tests {
         };
 
         let merged = PackedResidencySketchBackend::merge_stage_carry(Some(previous), None).unwrap();
-        let projection = merged
-            .attention
-            .as_ref()
-            .unwrap()
-            .projection
-            .as_ref()
-            .unwrap();
+        let projection = merged.attention.as_ref().unwrap().projection.as_ref().unwrap();
         let mix = merged.attention.as_ref().unwrap().mix.as_ref().unwrap();
 
-        assert_eq!(
-            projection
-                .q_provenance
-                .as_ref()
-                .unwrap()
-                .layer_distance_to_boundary,
-            1
-        );
-        assert_eq!(
-            projection
-                .k_provenance
-                .as_ref()
-                .unwrap()
-                .layer_distance_to_boundary,
-            1
-        );
-        assert_eq!(
-            projection
-                .v_provenance
-                .as_ref()
-                .unwrap()
-                .layer_distance_to_boundary,
-            1
-        );
-        assert_eq!(
-            mix.score_provenance
-                .as_ref()
-                .unwrap()
-                .layer_distance_to_boundary,
-            1
-        );
-        assert_eq!(
-            mix.value_provenance
-                .as_ref()
-                .unwrap()
-                .layer_distance_to_boundary,
-            1
-        );
+        assert_eq!(projection.q_provenance.as_ref().unwrap().layer_distance_to_boundary, 1);
+        assert_eq!(projection.k_provenance.as_ref().unwrap().layer_distance_to_boundary, 1);
+        assert_eq!(projection.v_provenance.as_ref().unwrap().layer_distance_to_boundary, 1);
+        assert_eq!(mix.score_provenance.as_ref().unwrap().layer_distance_to_boundary, 1);
+        assert_eq!(mix.value_provenance.as_ref().unwrap().layer_distance_to_boundary, 1);
     }
 
     #[test]
@@ -10915,15 +10270,9 @@ mod tests {
 
         assert_eq!(direct.recompute_phase, AttentionSliceRecomputePhase::Direct);
         assert_eq!(direct.blend_strength, None);
-        assert_eq!(
-            StageResumeFreshnessPolicy::max_distance_for_resume_path(Some(direct)),
-            Some(0)
-        );
+        assert_eq!(StageResumeFreshnessPolicy::max_distance_for_resume_path(Some(direct)), Some(0));
 
-        assert_eq!(
-            after_projection.recompute_phase,
-            AttentionSliceRecomputePhase::AfterProjection
-        );
+        assert_eq!(after_projection.recompute_phase, AttentionSliceRecomputePhase::AfterProjection);
         assert_eq!(after_projection.blend_strength, None);
         assert_eq!(
             StageResumeFreshnessPolicy::max_distance_for_resume_path(Some(after_projection)),
@@ -11128,10 +10477,7 @@ mod tests {
                 blend_weight_milli: None,
             })
         );
-        assert_eq!(
-            StageResumeFreshnessPolicy::max_distance_for_resume_path(q_path),
-            Some(0)
-        );
+        assert_eq!(StageResumeFreshnessPolicy::max_distance_for_resume_path(q_path), Some(0));
     }
 
     #[test]
@@ -11201,10 +10547,7 @@ mod tests {
                 next_layer_index: Some(1),
                 expected_payload_kind: PayloadKind::HiddenState,
                 expected_hidden_dim: 64,
-                carry_policy: StageCarryPolicy {
-                    carry_attention: true,
-                    carry_ffn: false,
-                },
+                carry_policy: StageCarryPolicy { carry_attention: true, carry_ffn: false },
                 expects_attention_carry: true,
                 expects_ffn_carry: false,
                 expected_attention_width: Some(1),
@@ -11328,14 +10671,12 @@ mod tests {
         };
 
         let mut contract_mismatch_request = request.clone();
-        contract_mismatch_request
-            .boundary
-            .resumable_attention_contract
-            .attention_q = Some(StageAttentionResumeContractSummary {
-            phase: StageAttentionResumePhase::AfterProjection,
-            blend: StageAttentionResumeBlend::StrongBlend,
-            blend_weight_milli: Some(350),
-        });
+        contract_mismatch_request.boundary.resumable_attention_contract.attention_q =
+            Some(StageAttentionResumeContractSummary {
+                phase: StageAttentionResumePhase::AfterProjection,
+                blend: StageAttentionResumeBlend::StrongBlend,
+                blend_weight_milli: Some(350),
+            });
         let contract_mismatch = tail.admit_resume_request(&contract_mismatch_request);
         assert!(!contract_mismatch.accepted);
         assert!(

@@ -36,3 +36,19 @@ solana-program/test-ledger/
 
 # Claude Code
 .claude/
+.compute-code/
+
+# Local convenience symlinks/clones to sibling repos
+/compute-code
+/compute-website
+/compute/
+/orchestrator
+/orchestrator-archive/
+
+# Vendored llama.cpp build artifacts (we ship the source, not its CMake output)
+vendor/llama.cpp/build*/
+vendor/llama.cpp/cmake-build*/
+vendor/llama.cpp/.cache/
+
+# Local research / scratch
+ARCHIVE-REMOVE/

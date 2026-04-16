@@ -77,13 +77,36 @@ pub struct ExperimentalConfig {
     pub stage_mode_enabled: bool,
     #[serde(default = "default_stage_backend")]
     pub stage_backend: String,
+    #[serde(default)]
+    pub stage_gateway_addr: String,
+    #[serde(default)]
+    pub stage_gateway_autostart: bool,
+    #[serde(default)]
+    pub stage_gateway_model_path: String,
+    #[serde(default)]
+    pub stage_gateway_stage_node_bin: String,
+    #[serde(default)]
+    pub stage_gateway_gateway_bin: String,
+    #[serde(default = "default_stage_gateway_connect_timeout_ms")]
+    pub stage_gateway_connect_timeout_ms: u64,
+    #[serde(default = "default_stage_gateway_retry_window_ms")]
+    pub stage_gateway_retry_window_ms: u64,
+    #[serde(default = "default_stage_gateway_retry_interval_ms")]
+    pub stage_gateway_retry_interval_ms: u64,
+    #[serde(default = "default_stage_gateway_startup_grace_ms")]
+    pub stage_gateway_startup_grace_ms: u64,
+    #[serde(default = "default_stage_acceleration")]
+    pub stage_acceleration: String,
+    #[serde(default = "default_stage_acceleration_provider")]
+    pub stage_acceleration_provider: String,
 }
 
 fn default_models_cache_dir() -> String {
     config_dir()
         .or_else(|| {
             // Fallback: expand ~ properly instead of using literal tilde
-            std::env::var("HOME").ok()
+            std::env::var("HOME")
+                .ok()
                 .or_else(|| std::env::var("USERPROFILE").ok())
                 .map(|h| PathBuf::from(h).join(".compute"))
         })
@@ -103,39 +126,70 @@ fn default_theme() -> String {
 
 impl Default for ModelsConfig {
     fn default() -> Self {
-        Self {
-            cache_dir: default_models_cache_dir(),
-            active_model: default_active_model(),
-        }
+        Self { cache_dir: default_models_cache_dir(), active_model: default_active_model() }
     }
 }
 
 impl Default for AppearanceConfig {
     fn default() -> Self {
-        Self {
-            theme: default_theme(),
-        }
+        Self { theme: default_theme() }
     }
 }
 
 impl Default for ExperimentalConfig {
     fn default() -> Self {
         Self {
-            stage_mode_enabled: false,
+            stage_mode_enabled: true,
             stage_backend: default_stage_backend(),
+            stage_gateway_addr: String::new(),
+            stage_gateway_autostart: true,
+            stage_gateway_model_path: String::new(),
+            stage_gateway_stage_node_bin: String::new(),
+            stage_gateway_gateway_bin: String::new(),
+            stage_gateway_connect_timeout_ms: default_stage_gateway_connect_timeout_ms(),
+            stage_gateway_retry_window_ms: default_stage_gateway_retry_window_ms(),
+            stage_gateway_retry_interval_ms: default_stage_gateway_retry_interval_ms(),
+            stage_gateway_startup_grace_ms: default_stage_gateway_startup_grace_ms(),
+            stage_acceleration: default_stage_acceleration(),
+            stage_acceleration_provider: default_stage_acceleration_provider(),
         }
     }
 }
 
 fn default_stage_backend() -> String {
-    "prototype".into()
+    "llama-stage-gateway".into()
+}
+
+fn default_stage_gateway_connect_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_stage_gateway_retry_window_ms() -> u64 {
+    30_000
+}
+
+fn default_stage_gateway_retry_interval_ms() -> u64 {
+    250
+}
+
+fn default_stage_gateway_startup_grace_ms() -> u64 {
+    0
+}
+
+fn default_stage_acceleration() -> String {
+    "auto".into()
+}
+
+fn default_stage_acceleration_provider() -> String {
+    "auto".into()
 }
 
 impl Default for Config {
     fn default() -> Self {
         let compute_dir = config_dir()
             .or_else(|| {
-                std::env::var("HOME").ok()
+                std::env::var("HOME")
+                    .ok()
                     .or_else(|| std::env::var("USERPROFILE").ok())
                     .map(|h| PathBuf::from(h).join(".compute"))
             })
@@ -207,8 +261,9 @@ impl Config {
         let tmp_path = path.with_extension("toml.tmp");
         std::fs::write(&tmp_path, &contents)
             .with_context(|| format!("Failed to write temp config: {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, &path)
-            .with_context(|| format!("Failed to rename config: {} -> {}", tmp_path.display(), path.display()))?;
+        std::fs::rename(&tmp_path, &path).with_context(|| {
+            format!("Failed to rename config: {} -> {}", tmp_path.display(), path.display())
+        })?;
         Ok(())
     }
 
@@ -229,8 +284,39 @@ impl Config {
             "logging.level" => Some(self.logging.level.clone()),
             "appearance.theme" => Some(self.appearance.theme.clone()),
             "models.active_model" => Some(self.models.active_model.clone()),
-            "experimental.stage_mode_enabled" => Some(self.experimental.stage_mode_enabled.to_string()),
+            "experimental.stage_mode_enabled" => {
+                Some(self.experimental.stage_mode_enabled.to_string())
+            }
             "experimental.stage_backend" => Some(self.experimental.stage_backend.clone()),
+            "experimental.stage_gateway_addr" => Some(self.experimental.stage_gateway_addr.clone()),
+            "experimental.stage_gateway_autostart" => {
+                Some(self.experimental.stage_gateway_autostart.to_string())
+            }
+            "experimental.stage_gateway_model_path" => {
+                Some(self.experimental.stage_gateway_model_path.clone())
+            }
+            "experimental.stage_gateway_stage_node_bin" => {
+                Some(self.experimental.stage_gateway_stage_node_bin.clone())
+            }
+            "experimental.stage_gateway_gateway_bin" => {
+                Some(self.experimental.stage_gateway_gateway_bin.clone())
+            }
+            "experimental.stage_gateway_connect_timeout_ms" => {
+                Some(self.experimental.stage_gateway_connect_timeout_ms.to_string())
+            }
+            "experimental.stage_gateway_retry_window_ms" => {
+                Some(self.experimental.stage_gateway_retry_window_ms.to_string())
+            }
+            "experimental.stage_gateway_retry_interval_ms" => {
+                Some(self.experimental.stage_gateway_retry_interval_ms.to_string())
+            }
+            "experimental.stage_gateway_startup_grace_ms" => {
+                Some(self.experimental.stage_gateway_startup_grace_ms.to_string())
+            }
+            "experimental.stage_acceleration" => Some(self.experimental.stage_acceleration.clone()),
+            "experimental.stage_acceleration_provider" => {
+                Some(self.experimental.stage_acceleration_provider.clone())
+            }
             _ => None,
         }
     }
@@ -252,8 +338,43 @@ impl Config {
             "logging.level" => self.logging.level = value.to_string(),
             "appearance.theme" => self.appearance.theme = value.to_string(),
             "models.active_model" => self.models.active_model = value.to_string(),
-            "experimental.stage_mode_enabled" => self.experimental.stage_mode_enabled = value.parse()?,
+            "experimental.stage_mode_enabled" => {
+                self.experimental.stage_mode_enabled = value.parse()?
+            }
             "experimental.stage_backend" => self.experimental.stage_backend = value.to_string(),
+            "experimental.stage_gateway_addr" => {
+                self.experimental.stage_gateway_addr = value.to_string()
+            }
+            "experimental.stage_gateway_autostart" => {
+                self.experimental.stage_gateway_autostart = value.parse()?
+            }
+            "experimental.stage_gateway_model_path" => {
+                self.experimental.stage_gateway_model_path = value.to_string()
+            }
+            "experimental.stage_gateway_stage_node_bin" => {
+                self.experimental.stage_gateway_stage_node_bin = value.to_string()
+            }
+            "experimental.stage_gateway_gateway_bin" => {
+                self.experimental.stage_gateway_gateway_bin = value.to_string()
+            }
+            "experimental.stage_gateway_connect_timeout_ms" => {
+                self.experimental.stage_gateway_connect_timeout_ms = value.parse()?
+            }
+            "experimental.stage_gateway_retry_window_ms" => {
+                self.experimental.stage_gateway_retry_window_ms = value.parse()?
+            }
+            "experimental.stage_gateway_retry_interval_ms" => {
+                self.experimental.stage_gateway_retry_interval_ms = value.parse()?
+            }
+            "experimental.stage_gateway_startup_grace_ms" => {
+                self.experimental.stage_gateway_startup_grace_ms = value.parse()?
+            }
+            "experimental.stage_acceleration" => {
+                self.experimental.stage_acceleration = value.to_string()
+            }
+            "experimental.stage_acceleration_provider" => {
+                self.experimental.stage_acceleration_provider = value.to_string()
+            }
             _ => anyhow::bail!("Unknown config key: {key}"),
         }
         Ok(())
@@ -339,6 +460,8 @@ mod tests {
         assert_eq!(config.network.orchestrator_url, "https://api.computenetwork.sh");
         assert_eq!(config.network.region, "auto");
         assert_eq!(config.logging.level, "info");
+        assert_eq!(config.experimental.stage_acceleration, "auto");
+        assert_eq!(config.experimental.stage_acceleration_provider, "auto");
     }
 
     #[test]
@@ -359,6 +482,14 @@ mod tests {
         assert_eq!(config.get("node.name").unwrap(), config.node.name);
         assert_eq!(config.get("node.max_gpu_usage").unwrap(), "90");
         assert_eq!(config.get("wallet.public_address").unwrap(), "");
+        assert_eq!(config.get("experimental.stage_acceleration").unwrap(), "auto");
+        assert_eq!(config.get("experimental.stage_acceleration_provider").unwrap(), "auto");
+        assert_eq!(config.get("experimental.stage_gateway_autostart").unwrap(), "false");
+        assert_eq!(config.get("experimental.stage_gateway_stage_node_bin").unwrap(), "");
+        assert_eq!(config.get("experimental.stage_gateway_connect_timeout_ms").unwrap(), "2000");
+        assert_eq!(config.get("experimental.stage_gateway_retry_window_ms").unwrap(), "30000");
+        assert_eq!(config.get("experimental.stage_gateway_retry_interval_ms").unwrap(), "250");
+        assert_eq!(config.get("experimental.stage_gateway_startup_grace_ms").unwrap(), "0");
         assert!(config.get("nonexistent.key").is_none());
 
         // Set
@@ -370,6 +501,36 @@ mod tests {
 
         config.set("wallet.public_address", "So1anaAddress123").unwrap();
         assert_eq!(config.wallet.public_address, "So1anaAddress123");
+
+        config.set("experimental.stage_acceleration", "metal").unwrap();
+        assert_eq!(config.experimental.stage_acceleration, "metal");
+
+        config.set("experimental.stage_acceleration_provider", "ggml").unwrap();
+        assert_eq!(config.experimental.stage_acceleration_provider, "ggml");
+
+        config.set("experimental.stage_gateway_autostart", "true").unwrap();
+        assert!(config.experimental.stage_gateway_autostart);
+
+        config.set("experimental.stage_gateway_model_path", "/tmp/model.gguf").unwrap();
+        assert_eq!(config.experimental.stage_gateway_model_path, "/tmp/model.gguf");
+
+        config.set("experimental.stage_gateway_stage_node_bin", "/tmp/stage-node").unwrap();
+        assert_eq!(config.experimental.stage_gateway_stage_node_bin, "/tmp/stage-node");
+
+        config.set("experimental.stage_gateway_gateway_bin", "/tmp/gateway-node").unwrap();
+        assert_eq!(config.experimental.stage_gateway_gateway_bin, "/tmp/gateway-node");
+
+        config.set("experimental.stage_gateway_connect_timeout_ms", "1500").unwrap();
+        assert_eq!(config.experimental.stage_gateway_connect_timeout_ms, 1500);
+
+        config.set("experimental.stage_gateway_retry_window_ms", "45000").unwrap();
+        assert_eq!(config.experimental.stage_gateway_retry_window_ms, 45000);
+
+        config.set("experimental.stage_gateway_retry_interval_ms", "500").unwrap();
+        assert_eq!(config.experimental.stage_gateway_retry_interval_ms, 500);
+
+        config.set("experimental.stage_gateway_startup_grace_ms", "4000").unwrap();
+        assert_eq!(config.experimental.stage_gateway_startup_grace_ms, 4000);
 
         // Invalid key
         assert!(config.set("invalid.key", "value").is_err());

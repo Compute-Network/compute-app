@@ -3,24 +3,14 @@ use stage_forward_lab::{LoadedRuntimeBundle, gguf::GgufFile};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
-    let root = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                "/Users/macintosh/Documents/projects/Compute/compute-backend/out/gemma-e4b-2stage",
-            )
-        });
-    let gguf_path = std::env::args()
-        .nth(2)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap()
-                .join(".compute")
-                .join("models")
-                .join("gemma-4-E4B-it-Q4_K_M.gguf")
-        });
+    let root = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from(
+            "/Users/macintosh/Documents/projects/Compute/compute-backend/out/gemma-e4b-2stage",
+        )
+    });
+    let gguf_path = std::env::args().nth(2).map(PathBuf::from).unwrap_or_else(|| {
+        dirs::home_dir().unwrap().join(".compute").join("models").join("gemma-4-E4B-it-Q4_K_M.gguf")
+    });
 
     let bundle = LoadedRuntimeBundle::load(&root)?;
     let gguf = GgufFile::parse_file(&gguf_path)?;

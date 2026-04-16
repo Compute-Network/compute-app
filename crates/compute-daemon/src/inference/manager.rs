@@ -44,7 +44,9 @@ impl std::fmt::Display for InferenceStatus {
             InferenceStatus::Idle => write!(f, "idle"),
             InferenceStatus::Starting => write!(f, "starting"),
             InferenceStatus::Running { model_name, .. } => write!(f, "running ({model_name})"),
-            InferenceStatus::RunningRpcWorker { model_name, .. } => write!(f, "rpc-worker ({model_name})"),
+            InferenceStatus::RunningRpcWorker { model_name, .. } => {
+                write!(f, "rpc-worker ({model_name})")
+            }
             InferenceStatus::Error(e) => write!(f, "error: {e}"),
         }
     }
@@ -159,14 +161,17 @@ impl InferenceManager {
                 self.start_server(pid, model);
             }
             // Running a different pipeline → check if same model (avoid restart)
-            (InferenceStatus::Running { pipeline_id: current, model_name: current_model, port }, Some(pid))
-                if current != pid =>
-            {
+            (
+                InferenceStatus::Running { pipeline_id: current, model_name: current_model, port },
+                Some(pid),
+            ) if current != pid => {
                 let new_model = model_name.unwrap_or("unknown");
                 if current_model == new_model {
                     // Same model, different pipeline (e.g. pre-warm → real assignment)
                     // Just update the pipeline ID without restarting llama-server
-                    info!("Pipeline reassigned: {current} → {pid} (same model {new_model}, keeping server)");
+                    info!(
+                        "Pipeline reassigned: {current} → {pid} (same model {new_model}, keeping server)"
+                    );
                     let port = *port;
                     self.status = InferenceStatus::Running {
                         pipeline_id: pid.to_string(),
@@ -177,7 +182,9 @@ impl InferenceManager {
                     self.current_model_name = Some(new_model.to_string());
                 } else {
                     // Different model → must restart
-                    info!("Pipeline changed: {current} → {pid} (model {current_model} → {new_model}) — restarting");
+                    info!(
+                        "Pipeline changed: {current} → {pid} (model {current_model} → {new_model}) — restarting"
+                    );
                     self.stop_server();
                     self.current_pipeline_id = Some(pid.to_string());
                     self.current_model_name = Some(new_model.to_string());
@@ -245,18 +252,29 @@ impl InferenceManager {
 
         let result = Command::new("llama-server")
             .args([
-                "--model", path,
-                "--port", &self.port.to_string(),
-                "--ctx-size", "32768",
-                "--n-gpu-layers", "999",
-                "--flash-attn", "on",
+                "--model",
+                path,
+                "--port",
+                &self.port.to_string(),
+                "--ctx-size",
+                "32768",
+                "--n-gpu-layers",
+                "999",
+                "--flash-attn",
+                "on",
                 "--cont-batching",
-                "--parallel", "2",
-                "--cache-type-k", "q8_0",
-                "--cache-type-v", "q8_0",
-                "--batch-size", "2048",
-                "--ubatch-size", "512",
-                "--threads", "6",
+                "--parallel",
+                "2",
+                "--cache-type-k",
+                "q8_0",
+                "--cache-type-v",
+                "q8_0",
+                "--batch-size",
+                "2048",
+                "--ubatch-size",
+                "512",
+                "--threads",
+                "6",
                 "--mlock",
                 "--jinja",
             ])
@@ -285,18 +303,29 @@ impl InferenceManager {
 
         // Build args — same as solo plus --rpc for distributed layers
         let mut args = vec![
-            "--model".to_string(), path.to_string(),
-            "--port".to_string(), self.port.to_string(),
-            "--ctx-size".to_string(), "8192".to_string(),
-            "--n-gpu-layers".to_string(), "999".to_string(),
-            "--flash-attn".to_string(), "on".to_string(),
+            "--model".to_string(),
+            path.to_string(),
+            "--port".to_string(),
+            self.port.to_string(),
+            "--ctx-size".to_string(),
+            "8192".to_string(),
+            "--n-gpu-layers".to_string(),
+            "999".to_string(),
+            "--flash-attn".to_string(),
+            "on".to_string(),
             "--cont-batching".to_string(),
-            "--parallel".to_string(), "4".to_string(),
-            "--cache-type-k".to_string(), "q8_0".to_string(),
-            "--cache-type-v".to_string(), "q8_0".to_string(),
-            "--batch-size".to_string(), "2048".to_string(),
-            "--ubatch-size".to_string(), "512".to_string(),
-            "--threads".to_string(), "6".to_string(),
+            "--parallel".to_string(),
+            "4".to_string(),
+            "--cache-type-k".to_string(),
+            "q8_0".to_string(),
+            "--cache-type-v".to_string(),
+            "q8_0".to_string(),
+            "--batch-size".to_string(),
+            "2048".to_string(),
+            "--ubatch-size".to_string(),
+            "512".to_string(),
+            "--threads".to_string(),
+            "6".to_string(),
             "--mlock".to_string(),
             "--jinja".to_string(),
         ];
@@ -330,9 +359,12 @@ impl InferenceManager {
         // rpc-server doesn't need a model file — the head node sends weights
         let result = Command::new("rpc-server")
             .args([
-                "--host", "0.0.0.0",
-                "--port", &rpc_port.to_string(),
-                "--mem", "0", // Use all available memory
+                "--host",
+                "0.0.0.0",
+                "--port",
+                &rpc_port.to_string(),
+                "--mem",
+                "0", // Use all available memory
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -394,7 +426,9 @@ impl InferenceManager {
             // Send SIGTERM for graceful shutdown
             #[cfg(unix)]
             {
-                unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGTERM);
+                }
             }
             #[cfg(not(unix))]
             {
@@ -438,8 +472,12 @@ impl InferenceManager {
                     self.server_process = None;
                     self.restart_attempts = self.restart_attempts.saturating_add(1);
                     let backoff_secs = 2u64.pow(self.restart_attempts.min(4));
-                    self.restart_after = Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs));
-                    self.status = InferenceStatus::Error(format!("Server crashed (restart in {backoff_secs}s)"));
+                    self.restart_after = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs),
+                    );
+                    self.status = InferenceStatus::Error(format!(
+                        "Server crashed (restart in {backoff_secs}s)"
+                    ));
                     return false;
                 }
                 Ok(None) => return true, // Still running
@@ -450,7 +488,10 @@ impl InferenceManager {
             }
         }
         // No process to check — only an issue if we think we're running
-        !matches!(self.status, InferenceStatus::Running { .. } | InferenceStatus::RunningRpcWorker { .. })
+        !matches!(
+            self.status,
+            InferenceStatus::Running { .. } | InferenceStatus::RunningRpcWorker { .. }
+        )
     }
 
     /// Attempt to restart the currently assigned process after a crash.
@@ -478,9 +519,7 @@ impl InferenceManager {
 
         warn!(
             "[inference] Attempting automatic recovery for pipeline {} model {} (attempt #{})",
-            pipeline_id,
-            model_name,
-            self.restart_attempts
+            pipeline_id, model_name, self.restart_attempts
         );
         self.start_server(&pipeline_id, &model_name);
         true
@@ -599,7 +638,11 @@ fn find_model_path(model_name: &str) -> Option<String> {
             // Verify file is a valid GGUF and not too small (corrupt/partial)
             if let Ok(meta) = std::fs::metadata(&path) {
                 if meta.len() < 100 * 1024 * 1024 {
-                    warn!("Skipping model {} — too small ({:.1} MB)", name, meta.len() as f64 / 1048576.0);
+                    warn!(
+                        "Skipping model {} — too small ({:.1} MB)",
+                        name,
+                        meta.len() as f64 / 1048576.0
+                    );
                     continue;
                 }
             }

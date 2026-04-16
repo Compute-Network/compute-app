@@ -39,6 +39,12 @@ pub struct NodeRow {
     pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tflops_fp16: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_capable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bandwidth_gbps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_backend_kind: Option<String>,
 }
 
 /// Heartbeat update payload (subset of node fields).
@@ -69,11 +75,17 @@ pub struct HeartbeatUpdate {
     pub downloaded_models: Option<String>, // comma-separated model IDs
     // Inference-aware heartbeat fields (for smarter scheduling)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub inference_slots_total: Option<i32>,     // --parallel value
+    pub inference_slots_total: Option<i32>, // --parallel value
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub inference_slots_busy: Option<i32>,      // currently processing
+    pub inference_slots_busy: Option<i32>, // currently processing
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gpu_vram_free_mb: Option<i64>,          // free unified/VRAM
+    pub gpu_vram_free_mb: Option<i64>, // free unified/VRAM
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_capable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bandwidth_gbps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_backend_kind: Option<String>,
     pub last_heartbeat: String, // ISO 8601
 }
 

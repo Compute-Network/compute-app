@@ -21,17 +21,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-13
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-          - target: aarch64-pc-windows-msvc
-            os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -44,38 +37,78 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Install cross for Linux ARM cross-compilation
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
-      # Build
-      - name: Build (cross)
-        if: matrix.cross
-        env:
-          OPENSSL_STATIC: "1"
-          CROSS_CONTAINER_OPTS: "--env OPENSSL_STATIC=1"
-        run: cross build --release --target ${{ matrix.target }} -p compute-cli
-
-      - name: Build (native)
-        if: "!matrix.cross"
-        run: cargo build --release --target ${{ matrix.target }} -p compute-cli
-
-      # Package - Unix: bare binary named compute-{target}
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      # Linux: install cmake/build tools needed by the patched llama.cpp build
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
         run: |
-          cp target/${{ matrix.target }}/release/compute compute-${{ matrix.target }}
-          tar czf compute-${{ matrix.target }}.tar.gz compute-${{ matrix.target }}
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential pkg-config
+
+      - name: Build
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p compute-cli --bin compute \
+            -p llama-stage-backend --bin llama_stage_tcp_node \
+            -p llama-stage-backend --bin llama_stage_gateway_tcp_node
+
+      # Bundle compute + sidecars + the libllama/libggml dylibs the sidecars
+      # need at runtime (they're built by the cmake step inside cargo's
+      # OUT_DIR; we copy them into the bundle so they sit next to the binaries
+      # in ~/.compute/bin/).
+      - name: Package bundle
+        run: |
+          set -e
+          rm -rf bundle
+          mkdir -p bundle
+          cp target/${{ matrix.target }}/release/compute bundle/compute
+          cp target/${{ matrix.target }}/release/llama_stage_tcp_node bundle/llama_stage_tcp_node
+          cp target/${{ matrix.target }}/release/llama_stage_gateway_tcp_node bundle/llama_stage_gateway_tcp_node
+
+          # The cmake build script installs libllama/libggml under
+          # target/<triple>/release/build/llama-stage-backend-*/out/lib
+          # — copy every .dylib/.so into the bundle.
+          BUILD_DIRS=$(ls -d target/${{ matrix.target }}/release/build/llama-stage-backend-*/out/lib 2>/dev/null || true)
+          if [ -z "$BUILD_DIRS" ]; then
+            echo "ERROR: no llama-stage-backend cmake output dir found" >&2
+            ls -la target/${{ matrix.target }}/release/build/ || true
+            exit 1
+          fi
+          for d in $BUILD_DIRS; do
+            find "$d" -maxdepth 1 \( -name '*.dylib' -o -name '*.so' -o -name '*.so.*' \) -exec cp -av {} bundle/ \;
+          done
+
+          # On macOS, rewrite the dylib install names so the sidecars look for
+          # them next to themselves (@loader_path) instead of the build-time
+          # absolute path baked in by cmake.
+          if [ "$(uname -s)" = "Darwin" ]; then
+            for binary in bundle/llama_stage_tcp_node bundle/llama_stage_gateway_tcp_node; do
+              for dep in $(otool -L "$binary" | awk 'NR>1 {print $1}' | grep -E '/libllama|/libggml' || true); do
+                base=$(basename "$dep")
+                install_name_tool -change "$dep" "@loader_path/$base" "$binary" || true
+              done
+            done
+            for dy in bundle/*.dylib; do
+              [ -f "$dy" ] || continue
+              install_name_tool -id "@loader_path/$(basename "$dy")" "$dy" || true
+              for dep in $(otool -L "$dy" | awk 'NR>1 {print $1}' | grep -E '/libllama|/libggml' || true); do
+                base=$(basename "$dep")
+                install_name_tool -change "$dep" "@loader_path/$base" "$dy" || true
+              done
+            done
+          fi
+
+          # On Linux, set rpath so the binaries find sibling .so files.
+          if [ "$(uname -s)" = "Linux" ]; then
+            sudo apt-get install -y patchelf || true
+            for binary in bundle/llama_stage_tcp_node bundle/llama_stage_gateway_tcp_node; do
+              patchelf --set-rpath '$ORIGIN' "$binary" || true
+            done
+          fi
+
+          ls -la bundle/
+
+          tar czf compute-${{ matrix.target }}.tar.gz -C bundle .
           shasum -a 256 compute-${{ matrix.target }}.tar.gz > compute-${{ matrix.target }}.tar.gz.sha256
-
-      # Package - Windows
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Copy-Item "target/${{ matrix.target }}/release/compute.exe" "compute-${{ matrix.target }}.exe"
-          Compress-Archive -Path "compute-${{ matrix.target }}.exe" -DestinationPath "compute-${{ matrix.target }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -84,7 +117,6 @@ jobs:
           path: |
             compute-${{ matrix.target }}.tar.gz
             compute-${{ matrix.target }}.tar.gz.sha256
-            compute-${{ matrix.target }}.zip
 
   release:
     name: Create Release
@@ -105,4 +137,3 @@ jobs:
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.tar.gz.sha256
-            artifacts/**/*.zip

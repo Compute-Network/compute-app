@@ -56,6 +56,32 @@ pub struct TokenPayload {
     pub is_finished: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings: Option<PipelineTimingProfile>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PipelineTimingProfile {
+    #[serde(default)]
+    pub stages: Vec<PipelineStageTiming>,
+}
+
+impl PipelineTimingProfile {
+    pub fn total_engine_ms(&self) -> u128 {
+        self.stages.iter().map(|stage| u128::from(stage.engine_ms)).sum()
+    }
+
+    pub fn total_stage_ms(&self) -> u128 {
+        self.stages.iter().map(|stage| u128::from(stage.total_ms)).sum()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStageTiming {
+    pub stage_index: u32,
+    pub role: String,
+    pub engine_ms: u64,
+    pub total_ms: u64,
 }
 
 /// Pipeline control messages.

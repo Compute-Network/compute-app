@@ -49,10 +49,7 @@ fn main() -> Result<()> {
     // Ensure terminal is restored on panic (raw mode + alternate screen)
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::execute!(
-            std::io::stderr(),
-            crossterm::terminal::LeaveAlternateScreen
-        );
+        let _ = crossterm::execute!(std::io::stderr(), crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
         default_panic(info);
     }));
@@ -69,7 +66,9 @@ fn main() -> Result<()> {
         Some(Commands::Config { action }) => cmd_config(action)?,
         Some(Commands::Wallet { action }) => cmd_wallet(action)?,
         Some(Commands::Earnings) => cmd_earnings()?,
-        Some(Commands::Benchmark { llama, model, api_key }) => cmd_benchmark(llama, model, api_key)?,
+        Some(Commands::Benchmark { llama, model, api_key }) => {
+            cmd_benchmark(llama, model, api_key)?
+        }
         Some(Commands::Hardware) => cmd_hardware()?,
         Some(Commands::Pipeline) => cmd_pipeline()?,
         Some(Commands::Nodes { all, limit }) => cmd_nodes(all, limit)?,
@@ -151,7 +150,9 @@ async fn register_node_orchestrator(config: &Config) {
     let hw = hardware::detect();
     match tui::app::register_node_orchestrator(config, &hw).await {
         Ok(id) => {
-            let Some(id) = id else { return; };
+            let Some(id) = id else {
+                return;
+            };
             println!("  Registered with network (node: {id})");
             let mut updated_config = config.clone();
             updated_config.wallet.node_id = id;
@@ -179,9 +180,8 @@ fn open_url(url: &str) {
 }
 
 fn wallet_login_flow() -> Result<WalletLoginResult> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+    let client =
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?;
 
     let start = client
         .post(format!("{API_BASE}/v1/auth/device/start"))
@@ -201,12 +201,15 @@ fn wallet_login_flow() -> Result<WalletLoginResult> {
             anyhow::bail!("Wallet login expired. Run the command again.");
         }
 
-        let res = client.get(format!("{API_BASE}/v1/auth/device/poll/{}", start.device_code)).send()?;
+        let res =
+            client.get(format!("{API_BASE}/v1/auth/device/poll/{}", start.device_code)).send()?;
         if res.status() == reqwest::StatusCode::ACCEPTED {
             std::thread::sleep(std::time::Duration::from_secs(start.poll_interval.max(1)));
             continue;
         }
-        if res.status() == reqwest::StatusCode::GONE || res.status() == reqwest::StatusCode::NOT_FOUND {
+        if res.status() == reqwest::StatusCode::GONE
+            || res.status() == reqwest::StatusCode::NOT_FOUND
+        {
             anyhow::bail!("Wallet login expired. Run the command again.");
         }
 
@@ -685,7 +688,9 @@ fn cmd_benchmark(run_llama: bool, model: Option<String>, api_key: Option<String>
 
         let direct_temp = rt.block_on(benchmark::run_direct_temp_path_case(&model_name));
         if compute_daemon::daemon::is_running() {
-            println!("  Path comparison unavailable: stop the running daemon first for an isolated comparison.");
+            println!(
+                "  Path comparison unavailable: stop the running daemon first for an isolated comparison."
+            );
         } else {
             match start_managed_benchmark_daemon()? {
                 Some((daemon_runtime, daemon_thread)) => {
@@ -693,8 +698,10 @@ fn cmd_benchmark(run_llama: bool, model: Option<String>, api_key: Option<String>
                     std::thread::sleep(std::time::Duration::from_secs(3));
 
                     let daemon_local = rt.block_on(benchmark::run_daemon_local_path_case());
-                    let orchestrator =
-                        rt.block_on(benchmark::run_orchestrator_path_case(&model_name, api_key.as_deref()));
+                    let orchestrator = rt.block_on(benchmark::run_orchestrator_path_case(
+                        &model_name,
+                        api_key.as_deref(),
+                    ));
 
                     daemon_runtime.shutdown();
                     let _ = daemon_thread.join();
@@ -713,7 +720,9 @@ fn cmd_benchmark(run_llama: bool, model: Option<String>, api_key: Option<String>
                     print_path_result(&orchestrator);
                 }
                 None => {
-                    println!("  Path comparison unavailable: wallet/node auth is not configured for this machine.");
+                    println!(
+                        "  Path comparison unavailable: wallet/node auth is not configured for this machine."
+                    );
                     match direct_temp {
                         Ok(result) => {
                             println!(
@@ -762,22 +771,10 @@ fn print_path_result(result: &compute_daemon::benchmark::PathBenchmarkResult) {
         println!(
             "  {:<14} {:<10} {:<10} {:<14} {:<10}",
             result.name,
-            result
-                .effective_tok_per_sec
-                .map(|v| format!("{v:.1}"))
-                .unwrap_or_else(|| "-".into()),
-            result
-                .first_token_ms
-                .map(|v| format!("{v:.0}"))
-                .unwrap_or_else(|| "-".into()),
-            result
-                .completion_tokens
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".into()),
-            result
-                .total_ms
-                .map(|v| format!("{v:.0}"))
-                .unwrap_or_else(|| "-".into()),
+            result.effective_tok_per_sec.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
+            result.first_token_ms.map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".into()),
+            result.completion_tokens.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+            result.total_ms.map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".into()),
         );
         if let Some(profile) = &result.profile
             && !profile.is_empty()
@@ -819,8 +816,8 @@ fn print_path_result(result: &compute_daemon::benchmark::PathBenchmarkResult) {
     }
 }
 
-fn start_managed_benchmark_daemon(
-) -> Result<Option<(Arc<compute_daemon::runtime::DaemonRuntime>, std::thread::JoinHandle<()>)>> {
+fn start_managed_benchmark_daemon()
+-> Result<Option<(Arc<compute_daemon::runtime::DaemonRuntime>, std::thread::JoinHandle<()>)>> {
     let config = Config::load()?;
     if config.wallet.public_address.is_empty() || config.wallet.node_token.is_empty() {
         return Ok(None);
@@ -844,9 +841,8 @@ fn start_managed_benchmark_daemon(
 }
 
 fn wait_for_local_llama_ready(port: u16, timeout_secs: u64) -> Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()?;
+    let client =
+        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(2)).build()?;
     let start = std::time::Instant::now();
 
     while start.elapsed().as_secs() < timeout_secs {

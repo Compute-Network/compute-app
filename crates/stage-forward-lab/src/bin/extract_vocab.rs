@@ -3,16 +3,9 @@ use stage_forward_lab::gguf::GgufFile;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
-    let gguf_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap()
-                .join(".compute")
-                .join("models")
-                .join("gemma-4-E4B-it-Q4_K_M.gguf")
-        });
+    let gguf_path = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
+        dirs::home_dir().unwrap().join(".compute").join("models").join("gemma-4-E4B-it-Q4_K_M.gguf")
+    });
     let out_path = std::env::args()
         .nth(2)
         .map(PathBuf::from)
@@ -23,7 +16,8 @@ fn main() -> Result<()> {
 
     let file = GgufFile::parse_file(&gguf_path)?;
 
-    let tokens = file.metadata_string_array("tokenizer.ggml.tokens")
+    let tokens = file
+        .metadata_string_array("tokenizer.ggml.tokens")
         .ok_or_else(|| anyhow::anyhow!("No tokenizer.ggml.tokens found in GGUF metadata"))?;
 
     println!("vocab size : {}", tokens.len());

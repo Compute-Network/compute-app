@@ -11,9 +11,20 @@
 //! - Resource management and graceful shutdown
 
 pub mod engine;
+pub mod ggml_graph_runtime;
+pub mod ggml_runtime;
+pub mod ggml_stage_executor;
+pub mod ggml_stage_manifest;
+pub mod ggml_stage_plan;
+pub mod ggml_stage_worker;
+pub mod llama_stage_gateway;
 pub mod llamacpp;
 pub mod manager;
+pub mod real_forward_artifact;
+pub mod real_forward_provider;
+pub mod real_forward_provider_ggml;
 pub mod shard;
+pub mod stage_acceleration;
 pub mod stage_artifacts;
 pub mod stage_backend;
 pub mod throttle;

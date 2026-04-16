@@ -7,8 +7,8 @@ use ratatui::{
     },
 };
 
-use super::worldmap;
 use super::theme::Palette;
+use super::worldmap;
 
 /// A spinning ASCII globe rendered using braille unicode characters.
 pub struct Globe {

@@ -17,10 +17,7 @@ fn main() -> Result<()> {
     println!("execution_layers  : {}", view.execution_programs.len());
     println!(
         "runnable_layers   : {}",
-        view.execution_programs
-            .iter()
-            .filter(|p| p.runnable_sketch)
-            .count()
+        view.execution_programs.iter().filter(|p| p.runnable_sketch).count()
     );
 
     for program in view.execution_programs.iter().take(3) {

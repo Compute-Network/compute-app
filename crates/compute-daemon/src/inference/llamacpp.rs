@@ -7,13 +7,13 @@
 //! - **CPU**: runs llama-server in CPU-only mode
 
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, error, info, warn};
 
 use super::engine::*;
+use crate::inference::ggml_runtime::build_ggml_launch_spec_for_backend;
 
 /// llama.cpp based inference engine.
 ///
@@ -54,98 +54,24 @@ impl LlamaCppEngine {
 
     /// Build the command to start llama-server based on backend.
     fn build_server_command(&self, config: &ShardConfig) -> Result<Command> {
-        match self.backend {
-            InferenceBackend::NativeMetal => {
-                let llama_server = find_llama_server()?;
-                let mut cmd = Command::new(llama_server);
-                cmd.args([
-                    "--model",
-                    config.shard_path.to_str().unwrap_or(""),
-                    "--port",
-                    &self.server_port.to_string(),
-                    "--ctx-size",
-                    &config.context_length.to_string(),
-                    "--batch-size",
-                    &config.max_batch_size.to_string(),
-                    "--n-gpu-layers",
-                    "999", // Offload all layers to Metal
-                    "--threads",
-                    &num_cpus().to_string(),
-                ]);
+        let launch =
+            build_ggml_launch_spec_for_backend(self.backend, config, self.server_port, num_cpus())?;
+        let mut cmd = launch.into_command();
 
-                // Set process priority
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    unsafe {
-                        let nice = self.nice_value;
-                        cmd.pre_exec(move || {
-                            libc::setpriority(libc::PRIO_PROCESS, 0, nice);
-                            Ok(())
-                        });
-                    }
-                }
-
-                Ok(cmd)
-            }
-            InferenceBackend::DockerCuda => {
-                let mut cmd = Command::new("docker");
-                let shard_dir = config
-                    .shard_path
-                    .parent()
-                    .unwrap_or(&PathBuf::from("/tmp"))
-                    .to_string_lossy()
-                    .to_string();
-                let shard_filename =
-                    config.shard_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-
-                cmd.args([
-                    "run",
-                    "--rm",
-                    "--gpus",
-                    "all",
-                    "-p",
-                    &format!("{}:8080", self.server_port),
-                    "-v",
-                    &format!("{shard_dir}:/models"),
-                    "--name",
-                    &format!("compute-inference-{}", self.server_port),
-                    "ghcr.io/ggerganov/llama.cpp:server-cuda",
-                    "--model",
-                    &format!("/models/{shard_filename}"),
-                    "--port",
-                    "8080",
-                    "--ctx-size",
-                    &config.context_length.to_string(),
-                    "--batch-size",
-                    &config.max_batch_size.to_string(),
-                    "--n-gpu-layers",
-                    "999",
-                ]);
-
-                Ok(cmd)
-            }
-            InferenceBackend::Cpu => {
-                let llama_server = find_llama_server()?;
-                let mut cmd = Command::new(llama_server);
-                cmd.args([
-                    "--model",
-                    config.shard_path.to_str().unwrap_or(""),
-                    "--port",
-                    &self.server_port.to_string(),
-                    "--ctx-size",
-                    &config.context_length.to_string(),
-                    "--batch-size",
-                    &config.max_batch_size.to_string(),
-                    "--n-gpu-layers",
-                    "0", // No GPU offloading
-                    "--threads",
-                    &num_cpus().to_string(),
-                ]);
-
-                Ok(cmd)
+        // Set process priority
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                let nice = self.nice_value;
+                cmd.pre_exec(move || {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, nice);
+                    Ok(())
+                });
             }
         }
+
+        Ok(cmd)
     }
 
     /// Check if the llama-server is healthy.
@@ -482,42 +408,6 @@ impl Drop for LlamaCppEngine {
             let _ = child.kill();
         }
     }
-}
-
-/// Find the llama-server binary.
-/// Checks: bundled path, PATH, common install locations.
-fn find_llama_server() -> Result<PathBuf> {
-    // Check if it's in PATH
-    if let Ok(output) = Command::new("which").arg("llama-server").output()
-        && output.status.success()
-    {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Ok(PathBuf::from(path));
-        }
-    }
-
-    // Check common locations
-    let candidates = [
-        "/usr/local/bin/llama-server",
-        "/opt/homebrew/bin/llama-server",
-        "~/.local/bin/llama-server",
-    ];
-
-    for candidate in &candidates {
-        let expanded = shellexpand::tilde(candidate).to_string();
-        let path = PathBuf::from(&expanded);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-
-    anyhow::bail!(
-        "llama-server not found. Install it:\n\
-         macOS:  brew install llama.cpp\n\
-         Linux:  See https://github.com/ggerganov/llama.cpp#build\n\
-         Or use Docker mode with an NVIDIA GPU."
-    )
 }
 
 /// Get the number of physical CPU cores for thread count.

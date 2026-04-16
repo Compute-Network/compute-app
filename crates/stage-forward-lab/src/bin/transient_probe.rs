@@ -15,21 +15,16 @@ fn main() -> Result<()> {
         .ok_or_else(|| {
             anyhow::anyhow!("usage: transient_probe <stage-index.json> [prompt] [layer-cap]")
         })?;
-    let prompt = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| "reply exactly: TRANSIENT PROBE".to_string());
+    let prompt =
+        args.get(2).cloned().unwrap_or_else(|| "reply exactly: TRANSIENT PROBE".to_string());
     let layer_cap = args.get(3).and_then(|value| value.parse::<usize>().ok());
 
     let mut backend = PackedResidencySketchBackend::new(index_path.clone());
     backend.set_debug_layer_cap(layer_cap);
     let store = StageTensorStore::load(&index_path)?;
     let model_view = store.model_view();
-    let stage_label = index_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("stage")
-        .to_string();
+    let stage_label =
+        index_path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("stage").to_string();
 
     let layout = StageLayout {
         model_id: "gemma-4-e4b-q4".into(),
@@ -80,10 +75,7 @@ fn main() -> Result<()> {
     if let Some(cont) = &tensor.continuation {
         println!("continuation.v  : {}", cont.version);
         println!("continuation.role: {}", cont.stage_role);
-        println!(
-            "continuation.layers: {}/{}",
-            cont.completed_layers, cont.operator_layers
-        );
+        println!("continuation.layers: {}/{}", cont.completed_layers, cont.operator_layers);
         println!(
             "continuation.paths: attention={} ffn={} projection={}",
             cont.has_attention_path, cont.has_ffn_path, cont.has_projection_path
@@ -129,9 +121,7 @@ fn main() -> Result<()> {
         boundary_plan.expected_attention_width,
         boundary_plan.expects_attention_projection_carry,
         boundary_plan.expects_attention_mix_carry,
-        boundary_plan
-            .expected_attention_projection_lanes
-            .unwrap_or(0),
+        boundary_plan.expected_attention_projection_lanes.unwrap_or(0),
         boundary_plan.expected_attention_mix_lanes.unwrap_or(0),
         boundary_plan.expects_ffn_carry,
         boundary_plan.expected_ffn_lanes.unwrap_or(0),
@@ -194,9 +184,7 @@ fn main() -> Result<()> {
         resume_receipt.accepted_attention_v_lanes.unwrap_or(0),
         resume_receipt.accepted_attention_projection_carry,
         resume_receipt.accepted_attention_mix_carry,
-        resume_receipt
-            .accepted_attention_projection_lanes
-            .unwrap_or(0),
+        resume_receipt.accepted_attention_projection_lanes.unwrap_or(0),
         resume_receipt.accepted_attention_mix_lanes.unwrap_or(0),
         resume_receipt.accepted_ffn_carry,
         resume_receipt.accepted_ffn_lanes.unwrap_or(0),
@@ -266,33 +254,17 @@ fn main() -> Result<()> {
             );
             println!(
                 "carry.attn.src : q={:?} k={:?} v={:?} score={:?} value={:?}",
-                attn.projection
-                    .as_ref()
-                    .and_then(|projection| projection.q_provenance.as_ref()),
-                attn.projection
-                    .as_ref()
-                    .and_then(|projection| projection.k_provenance.as_ref()),
-                attn.projection
-                    .as_ref()
-                    .and_then(|projection| projection.v_provenance.as_ref()),
-                attn.mix
-                    .as_ref()
-                    .and_then(|mix| mix.score_provenance.as_ref()),
-                attn.mix
-                    .as_ref()
-                    .and_then(|mix| mix.value_provenance.as_ref())
+                attn.projection.as_ref().and_then(|projection| projection.q_provenance.as_ref()),
+                attn.projection.as_ref().and_then(|projection| projection.k_provenance.as_ref()),
+                attn.projection.as_ref().and_then(|projection| projection.v_provenance.as_ref()),
+                attn.mix.as_ref().and_then(|mix| mix.score_provenance.as_ref()),
+                attn.mix.as_ref().and_then(|mix| mix.value_provenance.as_ref())
             );
             println!(
                 "carry.attn.lanes: q={:?} k={:?} v={:?} score={:?} value={:?}",
-                attn.projection
-                    .as_ref()
-                    .map(|projection| &projection.q_lane_indices),
-                attn.projection
-                    .as_ref()
-                    .map(|projection| &projection.k_lane_indices),
-                attn.projection
-                    .as_ref()
-                    .map(|projection| &projection.v_lane_indices),
+                attn.projection.as_ref().map(|projection| &projection.q_lane_indices),
+                attn.projection.as_ref().map(|projection| &projection.k_lane_indices),
+                attn.projection.as_ref().map(|projection| &projection.v_lane_indices),
                 attn.mix.as_ref().map(|mix| &mix.score_lane_indices),
                 attn.mix.as_ref().map(|mix| &mix.value_lane_indices)
             );

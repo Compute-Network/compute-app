@@ -261,10 +261,8 @@ impl ModelDefinition {
         }
 
         let midpoint = self.total_layers / 2;
-        let shard_ranges = [
-            (0_u32, midpoint.saturating_sub(1)),
-            (midpoint, self.total_layers.saturating_sub(1)),
-        ];
+        let shard_ranges =
+            [(0_u32, midpoint.saturating_sub(1)), (midpoint, self.total_layers.saturating_sub(1))];
 
         let shards = shard_ranges
             .into_iter()
@@ -287,11 +285,7 @@ impl ModelDefinition {
             })
             .collect();
 
-        Some(ModelShardManifest {
-            model_id: self.id.clone(),
-            revision: "lan-v1".into(),
-            shards,
-        })
+        Some(ModelShardManifest { model_id: self.id.clone(), revision: "lan-v1".into(), shards })
     }
 }
 

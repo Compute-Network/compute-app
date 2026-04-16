@@ -64,6 +64,11 @@ Single-node today:
 - orchestrator scheduling and relay
 - wallet-authenticated node sessions
 
+Gateway-backed staged serving:
+- experimental `llama-stage-gateway` backend for a 2-stage patched `llama.cpp` path
+- relay/orchestrator contract is proven in `compute-daemon`
+- rollout and operator commands are documented in [docs/llama-stage-gateway-ops-april-2026.md](docs/llama-stage-gateway-ops-april-2026.md)
+
 Multi-node research/code:
 - daisy-chained consumer GPUs across the internet to run models no single machine could handle
 - QUIC/P2P transport and staged layer assignment remain in the repo, but are not the primary production path today

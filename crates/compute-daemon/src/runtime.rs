@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::net::{Ipv4Addr, UdpSocket};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -9,11 +10,43 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::hardware;
 use crate::idle::{IdleDetector, IdleState};
+use crate::inference::llama_stage_gateway::LlamaStageGatewayRelayClient;
 use crate::inference::manager::{InferenceManager, InferenceStatus};
 use crate::inference::stage_backend::StageBackendKind;
 use crate::metrics::{Earnings, NetworkStats, PipelineStatus};
 use crate::relay::{AssignmentPush, RelayClient};
-use crate::stage_runtime::{StagePrototypeClient, StagePrototypeHandle, StagePrototypeSpec, start_stage_prototype};
+use crate::stage_runtime::{
+    StagePrototypeClient, StagePrototypeHandle, StagePrototypeSpec, start_stage_prototype,
+};
+use llama_stage_backend::{
+    ManagedGatewayLaunchSpec, ManagedGatewayStack, default_gemma_model_path,
+};
+
+fn classify_gateway_error_message(message: &str) -> (&'static str, String) {
+    if message.contains("protocol mismatch") {
+        ("protocol_mismatch", format!("stage gateway protocol/version mismatch: {message}"))
+    } else if message.contains("model mismatch") {
+        ("model_mismatch", format!("stage gateway model mismatch: {message}"))
+    } else if message.contains("tcp gateway error:")
+        || message.contains("expected info response")
+        || message.contains("head endpoint")
+        || message.contains("tail endpoint")
+    {
+        ("gateway_unusable", format!("stage gateway is reachable but unusable: {message}"))
+    } else if message.contains("resolving ")
+        || message.contains("no socket addresses resolved")
+        || message.contains("connecting to ")
+    {
+        ("connect_failure", format!("stage gateway connect failed: {message}"))
+    } else {
+        ("gateway_error", format!("stage gateway error: {message}"))
+    }
+}
+
+fn classify_gateway_error(err: &anyhow::Error) -> (&'static str, String) {
+    let chain = err.chain().map(ToString::to_string).collect::<Vec<_>>().join(": ");
+    classify_gateway_error_message(&chain)
+}
 
 fn spawn_ready_probe(
     port: u16,
@@ -45,6 +78,274 @@ fn spawn_ready_probe(
         }
         tracing::error!("[health] llama-server did not become ready after 60s");
     });
+}
+
+async fn send_gateway_ready_or_error(
+    gateway_result: anyhow::Result<LlamaStageGatewayRelayClient>,
+    expected_model: &str,
+    ws_tx: &tokio::sync::mpsc::Sender<String>,
+) {
+    let msg = match gateway_result {
+        Ok(client) => match client.model_name() {
+            Ok(model_name) if model_name == expected_model => serde_json::json!({
+                "type": "node_ready",
+                "model_name": model_name,
+            })
+            .to_string(),
+            Ok(model_name) => serde_json::json!({
+                "type": "node_error",
+                "model_name": expected_model,
+                "error": format!("stage gateway model mismatch: expected {expected_model}, got {model_name}"),
+            })
+            .to_string(),
+            Err(err) => {
+                let (kind, detail) = classify_gateway_error(&err);
+                warn!("[gateway] {kind}: {detail}");
+                serde_json::json!({
+                "type": "node_error",
+                "model_name": expected_model,
+                "error": detail,
+                })
+                .to_string()
+            }
+        },
+        Err(err) => {
+            let (kind, detail) = classify_gateway_error(&err);
+            warn!("[gateway] {kind}: {detail}");
+            serde_json::json!({
+            "type": "node_error",
+            "model_name": expected_model,
+            "error": detail,
+            })
+            .to_string()
+        }
+    };
+    let _ = ws_tx.send(msg).await;
+}
+
+fn gateway_assignment_supported(
+    stage: i32,
+    total_stages: i32,
+    assignment_mode: Option<&str>,
+) -> bool {
+    stage == 0 && total_stages == 1 && !matches!(assignment_mode, Some("stage") | Some("rpc"))
+}
+
+fn gateway_model_path(config: &Config) -> PathBuf {
+    if config.experimental.stage_gateway_model_path.trim().is_empty() {
+        default_gemma_model_path()
+    } else {
+        config.experimental.stage_gateway_model_path.clone().into()
+    }
+}
+
+fn gateway_launch_spec(config: &Config) -> ManagedGatewayLaunchSpec {
+    ManagedGatewayLaunchSpec {
+        stage_node_bin: (!config.experimental.stage_gateway_stage_node_bin.trim().is_empty())
+            .then(|| config.experimental.stage_gateway_stage_node_bin.clone().into()),
+        gateway_bin: (!config.experimental.stage_gateway_gateway_bin.trim().is_empty())
+            .then(|| config.experimental.stage_gateway_gateway_bin.clone().into()),
+        ..ManagedGatewayLaunchSpec::default()
+    }
+}
+
+fn configured_gateway_addr(
+    config: &Config,
+    managed_gateway_stack: Option<&ManagedGatewayStack>,
+) -> Option<String> {
+    let configured = config.experimental.stage_gateway_addr.trim();
+    if !configured.is_empty() {
+        Some(configured.to_string())
+    } else {
+        managed_gateway_stack.map(|stack| stack.gateway_addr().to_string())
+    }
+}
+
+fn gateway_connect_timeout(config: &Config) -> Duration {
+    Duration::from_millis(config.experimental.stage_gateway_connect_timeout_ms.max(1))
+}
+
+fn gateway_retry_window(config: &Config) -> Duration {
+    Duration::from_millis(config.experimental.stage_gateway_retry_window_ms.max(1))
+}
+
+fn gateway_retry_interval(config: &Config) -> Duration {
+    Duration::from_millis(config.experimental.stage_gateway_retry_interval_ms.max(1))
+}
+
+fn gateway_startup_grace(config: &Config) -> Duration {
+    Duration::from_millis(config.experimental.stage_gateway_startup_grace_ms)
+}
+
+fn gateway_addr_from_config(config: &Config) -> Option<String> {
+    let configured = config.experimental.stage_gateway_addr.trim();
+    (!configured.is_empty()).then(|| configured.to_string())
+}
+
+async fn attempt_gateway_client_once(
+    config: &Config,
+    gateway_client: &Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
+    managed_gateway_stack: &mut Option<ManagedGatewayStack>,
+) -> anyhow::Result<LlamaStageGatewayRelayClient> {
+    if let Some(client) = gateway_client.lock().await.clone() {
+        return Ok(client);
+    }
+
+    let mut gateway_addr = configured_gateway_addr(config, managed_gateway_stack.as_ref());
+    if gateway_addr.is_none() && config.experimental.stage_gateway_autostart {
+        let model_path = gateway_model_path(config);
+        let launch_spec = gateway_launch_spec(config);
+        let stack =
+            ManagedGatewayStack::spawn_local_with_spec(model_path.clone(), false, &launch_spec)
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to auto-start local gateway stack with model {}: {err}",
+                        model_path.display()
+                    )
+                })?;
+        let addr = stack.gateway_addr().to_string();
+        info!(
+            "[gateway] Auto-started local gateway stack at {} with model {}",
+            addr,
+            model_path.display()
+        );
+        *managed_gateway_stack = Some(stack);
+        gateway_addr = Some(addr);
+    }
+
+    let Some(gateway_addr) = gateway_addr else {
+        anyhow::bail!(
+            "neither experimental.stage_gateway_addr nor experimental.stage_gateway_autostart is configured"
+        );
+    };
+
+    let client = LlamaStageGatewayRelayClient::connect_with_timeout(
+        &gateway_addr,
+        Some(gateway_connect_timeout(config)),
+    )?;
+    info!("[gateway] Connected relay client to {}", client.addr());
+    *gateway_client.lock().await = Some(client.clone());
+    Ok(client)
+}
+
+fn spawn_gateway_startup_grace_connect(
+    config: Config,
+    gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
+) {
+    let Some(gateway_addr) = gateway_addr_from_config(&config) else {
+        return;
+    };
+    let startup_grace = gateway_startup_grace(&config);
+    if startup_grace.is_zero() || config.experimental.stage_gateway_autostart {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let connect_timeout = gateway_connect_timeout(&config);
+        let retry_interval = gateway_retry_interval(&config);
+        let deadline = tokio::time::Instant::now() + startup_grace;
+
+        loop {
+            if gateway_client.lock().await.is_some() {
+                return;
+            }
+
+            match LlamaStageGatewayRelayClient::connect_with_timeout(
+                &gateway_addr,
+                Some(connect_timeout),
+            ) {
+                Ok(client) => {
+                    info!(
+                        "[gateway] Connected relay client to {} during startup grace",
+                        client.addr()
+                    );
+                    *gateway_client.lock().await = Some(client);
+                    return;
+                }
+                Err(err) if tokio::time::Instant::now() >= deadline => {
+                    let (kind, detail) = classify_gateway_error(&err);
+                    warn!(
+                        "[gateway] {kind} after startup grace {}ms: {detail}",
+                        startup_grace.as_millis()
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tokio::time::sleep(retry_interval).await;
+                }
+            }
+        }
+    });
+}
+
+async fn ensure_gateway_client(
+    config: &Config,
+    gateway_client: &Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
+    managed_gateway_stack: &mut Option<ManagedGatewayStack>,
+) -> anyhow::Result<LlamaStageGatewayRelayClient> {
+    if let Some(client) = gateway_client.lock().await.clone() {
+        return Ok(client);
+    }
+
+    let mut gateway_addr = configured_gateway_addr(config, managed_gateway_stack.as_ref());
+    if gateway_addr.is_none() && config.experimental.stage_gateway_autostart {
+        let model_path = gateway_model_path(config);
+        let launch_spec = gateway_launch_spec(config);
+        let stack =
+            ManagedGatewayStack::spawn_local_with_spec(model_path.clone(), false, &launch_spec)
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "failed to auto-start local gateway stack with model {}: {err}",
+                        model_path.display()
+                    )
+                })?;
+        let addr = stack.gateway_addr().to_string();
+        info!(
+            "[gateway] Auto-started local gateway stack at {} with model {}",
+            addr,
+            model_path.display()
+        );
+        *managed_gateway_stack = Some(stack);
+        gateway_addr = Some(addr);
+    }
+
+    let Some(gateway_addr) = gateway_addr else {
+        anyhow::bail!(
+            "neither experimental.stage_gateway_addr nor experimental.stage_gateway_autostart is configured"
+        );
+    };
+
+    let connect_timeout = gateway_connect_timeout(config);
+    let retry_window = gateway_retry_window(config);
+    let retry_interval = gateway_retry_interval(config);
+    let deadline = tokio::time::Instant::now() + retry_window;
+    loop {
+        match LlamaStageGatewayRelayClient::connect_with_timeout(
+            &gateway_addr,
+            Some(connect_timeout),
+        ) {
+            Ok(client) => {
+                info!("[gateway] Connected relay client to {}", client.addr());
+                *gateway_client.lock().await = Some(client.clone());
+                return Ok(client);
+            }
+            Err(err) if tokio::time::Instant::now() >= deadline => {
+                *gateway_client.lock().await = None;
+                let (_, detail) = classify_gateway_error(&err);
+                anyhow::bail!(
+                    "{} after retrying {} for {}ms (attempt timeout {}ms, retry interval {}ms)",
+                    detail,
+                    gateway_addr,
+                    retry_window.as_millis(),
+                    connect_timeout.as_millis(),
+                    retry_interval.as_millis()
+                );
+            }
+            Err(_) => {
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+    }
 }
 
 /// Shared state between the daemon runtime and the TUI.
@@ -127,7 +428,10 @@ impl DaemonRuntime {
         let mut idle_detector = IdleDetector::new(self.config.node.idle_threshold_minutes);
         let mut inference_mgr = InferenceManager::new();
         let mut stage_runtime: Option<StagePrototypeHandle> = None;
+        let mut managed_gateway_stack: Option<ManagedGatewayStack> = None;
         let stage_runtime_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>> =
             Arc::new(tokio::sync::Mutex::new(None));
         let mut sys = sysinfo::System::new_all();
         let start_time = std::time::Instant::now();
@@ -136,7 +440,13 @@ impl DaemonRuntime {
 
         let stage_backend_kind = StageBackendKind::parse(&self.config.experimental.stage_backend);
         let prototype_stage_mode = self.config.experimental.stage_mode_enabled
-            && matches!(stage_backend_kind, StageBackendKind::Prototype | StageBackendKind::TailLlama | StageBackendKind::RealForward);
+            && matches!(
+                stage_backend_kind,
+                StageBackendKind::Prototype
+                    | StageBackendKind::TailLlama
+                    | StageBackendKind::LlamaStageGateway
+                    | StageBackendKind::RealForward
+            );
 
         // Pre-warm: start llama-server during splash so the model is ready for the first request.
         // Skip entirely for prototype stage mode, which does not use local llama-server.
@@ -166,11 +476,8 @@ impl DaemonRuntime {
         }
 
         // Initial state — use pre-detected hardware if available, else detect now
-        let hw = if self.hardware.cpu.cores > 0 {
-            self.hardware.clone()
-        } else {
-            hardware::detect()
-        };
+        let hw =
+            if self.hardware.cpu.cores > 0 { self.hardware.clone() } else { hardware::detect() };
         self.update_state(|state| {
             state.running = true;
             state.hardware = hw.clone();
@@ -196,6 +503,34 @@ impl DaemonRuntime {
             );
         }
 
+        if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway) {
+            inference_mgr.shutdown_server();
+            inference_mgr.set_externally_managed(true);
+            if let Err(err) = attempt_gateway_client_once(
+                &self.config,
+                &gateway_client,
+                &mut managed_gateway_stack,
+            )
+            .await
+            {
+                let startup_grace = gateway_startup_grace(&self.config);
+                let (_, detail) = classify_gateway_error(&err);
+                if startup_grace.is_zero() || gateway_addr_from_config(&self.config).is_none() {
+                    warn!("[gateway] Initial gateway connection unavailable: {detail}");
+                } else {
+                    info!(
+                        "[gateway] Initial gateway unavailable; entering startup grace {}ms: {}",
+                        startup_grace.as_millis(),
+                        detail
+                    );
+                    spawn_gateway_startup_grace_connect(
+                        self.config.clone(),
+                        gateway_client.clone(),
+                    );
+                }
+            }
+        }
+
         // Start WebSocket relay to orchestrator
         let relay = RelayClient::new(
             &self.config,
@@ -203,6 +538,7 @@ impl DaemonRuntime {
             assignment_tx,
             ws_outbound_rx,
             stage_runtime_client.clone(),
+            gateway_client.clone(),
         );
         let relay_latency = relay.last_latency_ms();
         let relay_tps = relay.last_tps();
@@ -241,6 +577,39 @@ impl DaemonRuntime {
                         assignment.stage, assignment.total_stages,
                         assignment.shard_id.as_ref().map(|s| format!(" shard={s}")).unwrap_or_default());
 
+                    if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway)
+                        && gateway_assignment_supported(
+                            assignment.stage,
+                            assignment.total_stages,
+                            assignment.assignment_mode.as_deref(),
+                        )
+                    {
+                        if let Some(handle) = stage_runtime.take() {
+                            handle.stop().await;
+                        }
+                        *stage_runtime_client.lock().await = None;
+                        inference_mgr.shutdown_server();
+                        inference_mgr.set_externally_managed(true);
+
+                        self.update_state(|state| {
+                            state.pipeline.active = true;
+                            state.pipeline.stage = Some(assignment.stage as u32);
+                            state.pipeline.total_stages = Some(assignment.total_stages as u32);
+                            state.pipeline.model = Some(assignment.model_name.clone());
+                            state.inference_status = "llama-stage-gateway".into();
+                        });
+
+                        let gateway_result = ensure_gateway_client(
+                            &self.config,
+                            &gateway_client,
+                            &mut managed_gateway_stack,
+                        )
+                        .await;
+                        send_gateway_ready_or_error(gateway_result, &assignment.model_name, &ws_outbound_tx)
+                            .await;
+                        continue;
+                    }
+
                     let assignment_mode = assignment.assignment_mode.as_deref().unwrap_or(
                         if assignment.total_stages > 1 { "rpc" } else { "solo" }
                     );
@@ -269,7 +638,8 @@ impl DaemonRuntime {
                                 continue;
                             };
 
-                            if let Some(ref url) = assignment.artifact_url {
+                            if !matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway) {
+                                if let Some(ref url) = assignment.artifact_url {
                                 if !crate::inference::stage_artifacts::is_stage_cached(
                                     &assignment.model_name,
                                     start_layer as u32,
@@ -297,6 +667,7 @@ impl DaemonRuntime {
                                         }
                                     }
                                 }
+                            }
                             }
 
                             let spec = StagePrototypeSpec {
@@ -411,6 +782,9 @@ impl DaemonRuntime {
                             &mut inference_mgr,
                             &mut stage_runtime,
                             &stage_runtime_client,
+                            &gateway_client,
+                            &mut managed_gateway_stack,
+                            stage_backend_kind,
                             &ws_outbound_tx,
                             &mut baseline_tps,
                             &mut served_baseline,
@@ -453,10 +827,18 @@ impl DaemonRuntime {
 
                     let metrics = hardware::collect_live_metrics(&mut sys);
                     let uptime = start_time.elapsed().as_secs();
-                    let inf_status = stage_runtime
-                        .as_ref()
-                        .map(|handle| handle.status_label())
-                        .unwrap_or_else(|| inference_mgr.status().to_string());
+                    let inf_status = if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway) {
+                        if gateway_client.lock().await.is_some() {
+                            "llama-stage-gateway".to_string()
+                        } else {
+                            "llama-stage-gateway (disconnected)".to_string()
+                        }
+                    } else {
+                        stage_runtime
+                            .as_ref()
+                            .map(|handle| handle.status_label())
+                            .unwrap_or_else(|| inference_mgr.status().to_string())
+                    };
 
                     // Read latest relay metrics
                     let latency = relay_latency.load(std::sync::atomic::Ordering::Relaxed);
@@ -558,6 +940,7 @@ impl DaemonRuntime {
             handle.stop().await;
         }
         *stage_runtime_client.lock().await = None;
+        drop(managed_gateway_stack);
         drop(inference_mgr);
 
         // Set node offline in the orchestrator
@@ -582,6 +965,9 @@ impl DaemonRuntime {
         inference_mgr: &mut InferenceManager,
         stage_runtime: &mut Option<StagePrototypeHandle>,
         stage_runtime_client: &Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
+        gateway_client: &Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
+        managed_gateway_stack: &mut Option<ManagedGatewayStack>,
+        stage_backend_kind: StageBackendKind,
         ws_outbound_tx: &tokio::sync::mpsc::Sender<String>,
         baseline_tps: &mut f64,
         served_baseline: &mut u64,
@@ -603,6 +989,15 @@ impl DaemonRuntime {
             Ok(Some(node)) => {
                 // Update pipeline status in TUI
                 let has_pipeline = node.pipeline_id.is_some();
+                let previous_pipeline = {
+                    let state = self.state_rx.borrow();
+                    (
+                        state.pipeline.active,
+                        state.pipeline.model.clone(),
+                        state.pipeline.stage,
+                        state.pipeline.total_stages,
+                    )
+                };
                 let pending = node.pending_compute.unwrap_or(0.0);
 
                 let tps = node.tokens_per_second.unwrap_or(0.0);
@@ -641,10 +1036,8 @@ impl DaemonRuntime {
                 let orchestrator_url = self.config.network.orchestrator_url.clone();
                 let state_tx = self.state_tx.clone();
                 tokio::spawn(async move {
-                    let client = compute_network::client::OrchestratorClient::new(
-                        &orchestrator_url,
-                        None,
-                    );
+                    let client =
+                        compute_network::client::OrchestratorClient::new(&orchestrator_url, None);
                     match client.get_earnings(&wallet_owned).await {
                         Ok(e) => {
                             state_tx.send_modify(|state| {
@@ -660,6 +1053,64 @@ impl DaemonRuntime {
                     }
                 });
 
+                if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway)
+                    && has_pipeline
+                    && node.pipeline_stage.unwrap_or(0) == 0
+                    && node.pipeline_total_stages.unwrap_or(1) == 1
+                {
+                    if let Some(handle) = stage_runtime.take() {
+                        handle.stop().await;
+                    }
+                    *stage_runtime_client.lock().await = None;
+                    inference_mgr.shutdown_server();
+                    inference_mgr.set_externally_managed(true);
+
+                    let supported = if has_pipeline {
+                        gateway_assignment_supported(
+                            node.pipeline_stage.unwrap_or(0),
+                            node.pipeline_total_stages.unwrap_or(1),
+                            None,
+                        )
+                    } else {
+                        true
+                    };
+                    let gateway_assignment_changed = has_pipeline != previous_pipeline.0
+                        || node.model_name != previous_pipeline.1
+                        || node.pipeline_stage.map(|s| s as u32) != previous_pipeline.2
+                        || node.pipeline_total_stages.map(|s| s as u32) != previous_pipeline.3;
+
+                    if has_pipeline && !supported {
+                        if gateway_assignment_changed {
+                            let msg = serde_json::json!({
+                                "type": "node_error",
+                                "model_name": node.model_name,
+                                "error": format!(
+                                    "llama-stage-gateway only supports single-stage assignments; got stage={:?}/{:?}",
+                                    node.pipeline_stage,
+                                    node.pipeline_total_stages
+                                ),
+                            }).to_string();
+                            let _ = ws_outbound_tx.send(msg).await;
+                        }
+                        return;
+                    }
+
+                    let gateway_needs_connect = gateway_client.lock().await.is_none();
+                    if has_pipeline && (gateway_assignment_changed || gateway_needs_connect) {
+                        if let Some(model_name) = node.model_name.as_deref() {
+                            let gateway_result = ensure_gateway_client(
+                                &self.config,
+                                gateway_client,
+                                managed_gateway_stack,
+                            )
+                            .await;
+                            send_gateway_ready_or_error(gateway_result, model_name, ws_outbound_tx)
+                                .await;
+                        }
+                    }
+                    return;
+                }
+
                 // Tell inference manager about the assignment
                 let stage_pipeline_match = stage_runtime
                     .as_ref()
@@ -667,25 +1118,29 @@ impl DaemonRuntime {
                         node.pipeline_id.as_deref() == Some(handle.pipeline_id())
                             && node.model_name.as_deref() == Some(handle.model_name())
                             && node.pipeline_stage.map(|s| s as u32) == Some(handle.stage_index())
-                            && node.pipeline_total_stages.map(|s| s as u32) == Some(handle.total_stages())
+                            && node.pipeline_total_stages.map(|s| s as u32)
+                                == Some(handle.total_stages())
                     })
                     .unwrap_or(false);
 
-                let looks_like_stage_assignment =
-                    self.config.experimental.stage_mode_enabled
-                        && node.model_name.as_deref() == Some("gemma-4-e4b-q4")
-                        && node.pipeline_id.is_some()
-                        && node.pipeline_stage.is_some()
-                        && node.pipeline_total_stages == Some(2);
+                let looks_like_stage_assignment = self.config.experimental.stage_mode_enabled
+                    && node.model_name.as_deref() == Some("gemma-4-e4b-q4")
+                    && node.pipeline_id.is_some()
+                    && node.pipeline_stage.is_some()
+                    && node.pipeline_total_stages == Some(2);
 
                 let previous_pipeline_id = match inference_mgr.status() {
                     InferenceStatus::Running { pipeline_id, .. } => Some(pipeline_id.clone()),
-                    InferenceStatus::RunningRpcWorker { pipeline_id, .. } => Some(pipeline_id.clone()),
+                    InferenceStatus::RunningRpcWorker { pipeline_id, .. } => {
+                        Some(pipeline_id.clone())
+                    }
                     _ => None,
                 };
                 let previous_model_name = match inference_mgr.status() {
                     InferenceStatus::Running { model_name, .. } => Some(model_name.clone()),
-                    InferenceStatus::RunningRpcWorker { model_name, .. } => Some(model_name.clone()),
+                    InferenceStatus::RunningRpcWorker { model_name, .. } => {
+                        Some(model_name.clone())
+                    }
                     _ => None,
                 };
 
@@ -712,21 +1167,25 @@ impl DaemonRuntime {
                         inference_mgr.set_externally_managed(false);
                     }
 
-                    inference_mgr.check_assignment(
-                        node.pipeline_id.as_deref(),
-                        node.model_name.as_deref(),
-                    );
+                    inference_mgr
+                        .check_assignment(node.pipeline_id.as_deref(), node.model_name.as_deref());
                 }
 
-                let pipeline_changed = previous_pipeline_id.as_deref() != node.pipeline_id.as_deref();
+                let pipeline_changed =
+                    previous_pipeline_id.as_deref() != node.pipeline_id.as_deref();
                 let model_changed = previous_model_name.as_deref() != node.model_name.as_deref();
-                if !looks_like_stage_assignment && node.pipeline_id.is_some() && (pipeline_changed || model_changed) {
+                if !looks_like_stage_assignment
+                    && node.pipeline_id.is_some()
+                    && (pipeline_changed || model_changed)
+                {
                     // Poll-based assignment detection runs before the WS push path on startup/reconnect.
                     // Emit the same ready probe here so the orchestrator doesn't wait 120s for a
                     // node_ready message that only the push path would have produced.
                     let active_model = match inference_mgr.status() {
                         InferenceStatus::Running { model_name, .. } => Some(model_name.clone()),
-                        InferenceStatus::RunningRpcWorker { model_name, .. } => Some(model_name.clone()),
+                        InferenceStatus::RunningRpcWorker { model_name, .. } => {
+                            Some(model_name.clone())
+                        }
                         _ => None,
                     };
                     spawn_ready_probe(inference_mgr.port(), active_model, ws_outbound_tx.clone());
@@ -764,10 +1223,7 @@ impl DaemonRuntime {
             let idle_str = format!("{}", state.idle_state);
 
             let (pipeline_id, pipeline_stage) = if let Some(handle) = stage_runtime {
-                (
-                    Some(handle.pipeline_id().to_string()),
-                    Some(handle.stage_index() as i32),
-                )
+                (Some(handle.pipeline_id().to_string()), Some(handle.stage_index() as i32))
             } else {
                 match inf_status {
                     InferenceStatus::Running { pipeline_id, .. } => {
@@ -790,17 +1246,21 @@ impl DaemonRuntime {
                     (Some(total), Some(busy))
                 }
                 None => {
+                    let gateway_mode = matches!(
+                        StageBackendKind::parse(&self.config.experimental.stage_backend),
+                        StageBackendKind::LlamaStageGateway
+                    );
                     let total = if stage_runtime.is_some() {
+                        Some(1)
+                    } else if gateway_mode {
                         Some(1)
                     } else if relay_busy_slots > 0 {
                         Some(2)
                     } else {
                         None
                     };
-                    let busy = if stage_runtime.is_some() {
+                    let busy = if stage_runtime.is_some() || gateway_mode {
                         Some(relay_busy_slots.max(0))
-                    } else if relay_busy_slots > 0 {
-                        Some(relay_busy_slots)
                     } else {
                         None
                     };
@@ -833,9 +1293,15 @@ impl DaemonRuntime {
                 inference_slots_busy: slots_busy,
                 gpu_vram_free_mb: vram_free,
                 ip_address: advertised_host(&self.config),
+                pipeline_capable: Some(self.config.experimental.stage_mode_enabled),
+                memory_bandwidth_gbps: None,
                 last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
                 stage_backend_kind: if self.config.experimental.stage_mode_enabled {
-                    Some(StageBackendKind::parse(&self.config.experimental.stage_backend).as_str().to_string())
+                    Some(
+                        StageBackendKind::parse(&self.config.experimental.stage_backend)
+                            .as_str()
+                            .to_string(),
+                    )
                 } else {
                     None
                 },
@@ -868,7 +1334,9 @@ fn detect_advertise_ip() -> Option<String> {
     socket.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).ok()?;
     let addr = socket.local_addr().ok()?;
     match addr.ip() {
-        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+            Some(ip.to_string())
+        }
         _ => None,
     }
 }
@@ -898,10 +1366,7 @@ fn is_valid_gguf(path: &std::path::Path) -> bool {
 }
 
 fn detect_downloaded_models() -> String {
-    let cache_dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".compute")
-        .join("models");
+    let cache_dir = dirs::home_dir().unwrap_or_default().join(".compute").join("models");
 
     // Clean up stale .tmp files from interrupted downloads
     if let Ok(entries) = std::fs::read_dir(&cache_dir) {
@@ -934,7 +1399,11 @@ fn detect_downloaded_models() -> String {
             // Skip files that are too small to be valid models (< 100MB)
             if let Ok(meta) = entry.metadata() {
                 if meta.len() < 100 * 1024 * 1024 {
-                    tracing::warn!("Skipping suspiciously small GGUF: {} ({:.1} MB)", name, meta.len() as f64 / 1048576.0);
+                    tracing::warn!(
+                        "Skipping suspiciously small GGUF: {} ({:.1} MB)",
+                        name,
+                        meta.len() as f64 / 1048576.0
+                    );
                     continue;
                 }
             }

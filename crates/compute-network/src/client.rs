@@ -29,6 +29,10 @@ pub struct NodeRegistration {
     pub listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_capable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bandwidth_gbps: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +68,10 @@ pub struct HeartbeatPayload {
     pub gpu_vram_free_mb: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline_capable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bandwidth_gbps: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_heartbeat: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -200,7 +208,7 @@ impl OrchestratorClient {
             .bearer_auth(
                 self.node_token
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("Missing node session token"))?
+                    .ok_or_else(|| anyhow::anyhow!("Missing node session token"))?,
             )
             .json(registration)
             .send()
@@ -224,7 +232,7 @@ impl OrchestratorClient {
             .bearer_auth(
                 self.node_token
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("Missing node session token"))?
+                    .ok_or_else(|| anyhow::anyhow!("Missing node session token"))?,
             )
             .json(payload)
             .send()
@@ -307,11 +315,7 @@ impl OrchestratorClient {
     }
 
     pub async fn get_network_stats(&self) -> Result<NetworkStats> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/nodes/stats", self.base_url))
-            .send()
-            .await?;
+        let resp = self.client.get(format!("{}/v1/nodes/stats", self.base_url)).send().await?;
 
         if !resp.status().is_success() {
             anyhow::bail!("Failed to fetch network stats: {}", resp.status());
@@ -330,11 +334,7 @@ impl OrchestratorClient {
         } else {
             format!("{}/v1/nodes?status=all&limit={}", self.base_url, limit)
         };
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .await?;
+        let resp = self.client.get(url).send().await?;
 
         if !resp.status().is_success() {
             anyhow::bail!("Failed to list nodes: {}", resp.status());
@@ -345,18 +345,15 @@ impl OrchestratorClient {
     }
 
     pub async fn get_online_nodes(&self) -> Result<Vec<OnlineNode>> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/nodes", self.base_url))
-            .send()
-            .await?;
+        let resp = self.client.get(format!("{}/v1/nodes", self.base_url)).send().await?;
 
         if !resp.status().is_success() {
             anyhow::bail!("Failed to fetch online nodes: {}", resp.status());
         }
 
         let body = resp.json::<serde_json::Value>().await?;
-        let nodes: Vec<OnlineNode> = serde_json::from_value(body["nodes"].clone()).unwrap_or_default();
+        let nodes: Vec<OnlineNode> =
+            serde_json::from_value(body["nodes"].clone()).unwrap_or_default();
         Ok(nodes)
     }
 
@@ -406,7 +403,9 @@ async fn orchestrator_error(prefix: &str, resp: reqwest::Response) -> anyhow::Er
     let body = resp.text().await.unwrap_or_default();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         if body.contains("node session") || body.contains("wallet mismatch") {
-            return anyhow::anyhow!("{prefix}: node session expired or invalid. Run `compute wallet login`.");
+            return anyhow::anyhow!(
+                "{prefix}: node session expired or invalid. Run `compute wallet login`."
+            );
         }
     }
     anyhow::anyhow!("{prefix} ({status}): {body}")

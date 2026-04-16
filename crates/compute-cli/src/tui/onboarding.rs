@@ -3,7 +3,6 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use serde::{de::DeserializeOwned, Deserialize};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -11,6 +10,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
+use serde::{Deserialize, de::DeserializeOwned};
 
 use compute_daemon::config::{self, Config};
 
@@ -157,7 +157,9 @@ impl OnboardingScreen {
                             self.start_wallet_auth();
                         }
                     }
-                    KeyCode::Char('s') | KeyCode::Char('S') => return Some(OnboardingResult::Skipped),
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        return Some(OnboardingResult::Skipped);
+                    }
                     _ => {}
                 }
                 None
@@ -309,10 +311,7 @@ impl OnboardingScreen {
                             .wallet_address
                             .or_else(|| wallet_address_from_node_token(&node_token))
                             .ok_or_else(|| "Missing wallet address in auth response".to_string())?;
-                        return Ok(WalletAuthResult {
-                            wallet_address,
-                            node_token,
-                        });
+                        return Ok(WalletAuthResult { wallet_address, node_token });
                     }
 
                     std::thread::sleep(Duration::from_secs(start.poll_interval.max(1)));
@@ -422,10 +421,7 @@ impl OnboardingScreen {
             OnboardingStep::Installing => "  Installing...",
             OnboardingStep::Done => "  [Enter] Continue",
         };
-        let help = Paragraph::new(Line::from(Span::styled(
-            help_text,
-            Style::default().fg(p.dim),
-        )));
+        let help = Paragraph::new(Line::from(Span::styled(help_text, Style::default().fg(p.dim))));
         frame.render_widget(help, chunks[4]);
     }
 
@@ -477,7 +473,7 @@ impl OnboardingScreen {
                 Constraint::Length(2),
                 Constraint::Length(5),
                 Constraint::Length(2),
-                Constraint::Min(0),    // remaining
+                Constraint::Min(0), // remaining
             ])
             .split(area);
 
@@ -499,16 +495,14 @@ impl OnboardingScreen {
         let input_block =
             Block::default().borders(Borders::ALL).border_style(Style::default().fg(border_color));
 
-        let status = self.auth_status.as_deref().unwrap_or("Press Enter to authenticate in your browser.");
+        let status =
+            self.auth_status.as_deref().unwrap_or("Press Enter to authenticate in your browser.");
         let input_text = Paragraph::new(vec![
             Line::from(Span::styled(
                 "  Compute uses wallet auth like compute-code.",
                 Style::default().fg(p.muted),
             )),
-            Line::from(Span::styled(
-                format!("  {status}"),
-                Style::default().fg(p.text),
-            )),
+            Line::from(Span::styled(format!("  {status}"), Style::default().fg(p.text))),
         ])
         .block(input_block);
 

@@ -406,9 +406,7 @@ async fn run_single_llama_case(
         let case_for_success = case.clone();
         wait_for_health(port, 60).await?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()?;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build()?;
 
         let started = Instant::now();
         let resp = client
@@ -440,7 +438,8 @@ async fn run_single_llama_case(
             success: true,
             error: None,
         })
-    }.await;
+    }
+    .await;
 
     let _ = stop_child(&mut child);
 
@@ -465,11 +464,7 @@ pub async fn run_path_comparison(
     let daemon_local = run_daemon_local_path_case().await;
     let orchestrator = run_orchestrator_path_case(model_name, api_key).await;
 
-    Ok(PathBenchmarkSuite {
-        direct_temp,
-        daemon_local,
-        orchestrator,
-    })
+    Ok(PathBenchmarkSuite { direct_temp, daemon_local, orchestrator })
 }
 
 pub async fn run_direct_temp_path_case(model_name: &str) -> Result<PathBenchmarkResult> {
@@ -611,7 +606,10 @@ async fn run_single_path_case_orchestrator(
             effective_tok_per_sec: None,
             profile: None,
             success: false,
-            error: Some("missing api key (pass --api-key, set OPENAI_API_KEY, or log into compute-code)".into()),
+            error: Some(
+                "missing api key (pass --api-key, set OPENAI_API_KEY, or log into compute-code)"
+                    .into(),
+            ),
         };
     };
 
@@ -756,9 +754,10 @@ async fn run_chat_stream_path_case(
     }
 
     let total_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let completion_tokens = completion_tokens.or_else(|| Some(captured_content_tokens).filter(|v| *v > 0));
-    let effective_tok_per_sec = completion_tokens
-        .map(|tokens| tokens as f64 / started.elapsed().as_secs_f64().max(0.001));
+    let completion_tokens =
+        completion_tokens.or_else(|| Some(captured_content_tokens).filter(|v| *v > 0));
+    let effective_tok_per_sec =
+        completion_tokens.map(|tokens| tokens as f64 / started.elapsed().as_secs_f64().max(0.001));
 
     PathBenchmarkResult {
         name: name.into(),
@@ -815,16 +814,13 @@ fn process_sse_frame(
         {
             *completion_tokens = Some(tokens);
         }
-        *captured_content_tokens += extract_delta_text(&json)
-            .map(|text| estimate_token_count(text) as u64)
-            .unwrap_or(0);
+        *captured_content_tokens +=
+            extract_delta_text(&json).map(|text| estimate_token_count(text) as u64).unwrap_or(0);
     }
 }
 
 fn has_visible_content_chunk(json: &serde_json::Value) -> bool {
-    extract_delta_text(json)
-        .map(|text| !text.trim().is_empty())
-        .unwrap_or(false)
+    extract_delta_text(json).map(|text| !text.trim().is_empty()).unwrap_or(false)
 }
 
 fn extract_delta_text<'a>(json: &'a serde_json::Value) -> Option<&'a str> {
@@ -865,9 +861,7 @@ fn estimate_token_count(text: &str) -> usize {
 }
 
 async fn wait_for_health(port: u16, timeout_secs: u64) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()?;
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
 
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(timeout_secs) {
@@ -898,7 +892,11 @@ fn find_llama_server() -> Result<PathBuf> {
         }
     }
 
-    for candidate in ["/usr/local/bin/llama-server", "/opt/homebrew/bin/llama-server", "~/.local/bin/llama-server"] {
+    for candidate in [
+        "/usr/local/bin/llama-server",
+        "/opt/homebrew/bin/llama-server",
+        "~/.local/bin/llama-server",
+    ] {
         let expanded = shellexpand::tilde(candidate).to_string();
         let path = PathBuf::from(expanded);
         if path.exists() {

@@ -6,7 +6,9 @@ use tracing::warn;
 
 use compute_daemon::config::Config;
 use compute_daemon::hardware;
-use compute_network::client::{NodeRegistration as OrchestratorNodeRegistration, OrchestratorClient};
+use compute_network::client::{
+    NodeRegistration as OrchestratorNodeRegistration, OrchestratorClient,
+};
 
 use super::dashboard::Dashboard;
 use super::onboarding::{OnboardingResult, OnboardingScreen};
@@ -78,8 +80,7 @@ fn run_inner(
 
     // Start daemon runtime in background DURING splash so there's no lag on transition
     let daemon_config = config.clone();
-    let runtime =
-        compute_daemon::runtime::DaemonRuntime::with_hardware(daemon_config, hw.clone());
+    let runtime = compute_daemon::runtime::DaemonRuntime::with_hardware(daemon_config, hw.clone());
     let state_rx = runtime.state_receiver();
 
     let daemon_handle = std::thread::spawn(move || {
@@ -114,9 +115,7 @@ fn run_inner(
 
 /// Kill any llama-server processes we spawned on port 8090.
 fn kill_llama_server() {
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "llama-server.*--port 8090"])
-        .status();
+    let _ = std::process::Command::new("pkill").args(["-f", "llama-server.*--port 8090"]).status();
 }
 
 pub async fn register_node_orchestrator(
@@ -142,8 +141,10 @@ pub async fn register_node_orchestrator(
     let os_str = Some(format!("{} {}", hw.os.name, hw.os.version));
     let ip_address = advertised_host(config);
 
-    let mut client =
-        OrchestratorClient::new(&config.network.orchestrator_url, Some(config.wallet.node_token.clone()));
+    let mut client = OrchestratorClient::new(
+        &config.network.orchestrator_url,
+        Some(config.wallet.node_token.clone()),
+    );
     let node = OrchestratorNodeRegistration {
         wallet_address: config.wallet.public_address.clone(),
         node_name: Some(config.node.name.clone()),
@@ -159,6 +160,8 @@ pub async fn register_node_orchestrator(
         tflops_fp16: tflops,
         listen_port: Some(9090),
         ip_address,
+        pipeline_capable: Some(config.experimental.stage_mode_enabled),
+        memory_bandwidth_gbps: None,
     };
 
     let node_id = client.register(&node).await?;
@@ -170,7 +173,9 @@ fn detect_advertise_ip() -> Option<String> {
     socket.connect((Ipv4Addr::new(1, 1, 1, 1), 80)).ok()?;
     let addr = socket.local_addr().ok()?;
     match addr.ip() {
-        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip.to_string()),
+        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => {
+            Some(ip.to_string())
+        }
         _ => None,
     }
 }

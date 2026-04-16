@@ -1,6 +1,6 @@
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -97,11 +97,7 @@ impl SplashScreen {
         let mut steps = vec![
             StartupStep { label: "Detecting hardware...".into(), done: false, result: None },
             StartupStep { label: format!("GPU: {gpu_name}"), done: false, result: None },
-            StartupStep {
-                label: "Checking llama-server...".into(),
-                done: false,
-                result: None,
-            },
+            StartupStep { label: "Checking llama-server...".into(), done: false, result: None },
         ];
 
         // Step 3 depends on whether llama-server was found
@@ -133,8 +129,12 @@ impl SplashScreen {
         } else {
             // Same logic as runtime.rs pre-warm: prefer small Gemma, then larger Gemma, then Qwen.
             let downloaded = first_model_path
-                .and_then(|p| std::path::Path::new(&p).file_stem()
-                    .and_then(|s| s.to_str()).map(|s| s.to_string()))
+                .and_then(|p| {
+                    std::path::Path::new(&p)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                })
                 .unwrap_or_default();
             downloaded
         };
@@ -270,8 +270,7 @@ impl SplashScreen {
                         // Step 4: wait for daemon's llama-server to be ready
                         if self.current_step == 4 && self.stage_mode_enabled {
                             self.model_loaded.store(true, Ordering::Relaxed);
-                            self.steps[self.current_step].label =
-                                "Stage backend ready".into();
+                            self.steps[self.current_step].label = "Stage backend ready".into();
                             self.steps[self.current_step].done = true;
                             self.current_step += 1;
                             self.step_timer = Instant::now();
@@ -316,8 +315,7 @@ impl SplashScreen {
                                 self.phase = SplashPhase::StepsRunning;
                             }
                             Err(e) => {
-                                self.steps[self.current_step].label =
-                                    format!("Model failed: {e}");
+                                self.steps[self.current_step].label = format!("Model failed: {e}");
                                 self.steps[self.current_step].done = true;
                                 self.current_step += 1;
                                 self.step_timer = Instant::now();
@@ -342,8 +340,7 @@ impl SplashScreen {
                                 self.phase = SplashPhase::StepsRunning;
                             }
                             Err(e) => {
-                                self.steps[self.current_step].label =
-                                    format!("llama-server: {e}");
+                                self.steps[self.current_step].label = format!("llama-server: {e}");
                                 self.steps[self.current_step].done = true;
                                 self.current_step += 1;
                                 self.step_timer = Instant::now();
@@ -541,7 +538,10 @@ impl SplashScreen {
 
             let (icon, color) = if step.done {
                 ("  ✓ ".to_string(), p.success)
-            } else if is_installing || is_loading_model || (i == self.current_step && self.phase == SplashPhase::StepsRunning) {
+            } else if is_installing
+                || is_loading_model
+                || (i == self.current_step && self.phase == SplashPhase::StepsRunning)
+            {
                 (format!("  {spinner} "), p.warning)
             } else {
                 ("    ".to_string(), p.dim)
@@ -564,10 +564,7 @@ impl SplashScreen {
                     "  Daemon started. Earning $COMPUTE...",
                     Style::default().fg(p.success),
                 )),
-                Line::from(Span::styled(
-                    "  [i] What is llama-server?",
-                    Style::default().fg(p.dim),
-                )),
+                Line::from(Span::styled("  [i] What is llama-server?", Style::default().fg(p.dim))),
             ]);
             frame.render_widget(msg, right_chunks[5]);
         } else if self.phase == SplashPhase::InstallingLlama {
@@ -576,10 +573,7 @@ impl SplashScreen {
                     "  Installing llama-server via Homebrew...",
                     Style::default().fg(p.warning),
                 )),
-                Line::from(Span::styled(
-                    "  [i] What is llama-server?",
-                    Style::default().fg(p.dim),
-                )),
+                Line::from(Span::styled("  [i] What is llama-server?", Style::default().fg(p.dim))),
             ]);
             frame.render_widget(msg, right_chunks[5]);
         } else if !self.has_local_model && !self.stage_mode_enabled {
@@ -588,10 +582,7 @@ impl SplashScreen {
                     "  No model cached yet. Download one from Models after startup.",
                     Style::default().fg(p.warning),
                 )),
-                Line::from(Span::styled(
-                    "  [i] What is llama-server?",
-                    Style::default().fg(p.dim),
-                )),
+                Line::from(Span::styled("  [i] What is llama-server?", Style::default().fg(p.dim))),
             ]);
             frame.render_widget(msg, right_chunks[5]);
         }

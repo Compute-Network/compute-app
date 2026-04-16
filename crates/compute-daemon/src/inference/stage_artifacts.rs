@@ -1,17 +1,13 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
 pub fn stages_cache_dir() -> PathBuf {
-    crate::config::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.compute"))
-        .join("stages")
+    crate::config::config_dir().unwrap_or_else(|| PathBuf::from("~/.compute")).join("stages")
 }
 
 pub fn packed_stage_dir(model_id: &str, start_layer: u32, end_layer: u32) -> PathBuf {
-    stages_cache_dir()
-        .join(model_id)
-        .join(format!("packed-stage-{}-{}", start_layer, end_layer))
+    stages_cache_dir().join(model_id).join(format!("packed-stage-{}-{}", start_layer, end_layer))
 }
 
 pub fn is_stage_cached(model_id: &str, start_layer: u32, end_layer: u32) -> bool {
@@ -25,9 +21,7 @@ pub fn is_stage_cached(model_id: &str, start_layer: u32, end_layer: u32) -> bool
 fn has_index_file(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|entries| {
-            entries.flatten().any(|e| {
-                e.file_name().to_string_lossy().ends_with(".index.json")
-            })
+            entries.flatten().any(|e| e.file_name().to_string_lossy().ends_with(".index.json"))
         })
         .unwrap_or(false)
 }
@@ -45,7 +39,10 @@ pub async fn ensure_stage_artifacts(
     if is_stage_cached(model_id, start_layer, end_layer) {
         info!(
             "Stage artifacts for {} layers {}-{} already cached at {}",
-            model_id, start_layer, end_layer, dest_dir.display()
+            model_id,
+            start_layer,
+            end_layer,
+            dest_dir.display()
         );
         return Ok(dest_dir);
     }
@@ -67,10 +64,7 @@ pub async fn ensure_stage_artifacts(
             let actual = sha256_file(&archive_path)?;
             if actual != sha {
                 let _ = std::fs::remove_file(&archive_path);
-                anyhow::bail!(
-                    "Artifact checksum mismatch: expected {}, got {}",
-                    sha, actual
-                );
+                anyhow::bail!("Artifact checksum mismatch: expected {}, got {}", sha, actual);
             }
             debug!("Checksum OK");
         }
@@ -78,14 +72,9 @@ pub async fn ensure_stage_artifacts(
 
     if let Some(expected) = expected_size {
         if expected > 0 {
-            let actual = std::fs::metadata(&archive_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let actual = std::fs::metadata(&archive_path).map(|m| m.len()).unwrap_or(0);
             if actual != expected {
-                warn!(
-                    "Artifact size mismatch: expected {} bytes, got {}",
-                    expected, actual
-                );
+                warn!("Artifact size mismatch: expected {} bytes, got {}", expected, actual);
             }
         }
     }
@@ -103,10 +92,7 @@ pub async fn ensure_stage_artifacts(
         );
     }
 
-    info!(
-        "Stage artifacts ready at {}",
-        dest_dir.display()
-    );
+    info!("Stage artifacts ready at {}", dest_dir.display());
     Ok(dest_dir)
 }
 
@@ -118,11 +104,7 @@ fn is_tar_file(path: &Path) -> bool {
             f.read_exact(&mut magic)?;
             Ok(magic)
         })
-        .map(|_| {
-            path.extension()
-                .map(|e| e == "tar" || e == "gz" || e == "tgz")
-                .unwrap_or(false)
-        })
+        .map(|_| path.extension().map(|e| e == "tar" || e == "gz" || e == "tgz").unwrap_or(false))
         .unwrap_or(false)
 }
 
@@ -138,9 +120,8 @@ fn extract_tar(archive: &Path, dest: &Path) -> Result<()> {
 }
 
 async fn download_file(url: &str, dest: &Path) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(7200))
-        .build()?;
+    let client =
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(7200)).build()?;
 
     let resp = client.get(url).send().await.context("Download request failed")?;
 
@@ -152,12 +133,11 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
     let mut downloaded: u64 = 0;
 
     let tmp_path = dest.with_extension("tmp");
-    let mut file = tokio::fs::File::create(&tmp_path)
-        .await
-        .context("Failed to create temp file")?;
+    let mut file =
+        tokio::fs::File::create(&tmp_path).await.context("Failed to create temp file")?;
 
-    use tokio::io::AsyncWriteExt;
     use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
@@ -179,15 +159,9 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
     file.flush().await?;
     drop(file);
 
-    tokio::fs::rename(&tmp_path, dest)
-        .await
-        .context("Failed to move downloaded artifact")?;
+    tokio::fs::rename(&tmp_path, dest).await.context("Failed to move downloaded artifact")?;
 
-    info!(
-        "Downloaded {:.2} GB to {}",
-        downloaded as f64 / 1_073_741_824.0,
-        dest.display()
-    );
+    info!("Downloaded {:.2} GB to {}", downloaded as f64 / 1_073_741_824.0, dest.display());
     Ok(())
 }
 

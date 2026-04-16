@@ -92,7 +92,9 @@ pub fn palette_for(mode: ThemeMode) -> Palette {
             globe_nodes: Color::Green,
             globe_me: Color::Blue,
         },
-        ThemeMode::System => unreachable!("system mode should be resolved before palette selection"),
+        ThemeMode::System => {
+            unreachable!("system mode should be resolved before palette selection")
+        }
     }
 }
 

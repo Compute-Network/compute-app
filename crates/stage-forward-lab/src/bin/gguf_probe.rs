@@ -3,61 +3,36 @@ use stage_forward_lab::gguf::{GgufFile, TensorRole};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
-    let path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap()
-                .join(".compute")
-                .join("models")
-                .join("gemma-4-E4B-it-Q4_K_M.gguf")
-        });
+    let path = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| {
+        dirs::home_dir().unwrap().join(".compute").join("models").join("gemma-4-E4B-it-Q4_K_M.gguf")
+    });
 
     let file = GgufFile::parse_file(&path)?;
 
     println!("path               : {}", path.display());
     println!("version            : {}", file.version);
     println!("tensor_count       : {}", file.tensor_count);
-    println!(
-        "architecture       : {}",
-        file.architecture().unwrap_or("unknown")
-    );
+    println!("architecture       : {}", file.architecture().unwrap_or("unknown"));
     println!(
         "inferred_layers    : {}",
-        file.inferred_layer_count()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "unknown".into())
+        file.inferred_layer_count().map(|n| n.to_string()).unwrap_or_else(|| "unknown".into())
     );
     println!(
         "metadata examples  : general.name={}, general.architecture={}",
-        file.metadata_string("general.name")
-            .unwrap_or_else(|| "n/a".into()),
-        file.metadata_string("general.architecture")
-            .unwrap_or_else(|| "n/a".into())
+        file.metadata_string("general.name").unwrap_or_else(|| "n/a".into()),
+        file.metadata_string("general.architecture").unwrap_or_else(|| "n/a".into())
     );
     println!(
         "model dims         : hidden_size={} ffn_size={} heads={}",
-        file.hidden_size()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        file.feed_forward_length()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "unknown".into()),
-        file.attention_head_count()
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "unknown".into())
+        file.hidden_size().map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()),
+        file.feed_forward_length().map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()),
+        file.attention_head_count().map(|n| n.to_string()).unwrap_or_else(|| "unknown".into())
     );
     if let Some(split) = file.suggest_even_stage_split(2) {
         let formatted = split
             .iter()
             .map(|stage| {
-                format!(
-                    "stage{}={}..{}",
-                    stage.stage_index + 1,
-                    stage.start_layer,
-                    stage.end_layer
-                )
+                format!("stage{}={}..{}", stage.stage_index + 1, stage.start_layer, stage.end_layer)
             })
             .collect::<Vec<_>>()
             .join(", ");

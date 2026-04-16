@@ -7,16 +7,10 @@ use std::time::Instant;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let stage1_path = args
-        .get(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("out/gemma-e4b-2stage/packed-stage-1/stage-1-required.index.json")
-        });
-    let prompt = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| "Hello".to_string());
+    let stage1_path = args.get(1).map(PathBuf::from).unwrap_or_else(|| {
+        PathBuf::from("out/gemma-e4b-2stage/packed-stage-1/stage-1-required.index.json")
+    });
+    let prompt = args.get(2).cloned().unwrap_or_else(|| "Hello".to_string());
 
     println!("=== Real Gemma Forward Probe ===");
     println!("stage artifact : {}", stage1_path.display());
@@ -46,7 +40,8 @@ fn main() -> Result<()> {
     println!("stage_trace    : {:?}", tensor.stage_trace);
     println!("kind           : {:?}", tensor.kind);
 
-    let state: Vec<f32> = tensor.bytes
+    let state: Vec<f32> = tensor
+        .bytes
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();

@@ -109,10 +109,7 @@ fn is_model_downloaded(model_id: &str) -> bool {
         }
         return false;
     }
-    let cache_dir = dirs::home_dir()
-        .unwrap_or_default()
-        .join(".compute")
-        .join("models");
+    let cache_dir = dirs::home_dir().unwrap_or_default().join(".compute").join("models");
     for entry in model_entries() {
         if entry.id == model_id && !entry.gguf_filename.is_empty() {
             let path = cache_dir.join(entry.gguf_filename);
@@ -381,11 +378,8 @@ impl Dashboard {
             while let Ok((model_id, progress)) = rx.try_recv() {
                 if progress >= 1.0 || progress < 0.0 {
                     // Done or failed
-                    self.models_downloading = if progress < 0.0 {
-                        Some((model_id, -1.0))
-                    } else {
-                        None
-                    };
+                    self.models_downloading =
+                        if progress < 0.0 { Some((model_id, -1.0)) } else { None };
                     self.download_progress_rx = None;
                     break;
                 }
@@ -508,9 +502,8 @@ impl Dashboard {
             .split(area);
 
         // Globe
-        let globe_block = Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(Style::default().fg(p.dim));
+        let globe_block =
+            Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(p.dim));
         let inner = globe_block.inner(chunks[0]);
         frame.render_widget(globe_block, chunks[0]);
         self.globe.render(inner, frame.buffer_mut(), p);
@@ -575,14 +568,15 @@ impl Dashboard {
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
         let p = theme::palette();
         let w = area.width as usize;
-        let (status_color, status_text) =
-            if self.pipeline.active && (self.pipeline.active_requests > 0 || self.pipeline.tokens_per_sec > 0.0) {
-                (p.success, "ACTIVE")
-            } else if self.pipeline.active {
-                (p.success, "ONLINE")
-            } else {
-                (p.dim, "IDLE")
-            };
+        let (status_color, status_text) = if self.pipeline.active
+            && (self.pipeline.active_requests > 0 || self.pipeline.tokens_per_sec > 0.0)
+        {
+            (p.success, "ACTIVE")
+        } else if self.pipeline.active {
+            (p.success, "ONLINE")
+        } else {
+            (p.dim, "IDLE")
+        };
 
         let tab_style = |tab: Tab| {
             if tab == self.active_tab {
@@ -604,10 +598,7 @@ impl Dashboard {
         // Subtitle + status: combine on one line if wide enough, split if narrow
         if w >= 55 {
             lines.push(Line::from(vec![
-                Span::styled(
-                    "  Decentralized GPU Infrastructure",
-                    Style::default().fg(p.dim),
-                ),
+                Span::styled("  Decentralized GPU Infrastructure", Style::default().fg(p.dim)),
                 Span::raw("  "),
                 Span::styled("● ", Style::default().fg(status_color)),
                 Span::styled(status_text, Style::default().fg(status_color)),
@@ -650,9 +641,7 @@ impl Dashboard {
         }
 
         let header = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(p.dim)),
+            Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(p.dim)),
         );
         frame.render_widget(header, area);
     }
@@ -706,9 +695,7 @@ impl Dashboard {
         ];
 
         let widget = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(p.dim)),
+            Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(p.dim)),
         );
         frame.render_widget(widget, area);
     }
@@ -732,10 +719,7 @@ impl Dashboard {
             ]),
             Line::from(vec![
                 Span::styled("  This Week  ", Style::default().fg(p.dim)),
-                Span::styled(
-                    format!("{:.1} $COMPUTE", e.this_week),
-                    Style::default().fg(p.text),
-                ),
+                Span::styled(format!("{:.1} $COMPUTE", e.this_week), Style::default().fg(p.text)),
                 Span::styled(
                     format!("    ≈ ${:.2}", e.this_week * e.usd_rate),
                     Style::default().fg(p.dim),
@@ -743,25 +727,17 @@ impl Dashboard {
             ]),
             Line::from(vec![
                 Span::styled("  All Time   ", Style::default().fg(p.dim)),
-                Span::styled(
-                    format!("{:.0} $COMPUTE", e.all_time),
-                    Style::default().fg(p.text),
-                ),
+                Span::styled(format!("{:.0} $COMPUTE", e.all_time), Style::default().fg(p.text)),
             ]),
             Line::from(vec![
                 Span::styled("  Pending    ", Style::default().fg(p.dim)),
-                Span::styled(
-                    format!("{:.1} $COMPUTE", e.pending),
-                    Style::default().fg(p.warning),
-                ),
+                Span::styled(format!("{:.1} $COMPUTE", e.pending), Style::default().fg(p.warning)),
                 Span::styled("  [c]laim", Style::default().fg(p.dim)),
             ]),
         ];
 
         let widget = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(p.dim)),
+            Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(p.dim)),
         );
         frame.render_widget(widget, area);
     }
@@ -810,7 +786,11 @@ impl Dashboard {
                 Span::styled("    Active  ", Style::default().fg(theme.dim)),
                 Span::styled(
                     format!("{}", p.active_requests),
-                    Style::default().fg(if p.active_requests > 0 { theme.success } else { theme.text }),
+                    Style::default().fg(if p.active_requests > 0 {
+                        theme.success
+                    } else {
+                        theme.text
+                    }),
                 ),
             ]),
             Line::from(vec![
@@ -833,9 +813,7 @@ impl Dashboard {
         ];
 
         let widget = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .border_style(Style::default().fg(theme.dim)),
+            Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme.dim)),
         );
         frame.render_widget(widget, area);
     }
@@ -861,10 +839,8 @@ impl Dashboard {
         // Fixed scale: max 200, baseline offset 25 (always 1 visible block)
         let display_data: Vec<u64> = self.throughput_history.iter().map(|&v| v + 25).collect();
 
-        let sparkline = Sparkline::default()
-            .data(&display_data)
-            .max(200)
-            .style(Style::default().fg(p.text));
+        let sparkline =
+            Sparkline::default().data(&display_data).max(200).style(Style::default().fg(p.text));
 
         let sparkline_area =
             Rect { x: chunks[2].x + 2, width: chunks[2].width.saturating_sub(4), ..chunks[2] };
@@ -1061,6 +1037,7 @@ impl Dashboard {
                 if config.experimental.stage_mode_enabled { "On" } else { "Off" }.into()
             }
             "experimental.stage_backend" => match config.experimental.stage_backend.as_str() {
+                "llama-stage-gateway" | "llama_stage_gateway" | "gateway" => "LlamaStageGateway".into(),
                 "llamacpp" => "LlamaCpp".into(),
                 "tail-llama" => "TailLlama".into(),
                 "real_forward" | "real-forward" => "RealForward".into(),
@@ -1093,7 +1070,8 @@ impl Dashboard {
                         return; // Don't save config for service
                     }
                     "experimental.stage_mode_enabled" => {
-                        config.experimental.stage_mode_enabled = !config.experimental.stage_mode_enabled
+                        config.experimental.stage_mode_enabled =
+                            !config.experimental.stage_mode_enabled
                     }
                     _ => {}
                 }
@@ -1133,12 +1111,16 @@ impl Dashboard {
                         };
                     }
                     "experimental.stage_backend" => {
-                        config.experimental.stage_backend = match config.experimental.stage_backend.as_str() {
-                            "prototype" => "tail-llama".into(),
-                            "tail-llama" => "llamacpp".into(),
-                            "llamacpp" => "real_forward".into(),
-                            _ => "prototype".into(),
-                        };
+                        config.experimental.stage_backend =
+                            match config.experimental.stage_backend.as_str() {
+                                "llama-stage-gateway" | "llama_stage_gateway" | "gateway" => {
+                                    "llamacpp".into()
+                                }
+                                "llamacpp" => "tail-llama".into(),
+                                "tail-llama" => "real_forward".into(),
+                                "real_forward" | "real-forward" => "prototype".into(),
+                                _ => "llama-stage-gateway".into(),
+                            };
                     }
                     _ => {}
                 }
@@ -1340,10 +1322,7 @@ impl Dashboard {
                 let tmp = dest.with_extension("tmp");
                 (parent, dest, tmp)
             } else {
-                let dir = dirs::home_dir()
-                    .unwrap_or_default()
-                    .join(".compute")
-                    .join("models");
+                let dir = dirs::home_dir().unwrap_or_default().join(".compute").join("models");
                 let _ = std::fs::create_dir_all(&dir);
                 let dest = dir.join(&filename);
                 let tmp = dest.with_extension("tmp");
@@ -1363,9 +1342,7 @@ impl Dashboard {
             };
 
             // Resume support: check if a partial .tmp file exists
-            let mut downloaded: u64 = std::fs::metadata(&tmp)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let mut downloaded: u64 = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
 
             // Retry loop: on network interruption (sleep/wake), retry up to 10 times
             let max_retries = 10;
@@ -1376,7 +1353,11 @@ impl Dashboard {
                 let mut req = client.get(&url);
                 if downloaded > 0 {
                     req = req.header("Range", format!("bytes={downloaded}-"));
-                    tracing::info!("[download] Resuming from {:.1} MB (attempt {})", downloaded as f64 / 1048576.0, attempt + 1);
+                    tracing::info!(
+                        "[download] Resuming from {:.1} MB (attempt {})",
+                        downloaded as f64 / 1048576.0,
+                        attempt + 1
+                    );
                 }
 
                 let resp = match req.send() {
@@ -1384,7 +1365,9 @@ impl Dashboard {
                     Err(e) => {
                         tracing::warn!("[download] Request failed: {e}");
                         if attempt < max_retries {
-                            std::thread::sleep(std::time::Duration::from_secs(2u64.pow(attempt.min(5))));
+                            std::thread::sleep(std::time::Duration::from_secs(
+                                2u64.pow(attempt.min(5)),
+                            ));
                             continue;
                         }
                         let _ = tx.send((model_id, -1.0));
@@ -1428,17 +1411,14 @@ impl Dashboard {
 
                 // Open file for append (resume) or create (fresh)
                 use std::io::{Read, Write};
-                let mut file = match std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&tmp)
-                {
-                    Ok(f) => f,
-                    Err(_) => {
-                        let _ = tx.send((model_id, -1.0));
-                        return;
-                    }
-                };
+                let mut file =
+                    match std::fs::OpenOptions::new().create(true).append(true).open(&tmp) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            let _ = tx.send((model_id, -1.0));
+                            return;
+                        }
+                    };
 
                 let mut reader = std::io::BufReader::with_capacity(1024 * 1024, resp);
                 let mut buf = vec![0u8; 256 * 1024]; // 256KB chunks
@@ -1502,7 +1482,8 @@ impl Dashboard {
                     if meta.len() != total {
                         tracing::warn!(
                             "[download] Size mismatch: expected {} bytes, got {}",
-                            total, meta.len()
+                            total,
+                            meta.len()
                         );
                         let _ = std::fs::remove_file(&tmp);
                         let _ = tx.send((model_id, -1.0));
@@ -1647,12 +1628,15 @@ impl Dashboard {
                 let filled = (progress * bar_width as f64) as usize;
                 let empty = bar_width - filled;
                 let pct = progress * 100.0;
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("  Downloading  [{}{}] {:.0}%", "█".repeat(filled), "░".repeat(empty), pct),
-                        Style::default().fg(p.text),
+                lines.push(Line::from(vec![Span::styled(
+                    format!(
+                        "  Downloading  [{}{}] {:.0}%",
+                        "█".repeat(filled),
+                        "░".repeat(empty),
+                        pct
                     ),
-                ]));
+                    Style::default().fg(p.text),
+                )]));
             }
         }
 

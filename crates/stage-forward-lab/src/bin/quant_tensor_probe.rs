@@ -19,18 +19,11 @@ fn main() -> Result<()> {
     let decoded = quants::dequantize_tensor(entry.ggml_type, &bytes)?;
 
     println!("tensor         : {}", entry.name);
-    println!(
-        "ggml_type      : {} ({})",
-        entry.ggml_type,
-        quants::ggml_type_name(entry.ggml_type)
-    );
+    println!("ggml_type      : {} ({})", entry.ggml_type, quants::ggml_type_name(entry.ggml_type));
     println!("dimensions     : {:?}", entry.dimensions);
     println!("byte_len       : {}", entry.byte_len);
     println!("decoded_len    : {}", decoded.len());
-    println!(
-        "decoded_head   : {:?}",
-        decoded.iter().take(16).copied().collect::<Vec<_>>()
-    );
+    println!("decoded_head   : {:?}", decoded.iter().take(16).copied().collect::<Vec<_>>());
 
     Ok(())
 }

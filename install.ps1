@@ -5,6 +5,8 @@ $ErrorActionPreference = "Stop"
 
 $repo = "Compute-Network/compute-app"
 $binaryName = "compute.exe"
+$stageNodeBinary = "llama_stage_tcp_node.exe"
+$gatewayBinary = "llama_stage_gateway_tcp_node.exe"
 
 Write-Host ""
 Write-Host "  ██████╗ ██████╗ ███╗   ███╗██████╗ ██╗   ██╗████████╗███████╗" -ForegroundColor White
@@ -25,7 +27,8 @@ $arch = if ([System.Environment]::Is64BitOperatingSystem) {
     exit 1
 }
 
-$filename = "compute-windows-${arch}.zip"
+$target = if ($arch -eq "aarch64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
+$filename = "compute-${target}.zip"
 
 # Get latest release
 Write-Host "  Fetching latest release..." -ForegroundColor DarkGray
@@ -73,6 +76,16 @@ if (-not $binaryPath) {
 }
 
 Copy-Item -Path $binaryPath.FullName -Destination (Join-Path $installDir $binaryName) -Force
+
+$stageNodePath = Get-ChildItem -Path $tempDir -Filter $stageNodeBinary -Recurse | Select-Object -First 1
+if ($stageNodePath) {
+    Copy-Item -Path $stageNodePath.FullName -Destination (Join-Path $installDir $stageNodeBinary) -Force
+}
+
+$gatewayPath = Get-ChildItem -Path $tempDir -Filter $gatewayBinary -Recurse | Select-Object -First 1
+if ($gatewayPath) {
+    Copy-Item -Path $gatewayPath.FullName -Destination (Join-Path $installDir $gatewayBinary) -Force
+}
 
 # Add to PATH if not already there
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")

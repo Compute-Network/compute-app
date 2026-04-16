@@ -17,10 +17,7 @@ fn main() -> Result<()> {
     let view = store.model_view();
 
     println!("index              : {}", index_path.display());
-    println!(
-        "pack               : {}",
-        store.artifact.pack_path.display()
-    );
+    println!("pack               : {}", store.artifact.pack_path.display());
     println!("role               : {}", store.artifact.index.role);
     println!("tensor count       : {}", store.tensor_count());
     println!("total bytes        : {}", store.total_bytes());
@@ -64,11 +61,7 @@ fn main() -> Result<()> {
             spec.runnable_sketch
         );
     }
-    let runnable_layers = view
-        .execution_layers
-        .iter()
-        .filter(|spec| spec.runnable_sketch)
-        .count();
+    let runnable_layers = view.execution_layers.iter().filter(|spec| spec.runnable_sketch).count();
     println!("runnable layers    : {}", runnable_layers);
     for name in store.tensor_names().take(8) {
         let entry = store.entry(name).unwrap();
