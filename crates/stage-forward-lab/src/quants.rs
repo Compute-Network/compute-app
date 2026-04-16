@@ -290,6 +290,7 @@ unsafe fn decode_q4_coeffs8(
     )
 }
 
+#[cfg(target_arch = "aarch64")]
 unsafe fn dot_many_q4_k_four_blocks_with_offset_six_neon(
     block_a: &[u8],
     block_b: &[u8],
