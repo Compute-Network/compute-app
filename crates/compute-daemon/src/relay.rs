@@ -96,6 +96,18 @@ pub struct AssignmentPush {
     /// Expected size of the packed artifact in bytes
     #[serde(default)]
     pub artifact_size_bytes: Option<u64>,
+    /// llama-stage-gateway role for split assignments: "head" or "tail".
+    /// Set when assignment_mode is "gateway-head" or "gateway-tail".
+    #[serde(default)]
+    pub gateway_role: Option<String>,
+    /// For gateway-head assignments: address of the remote tail worker
+    /// (e.g. "10.0.0.5:9182") that the local gateway should connect to.
+    #[serde(default)]
+    pub gateway_tail_addr: Option<String>,
+    /// For gateway-tail assignments: where the tail worker should bind
+    /// (e.g. "0.0.0.0:9182"). Falls back to "0.0.0.0:9182" if missing.
+    #[serde(default)]
+    pub gateway_tail_bind: Option<String>,
 }
 
 /// Channel for sending messages back through the WebSocket from other tasks
@@ -1196,7 +1208,75 @@ fn extract_stop_sequences(body: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_request_prompt, extract_stop_sequences};
+    use super::{AssignmentPush, extract_request_prompt, extract_stop_sequences};
+
+    #[test]
+    fn assignment_push_deserializes_gateway_head_payload() {
+        // Mirrors what the orchestrator's sendAssignment serializes for the
+        // head node in a 2-machine split. Catches wire-format drift early.
+        let payload = serde_json::json!({
+            "type": "assignment",
+            "pipeline_id": "pipe-test",
+            "model_name": "gemma-4-e4b-q4",
+            "stage": 0,
+            "total_stages": 2,
+            "assignment_mode": "gateway-head",
+            "shard_id": "gemma-4-e4b-q4:gateway-head-0-20",
+            "start_layer": 0,
+            "end_layer": 20,
+            "upstream_addr": null,
+            "downstream_addr": null,
+            "gateway_role": "head",
+            "gateway_tail_addr": "10.0.0.5:9182",
+        });
+        let parsed: AssignmentPush = serde_json::from_value(payload).expect("parse head");
+        assert_eq!(parsed.assignment_mode.as_deref(), Some("gateway-head"));
+        assert_eq!(parsed.gateway_role.as_deref(), Some("head"));
+        assert_eq!(parsed.gateway_tail_addr.as_deref(), Some("10.0.0.5:9182"));
+        assert_eq!(parsed.start_layer, Some(0));
+        assert_eq!(parsed.end_layer, Some(20));
+    }
+
+    #[test]
+    fn assignment_push_deserializes_gateway_tail_payload() {
+        let payload = serde_json::json!({
+            "type": "assignment",
+            "pipeline_id": "pipe-test",
+            "model_name": "gemma-4-e4b-q4",
+            "stage": 1,
+            "total_stages": 2,
+            "assignment_mode": "gateway-tail",
+            "shard_id": "gemma-4-e4b-q4:gateway-tail-21-41",
+            "start_layer": 21,
+            "end_layer": 41,
+            "upstream_addr": null,
+            "downstream_addr": null,
+            "gateway_role": "tail",
+            "gateway_tail_bind": "0.0.0.0:9182",
+        });
+        let parsed: AssignmentPush = serde_json::from_value(payload).expect("parse tail");
+        assert_eq!(parsed.assignment_mode.as_deref(), Some("gateway-tail"));
+        assert_eq!(parsed.gateway_role.as_deref(), Some("tail"));
+        assert_eq!(parsed.gateway_tail_bind.as_deref(), Some("0.0.0.0:9182"));
+        assert_eq!(parsed.start_layer, Some(21));
+        assert_eq!(parsed.end_layer, Some(41));
+    }
+
+    #[test]
+    fn assignment_push_solo_payload_has_no_gateway_fields() {
+        let payload = serde_json::json!({
+            "pipeline_id": "pipe-test",
+            "model_name": "gemma-4-e4b-q4",
+            "stage": 0,
+            "total_stages": 1,
+            "assignment_mode": "solo",
+        });
+        let parsed: AssignmentPush = serde_json::from_value(payload).expect("parse solo");
+        assert_eq!(parsed.assignment_mode.as_deref(), Some("solo"));
+        assert!(parsed.gateway_role.is_none());
+        assert!(parsed.gateway_tail_addr.is_none());
+        assert!(parsed.gateway_tail_bind.is_none());
+    }
 
     #[test]
     fn extract_request_prompt_prefers_prompt_field() {

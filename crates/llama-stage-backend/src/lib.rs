@@ -2319,6 +2319,121 @@ impl ManagedGatewayStack {
     }
 }
 
+/// A standalone tail-only stage worker (the rear half of a 2-machine split).
+/// Spawns just `llama_stage_tcp_node --tail` so a remote head can connect.
+pub struct ManagedTailNode {
+    _child: ManagedServiceChild,
+    addr: String,
+}
+
+impl ManagedTailNode {
+    pub fn spawn(
+        model_path: impl Into<PathBuf>,
+        bind_addr: impl Into<String>,
+        start_layer: u32,
+        end_layer: u32,
+        launch_spec: &ManagedGatewayLaunchSpec,
+    ) -> Result<Self> {
+        let model_path = model_path.into();
+        let bind_addr = bind_addr.into();
+        let stage_node_bin = resolve_managed_binary_path(
+            launch_spec.stage_node_bin.as_deref(),
+            "llama_stage_tcp_node",
+        )?;
+        let child = ManagedServiceChild::spawn_stage_from_bin(
+            &stage_node_bin,
+            &model_path,
+            &bind_addr,
+            "stage-tail",
+            start_layer,
+            end_layer,
+            false,
+            true,
+        )?;
+        let addr = child.addr.clone();
+        Ok(Self { _child: child, addr })
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+}
+
+/// A head + gateway stack that talks to a remote tail worker over TCP.
+/// Spawns the local head stage node and a gateway pointing at `tail_remote_addr`.
+pub struct ManagedHeadGatewayStack {
+    _head: ManagedServiceChild,
+    gateway: ManagedServiceChild,
+}
+
+impl ManagedHeadGatewayStack {
+    pub fn spawn_with_remote_tail(
+        model_path: impl Into<PathBuf>,
+        head_start_layer: u32,
+        head_end_layer: u32,
+        tail_remote_addr: impl Into<String>,
+        reconnect_after_prompt: bool,
+        launch_spec: &ManagedGatewayLaunchSpec,
+    ) -> Result<Self> {
+        let model_path = model_path.into();
+        let tail_remote_addr = tail_remote_addr.into();
+        let stage_node_bin = resolve_managed_binary_path(
+            launch_spec.stage_node_bin.as_deref(),
+            "llama_stage_tcp_node",
+        )?;
+        let gateway_bin = resolve_managed_binary_path(
+            launch_spec.gateway_bin.as_deref(),
+            "llama_stage_gateway_tcp_node",
+        )?;
+        let head_bind = launch_spec.head_bind.as_deref().unwrap_or("127.0.0.1:0");
+        let gateway_bind = launch_spec.gateway_bind.as_deref().unwrap_or("127.0.0.1:0");
+
+        let head = ManagedServiceChild::spawn_stage_from_bin(
+            &stage_node_bin,
+            &model_path,
+            head_bind,
+            "stage-head",
+            head_start_layer,
+            head_end_layer,
+            true,
+            false,
+        )?;
+        let gateway = ManagedServiceChild::spawn_gateway_from_bin(
+            &gateway_bin,
+            gateway_bind,
+            &head.addr,
+            &tail_remote_addr,
+            reconnect_after_prompt,
+        )?;
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last_err = None;
+        while Instant::now() < deadline {
+            match GatewayServiceClient::connect(&gateway.addr) {
+                Ok(_) => {
+                    return Ok(Self {
+                        _head: head,
+                        gateway,
+                    });
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+
+        let err = last_err
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "gateway did not become ready".to_string());
+        bail!("timed out waiting for head-only gateway readiness: {err}")
+    }
+
+    pub fn gateway_addr(&self) -> &str {
+        &self.gateway.addr
+    }
+}
+
 impl Drop for LlamaStageBackend {
     fn drop(&mut self) {
         let mut state = self.state.borrow_mut();

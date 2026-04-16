@@ -19,8 +19,27 @@ use crate::stage_runtime::{
     StagePrototypeClient, StagePrototypeHandle, StagePrototypeSpec, start_stage_prototype,
 };
 use llama_stage_backend::{
-    ManagedGatewayLaunchSpec, ManagedGatewayStack, default_gemma_model_path,
+    ManagedGatewayLaunchSpec, ManagedGatewayStack, ManagedHeadGatewayStack, ManagedTailNode,
+    default_gemma_model_path,
 };
+
+/// Default bind for the gateway-tail worker on a 2-machine split.
+/// The orchestrator can override via `gateway_tail_bind` on the assignment.
+const DEFAULT_GATEWAY_TAIL_BIND: &str = "0.0.0.0:9182";
+
+/// Captures whether the currently-running split-gateway role/topology already
+/// matches a fresh assignment so we don't re-spawn workers on benign repeats.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitGatewaySignature {
+    role: String,
+    pipeline_id: String,
+    model_name: String,
+    start_layer: i32,
+    end_layer: i32,
+    total_stages: i32,
+    tail_addr: Option<String>,
+    tail_bind: Option<String>,
+}
 
 fn classify_gateway_error_message(message: &str) -> (&'static str, String) {
     if message.contains("protocol mismatch") {
@@ -128,7 +147,12 @@ fn gateway_assignment_supported(
     total_stages: i32,
     assignment_mode: Option<&str>,
 ) -> bool {
-    stage == 0 && total_stages == 1 && !matches!(assignment_mode, Some("stage") | Some("rpc"))
+    // Solo (single-stage) gateway path
+    if stage == 0 && total_stages == 1 && !matches!(assignment_mode, Some("stage") | Some("rpc")) {
+        return true;
+    }
+    // 2-machine split: orchestrator picks one head and one tail by mode tag.
+    matches!(assignment_mode, Some("gateway-head") | Some("gateway-tail"))
 }
 
 fn gateway_model_path(config: &Config) -> PathBuf {
@@ -429,6 +453,10 @@ impl DaemonRuntime {
         let mut inference_mgr = InferenceManager::new();
         let mut stage_runtime: Option<StagePrototypeHandle> = None;
         let mut managed_gateway_stack: Option<ManagedGatewayStack> = None;
+        // Split-gateway state: tail-only worker on one machine, head+gateway on the other.
+        let mut managed_tail_node: Option<ManagedTailNode> = None;
+        let mut managed_head_gateway_stack: Option<ManagedHeadGatewayStack> = None;
+        let mut current_split_signature: Option<SplitGatewaySignature> = None;
         let stage_runtime_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>> =
             Arc::new(tokio::sync::Mutex::new(None));
         let gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>> =
@@ -590,6 +618,236 @@ impl DaemonRuntime {
                         *stage_runtime_client.lock().await = None;
                         inference_mgr.shutdown_server();
                         inference_mgr.set_externally_managed(true);
+
+                        let mode = assignment.assignment_mode.as_deref().unwrap_or("solo");
+
+                        match mode {
+                            "gateway-tail" => {
+                                let bind = assignment
+                                    .gateway_tail_bind
+                                    .clone()
+                                    .unwrap_or_else(|| DEFAULT_GATEWAY_TAIL_BIND.to_string());
+                                let (Some(start), Some(end)) =
+                                    (assignment.start_layer, assignment.end_layer)
+                                else {
+                                    warn!("[gateway-tail] missing layer bounds; skipping assignment");
+                                    continue;
+                                };
+
+                                let signature = SplitGatewaySignature {
+                                    role: "tail".to_string(),
+                                    pipeline_id: assignment.pipeline_id.clone(),
+                                    model_name: assignment.model_name.clone(),
+                                    start_layer: start,
+                                    end_layer: end,
+                                    total_stages: assignment.total_stages,
+                                    tail_addr: None,
+                                    tail_bind: Some(bind.clone()),
+                                };
+
+                                let already_matches = managed_tail_node.is_some()
+                                    && current_split_signature
+                                        .as_ref()
+                                        .map(|sig| sig == &signature)
+                                        .unwrap_or(false);
+
+                                if !already_matches {
+                                    // Drop any prior gateway state — both the
+                                    // split topology and the local solo stack.
+                                    managed_head_gateway_stack = None;
+                                    managed_tail_node = None;
+                                    managed_gateway_stack = None;
+                                    *gateway_client.lock().await = None;
+
+                                    let model_path = gateway_model_path(&self.config);
+                                    let launch_spec = gateway_launch_spec(&self.config);
+                                    info!(
+                                        "[gateway-tail] Spawning tail worker on {bind} layers {start}-{end} model={}",
+                                        model_path.display()
+                                    );
+                                    match ManagedTailNode::spawn(
+                                        model_path.clone(),
+                                        bind.clone(),
+                                        start as u32,
+                                        end as u32,
+                                        &launch_spec,
+                                    ) {
+                                        Ok(node) => {
+                                            info!(
+                                                "[gateway-tail] Tail listening on {} (announced)",
+                                                node.addr()
+                                            );
+                                            managed_tail_node = Some(node);
+                                            current_split_signature = Some(signature);
+                                            let msg = serde_json::json!({
+                                                "type": "node_ready",
+                                                "model_name": assignment.model_name,
+                                            })
+                                            .to_string();
+                                            let _ = ws_outbound_tx.send(msg).await;
+                                        }
+                                        Err(err) => {
+                                            warn!("[gateway-tail] spawn failed: {err}");
+                                            let msg = serde_json::json!({
+                                                "type": "node_error",
+                                                "model_name": assignment.model_name,
+                                                "error": format!("gateway-tail spawn failed: {err}"),
+                                            })
+                                            .to_string();
+                                            let _ = ws_outbound_tx.send(msg).await;
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    let msg = serde_json::json!({
+                                        "type": "node_ready",
+                                        "model_name": assignment.model_name,
+                                    })
+                                    .to_string();
+                                    let _ = ws_outbound_tx.send(msg).await;
+                                }
+
+                                self.update_state(|state| {
+                                    state.pipeline.active = true;
+                                    state.pipeline.stage = Some(assignment.stage as u32);
+                                    state.pipeline.total_stages =
+                                        Some(assignment.total_stages as u32);
+                                    state.pipeline.model = Some(assignment.model_name.clone());
+                                    state.inference_status = "llama-stage-gateway-tail".into();
+                                });
+                                continue;
+                            }
+                            "gateway-head" => {
+                                let Some(tail_addr) = assignment.gateway_tail_addr.clone() else {
+                                    warn!("[gateway-head] assignment missing gateway_tail_addr");
+                                    let msg = serde_json::json!({
+                                        "type": "node_error",
+                                        "model_name": assignment.model_name,
+                                        "error": "gateway-head assignment missing gateway_tail_addr",
+                                    })
+                                    .to_string();
+                                    let _ = ws_outbound_tx.send(msg).await;
+                                    continue;
+                                };
+                                let (Some(start), Some(end)) =
+                                    (assignment.start_layer, assignment.end_layer)
+                                else {
+                                    warn!("[gateway-head] missing layer bounds; skipping assignment");
+                                    continue;
+                                };
+
+                                let signature = SplitGatewaySignature {
+                                    role: "head".to_string(),
+                                    pipeline_id: assignment.pipeline_id.clone(),
+                                    model_name: assignment.model_name.clone(),
+                                    start_layer: start,
+                                    end_layer: end,
+                                    total_stages: assignment.total_stages,
+                                    tail_addr: Some(tail_addr.clone()),
+                                    tail_bind: None,
+                                };
+
+                                let already_matches = managed_head_gateway_stack.is_some()
+                                    && current_split_signature
+                                        .as_ref()
+                                        .map(|sig| sig == &signature)
+                                        .unwrap_or(false)
+                                    && gateway_client.lock().await.is_some();
+
+                                if !already_matches {
+                                    // Drop any prior split-gateway state and the local gateway stack.
+                                    managed_tail_node = None;
+                                    managed_head_gateway_stack = None;
+                                    managed_gateway_stack = None;
+                                    *gateway_client.lock().await = None;
+
+                                    let model_path = gateway_model_path(&self.config);
+                                    let launch_spec = gateway_launch_spec(&self.config);
+                                    info!(
+                                        "[gateway-head] Spawning head + remote-tail gateway head_layers={start}-{end} tail={tail_addr} model={}",
+                                        model_path.display()
+                                    );
+                                    match ManagedHeadGatewayStack::spawn_with_remote_tail(
+                                        model_path.clone(),
+                                        start as u32,
+                                        end as u32,
+                                        tail_addr.clone(),
+                                        false,
+                                        &launch_spec,
+                                    ) {
+                                        Ok(stack) => {
+                                            let addr = stack.gateway_addr().to_string();
+                                            info!(
+                                                "[gateway-head] gateway listening on {addr}; connecting relay client"
+                                            );
+                                            managed_head_gateway_stack = Some(stack);
+                                            current_split_signature = Some(signature);
+
+                                            match LlamaStageGatewayRelayClient::connect_with_timeout(
+                                                &addr,
+                                                Some(gateway_connect_timeout(&self.config)),
+                                            ) {
+                                                Ok(client) => {
+                                                    *gateway_client.lock().await = Some(client.clone());
+                                                    send_gateway_ready_or_error(
+                                                        Ok(client),
+                                                        &assignment.model_name,
+                                                        &ws_outbound_tx,
+                                                    )
+                                                    .await;
+                                                }
+                                                Err(err) => {
+                                                    warn!("[gateway-head] relay client connect failed: {err}");
+                                                    let msg = serde_json::json!({
+                                                        "type": "node_error",
+                                                        "model_name": assignment.model_name,
+                                                        "error": format!("gateway-head relay client failed: {err}"),
+                                                    })
+                                                    .to_string();
+                                                    let _ = ws_outbound_tx.send(msg).await;
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            warn!("[gateway-head] spawn failed: {err}");
+                                            let msg = serde_json::json!({
+                                                "type": "node_error",
+                                                "model_name": assignment.model_name,
+                                                "error": format!("gateway-head spawn failed: {err}"),
+                                            })
+                                            .to_string();
+                                            let _ = ws_outbound_tx.send(msg).await;
+                                            continue;
+                                        }
+                                    }
+                                } else if let Some(client) = gateway_client.lock().await.clone() {
+                                    send_gateway_ready_or_error(
+                                        Ok(client),
+                                        &assignment.model_name,
+                                        &ws_outbound_tx,
+                                    )
+                                    .await;
+                                }
+
+                                self.update_state(|state| {
+                                    state.pipeline.active = true;
+                                    state.pipeline.stage = Some(assignment.stage as u32);
+                                    state.pipeline.total_stages =
+                                        Some(assignment.total_stages as u32);
+                                    state.pipeline.model = Some(assignment.model_name.clone());
+                                    state.inference_status = "llama-stage-gateway-head".into();
+                                });
+                                continue;
+                            }
+                            _ => {}
+                        }
+
+                        // Solo path: shut down any split-gateway state and use the
+                        // local 3-process gateway stack.
+                        managed_tail_node = None;
+                        managed_head_gateway_stack = None;
+                        current_split_signature = None;
 
                         self.update_state(|state| {
                             state.pipeline.active = true;

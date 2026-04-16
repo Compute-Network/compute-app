@@ -1092,6 +1092,7 @@ mod tests {
             hidden_state_bytes: Some(2048),
             hidden_dim: Some(2048),
             hidden_state: vec![7; 2048],
+            token_ids: Vec::new(),
         };
         let activation = Activation {
             request_id: "req".into(),
