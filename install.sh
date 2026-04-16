@@ -163,8 +163,10 @@ fi
 
 # Move any bundled shared libraries (libllama.dylib / libggml.dylib / .so)
 # next to the binaries so the sidecars can dlopen them via @loader_path.
+# -e fails for broken symlinks (whose targets we already moved earlier in the
+# loop), so accept either an existing path or a symlink.
 for libfile in "${TMPDIR}"/*.dylib "${TMPDIR}"/*.so "${TMPDIR}"/*.so.*; do
-  [ -e "$libfile" ] || continue
+  [ -e "$libfile" ] || [ -L "$libfile" ] || continue
   base=$(basename "$libfile")
   mv "$libfile" "${INSTALL_DIR}/${base}"
   echo "  ${GREEN}✓${RESET} Installed ${DIM}${base}${RESET}"
