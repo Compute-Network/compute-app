@@ -76,6 +76,8 @@ pub struct HeartbeatPayload {
     pub last_heartbeat: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_backend_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

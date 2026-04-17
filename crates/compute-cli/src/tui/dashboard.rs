@@ -366,6 +366,9 @@ impl Dashboard {
                     KeyCode::Enter if self.active_tab == Tab::Models => {
                         self.select_model();
                     }
+                    KeyCode::Char('d') if self.active_tab == Tab::Models => {
+                        self.delete_model();
+                    }
                     KeyCode::Tab => {
                         self.active_tab = match self.active_tab {
                             Tab::Overview => Tab::Logs,
@@ -1533,6 +1536,45 @@ impl Dashboard {
         });
     }
 
+    fn delete_model(&mut self) {
+        let models = model_entries();
+        let entry = match models.get(self.models_selected) {
+            Some(e) => e,
+            None => return,
+        };
+
+        if entry.id == "auto" || entry.gguf_filename.is_empty() {
+            return;
+        }
+
+        if self.models_downloading.is_some() {
+            return;
+        }
+
+        let path = if is_stage_entry(entry.id) {
+            stage_shard_path(entry.gguf_filename)
+        } else {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".compute")
+                .join("models")
+                .join(entry.gguf_filename)
+        };
+
+        let tmp = path.with_extension("tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&path);
+
+        // If we just deleted the active full model, fall back to auto.
+        if !is_stage_entry(entry.id) {
+            let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+            if config.models.active_model == entry.id {
+                config.models.active_model = "auto".into();
+                let _ = config.save();
+            }
+        }
+    }
+
     fn draw_models_panel(&self, frame: &mut Frame, area: Rect) {
         let p = theme::palette();
         let chunks = Layout::default()
@@ -1646,7 +1688,9 @@ impl Dashboard {
             Span::styled("↑↓", Style::default().fg(p.dim)),
             Span::styled(" navigate  ", Style::default().fg(p.dim)),
             Span::styled("↵", Style::default().fg(p.dim)),
-            Span::styled(" select", Style::default().fg(p.dim)),
+            Span::styled(" select  ", Style::default().fg(p.dim)),
+            Span::styled("d", Style::default().fg(p.dim)),
+            Span::styled(" delete", Style::default().fg(p.dim)),
         ]));
         frame.render_widget(footer, chunks[2]);
     }

@@ -334,9 +334,7 @@ impl LlamaModelHandle {
         let force_cpu = std::env::var_os("LLAMA_STAGE_FORCE_CPU").is_some();
 
         let mut cparams = unsafe { (api.context_default_params)() };
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(4);
+        let threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
         cparams.n_ctx = 8192;
         cparams.n_batch = 2048;
         cparams.n_ubatch = 2048;
@@ -399,11 +397,7 @@ impl OwnedBatch {
             seq_id: std::ptr::null_mut(),
             logits: std::ptr::null_mut(),
         };
-        Self {
-            _tokens: Some(tokens),
-            _embd: None,
-            raw,
-        }
+        Self { _tokens: Some(tokens), _embd: None, raw }
     }
 
     fn token_and_hidden(tokens: Option<Vec<i32>>, hidden: Vec<f32>, token_count: usize) -> Self {
@@ -424,11 +418,7 @@ impl OwnedBatch {
             logits: std::ptr::null_mut(),
         };
 
-        Self {
-            _tokens: token_buf,
-            _embd: Some(embd),
-            raw,
-        }
+        Self { _tokens: token_buf, _embd: Some(embd), raw }
     }
 }
 
@@ -483,36 +473,14 @@ pub struct GreedyCompletion {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum StageNodeRequest {
     Info,
-    Tokenize {
-        text: String,
-    },
-    BeginPrompt {
-        request_id: String,
-        prompt: String,
-        max_tokens: Option<u32>,
-    },
-    ContinueHeadTokens {
-        request_id: String,
-        token_ids: Vec<i32>,
-        max_tokens: Option<u32>,
-    },
-    ContinueForward {
-        tensor: StageTensor,
-    },
-    ContinueForwardTokens {
-        tensor: StageTensor,
-        token_ids: Vec<i32>,
-        clear_memory: bool,
-    },
-    SampleTail {
-        tensor: StageTensor,
-    },
-    SampleTailToken {
-        tensor: StageTensor,
-    },
-    ClearDecodeSession {
-        request_id: String,
-    },
+    Tokenize { text: String },
+    BeginPrompt { request_id: String, prompt: String, max_tokens: Option<u32> },
+    ContinueHeadTokens { request_id: String, token_ids: Vec<i32>, max_tokens: Option<u32> },
+    ContinueForward { tensor: StageTensor },
+    ContinueForwardTokens { tensor: StageTensor, token_ids: Vec<i32>, clear_memory: bool },
+    SampleTail { tensor: StageTensor },
+    SampleTailToken { tensor: StageTensor },
+    ClearDecodeSession { request_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -622,41 +590,19 @@ pub struct RemoteStageGateway {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum GatewayStep {
-    Token {
-        request_id: String,
-        sample: GreedyTokenSample,
-        text: String,
-        token_ids: Vec<i32>,
-    },
-    Complete {
-        request_id: String,
-        completion: RemoteStageCompletion,
-    },
+    Token { request_id: String, sample: GreedyTokenSample, text: String, token_ids: Vec<i32> },
+    Complete { request_id: String, completion: RemoteStageCompletion },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum StageGatewayRequest {
     Info,
-    Tokenize {
-        text: String,
-    },
-    Complete {
-        request_id: String,
-        prompt: String,
-        max_tokens: u32,
-    },
-    BeginCompletion {
-        request_id: String,
-        prompt: String,
-        max_tokens: u32,
-    },
-    StepCompletion {
-        request_id: String,
-    },
-    ClearCompletion {
-        request_id: String,
-    },
+    Tokenize { text: String },
+    Complete { request_id: String, prompt: String, max_tokens: u32 },
+    BeginCompletion { request_id: String, prompt: String, max_tokens: u32 },
+    StepCompletion { request_id: String },
+    ClearCompletion { request_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -769,28 +715,27 @@ impl GatewayServiceClient {
     }
 
     pub fn step_completion(&mut self, request_id: impl Into<String>) -> Result<GatewayStep> {
-        match self.client.request(&StageGatewayRequest::StepCompletion {
-            request_id: request_id.into(),
-        })? {
+        match self
+            .client
+            .request(&StageGatewayRequest::StepCompletion { request_id: request_id.into() })?
+        {
             StageGatewayResponse::Step { step } => Ok(step),
             other => bail!("expected step response, got {other:?}"),
         }
     }
 
     pub fn clear_completion(&mut self, request_id: impl Into<String>) -> Result<()> {
-        match self.client.request(&StageGatewayRequest::ClearCompletion {
-            request_id: request_id.into(),
-        })? {
+        match self
+            .client
+            .request(&StageGatewayRequest::ClearCompletion { request_id: request_id.into() })?
+        {
             StageGatewayResponse::Ack => Ok(()),
             other => bail!("expected ack response, got {other:?}"),
         }
     }
 
     pub fn tokenize(&mut self, text: impl Into<String>) -> Result<Vec<i32>> {
-        match self
-            .client
-            .request(&StageGatewayRequest::Tokenize { text: text.into() })?
-        {
+        match self.client.request(&StageGatewayRequest::Tokenize { text: text.into() })? {
             StageGatewayResponse::TokenIds { token_ids } => Ok(token_ids),
             other => bail!("expected token_ids response, got {other:?}"),
         }
@@ -812,26 +757,22 @@ pub fn handle_gateway_service_client_request(
             tail_info: client.info.tail_info.clone(),
             reconnect_after_prompt: client.info.reconnect_after_prompt,
         }),
-        StageGatewayRequest::Tokenize { text } => Ok(StageGatewayResponse::TokenIds {
-            token_ids: client.tokenize(text)?,
-        }),
-        StageGatewayRequest::Complete {
-            request_id,
-            prompt,
-            max_tokens,
-        } => Ok(StageGatewayResponse::Completion {
-            completion: client.complete(request_id, prompt, max_tokens)?,
-        }),
-        StageGatewayRequest::BeginCompletion {
-            request_id,
-            prompt,
-            max_tokens,
-        } => Ok(StageGatewayResponse::Started {
-            request_id: client.begin_completion(request_id, prompt, max_tokens)?,
-        }),
-        StageGatewayRequest::StepCompletion { request_id } => Ok(StageGatewayResponse::Step {
-            step: client.step_completion(request_id)?,
-        }),
+        StageGatewayRequest::Tokenize { text } => {
+            Ok(StageGatewayResponse::TokenIds { token_ids: client.tokenize(text)? })
+        }
+        StageGatewayRequest::Complete { request_id, prompt, max_tokens } => {
+            Ok(StageGatewayResponse::Completion {
+                completion: client.complete(request_id, prompt, max_tokens)?,
+            })
+        }
+        StageGatewayRequest::BeginCompletion { request_id, prompt, max_tokens } => {
+            Ok(StageGatewayResponse::Started {
+                request_id: client.begin_completion(request_id, prompt, max_tokens)?,
+            })
+        }
+        StageGatewayRequest::StepCompletion { request_id } => {
+            Ok(StageGatewayResponse::Step { step: client.step_completion(request_id)? })
+        }
         StageGatewayRequest::ClearCompletion { request_id } => {
             client.clear_completion(request_id)?;
             Ok(StageGatewayResponse::Ack)
@@ -840,9 +781,7 @@ pub fn handle_gateway_service_client_request(
 
     match result {
         Ok(response) => response,
-        Err(err) => StageGatewayResponse::Error {
-            message: err.to_string(),
-        },
+        Err(err) => StageGatewayResponse::Error { message: err.to_string() },
     }
 }
 
@@ -864,10 +803,7 @@ impl LlamaStageBackend {
     }
 
     fn layout<'a>(&self, state: &'a BackendState) -> Result<&'a StageLayout> {
-        state
-            .layout
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no stage layout loaded"))
+        state.layout.as_ref().ok_or_else(|| anyhow::anyhow!("no stage layout loaded"))
     }
 
     fn ensure_model<'a>(&'a self, state: &'a mut BackendState) -> Result<&'a LlamaModelHandle> {
@@ -936,23 +872,13 @@ impl LlamaStageBackend {
             state.model = Some(LlamaModelHandle::new(&self.api, &self.model_path)?);
         }
         if !state.sessions.contains_key(request_id) {
-            let session = state
-                .model
-                .as_ref()
-                .expect("model initialized")
-                .create_session(&self.api)?;
-            state.sessions.insert(
-                request_id.to_string(),
-                SessionState {
-                    session,
-                    cached_sample: None,
-                },
-            );
+            let session =
+                state.model.as_ref().expect("model initialized").create_session(&self.api)?;
+            state
+                .sessions
+                .insert(request_id.to_string(), SessionState { session, cached_sample: None });
         }
-        Ok(state
-            .sessions
-            .get_mut(request_id)
-            .expect("session initialized"))
+        Ok(state.sessions.get_mut(request_id).expect("session initialized"))
     }
 
     fn clear_decode_session_inner(state: &mut BackendState, api: &LlamaApi, request_id: &str) {
@@ -1015,11 +941,7 @@ impl LlamaStageBackend {
             .iter()
             .copied()
             .enumerate()
-            .max_by(|lhs, rhs| {
-                lhs.1
-                    .partial_cmp(&rhs.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .max_by(|lhs, rhs| lhs.1.partial_cmp(&rhs.1).unwrap_or(std::cmp::Ordering::Equal))
             .context("empty logits buffer")?;
 
         let token_id = token_id as i32;
@@ -1056,10 +978,7 @@ impl LlamaStageBackend {
             bail!("token_to_piece failed for token {}", token);
         }
 
-        let bytes = buf[..n as usize]
-            .iter()
-            .map(|b| *b as u8)
-            .collect::<Vec<u8>>();
+        let bytes = buf[..n as usize].iter().map(|b| *b as u8).collect::<Vec<u8>>();
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
@@ -1096,10 +1015,7 @@ impl LlamaStageBackend {
         let mut state = self.state.borrow_mut();
         let layout = self.layout(&state)?.clone();
         if !layout.is_head {
-            bail!(
-                "head token ingress called on non-head stage {}",
-                layout.stage_id
-            );
+            bail!("head token ingress called on non-head stage {}", layout.stage_id);
         }
 
         let hidden_dim = self.ensure_model(&mut state)?.hidden_dim(&self.api);
@@ -1111,11 +1027,7 @@ impl LlamaStageBackend {
 
         let batch = OwnedBatch::token_only(token_ids.clone());
         let rc = unsafe {
-            (self.api.decode_head)(
-                session_state.session.ctx,
-                batch.raw,
-                layout.end_layer as i32,
-            )
+            (self.api.decode_head)(session_state.session.ctx, batch.raw, layout.end_layer as i32)
         };
         if rc != 0 && rc != 1 {
             bail!("llama_decode_head failed with {}", rc);
@@ -1424,10 +1336,7 @@ fn connect_tcp_stream(addr: &str, timeout: Option<Duration>) -> Result<TcpStream
                 .next()
                 .with_context(|| format!("no socket addresses resolved for {addr}"))?;
             TcpStream::connect_timeout(&socket_addr, timeout).with_context(|| {
-                format!(
-                    "connecting to {addr} with timeout {}ms",
-                    timeout.as_millis()
-                )
+                format!("connecting to {addr} with timeout {}ms", timeout.as_millis())
             })
         }
         None => TcpStream::connect(addr).with_context(|| format!("connecting to {addr}")),
@@ -1438,10 +1347,7 @@ impl RemoteStageNodeClient {
     pub fn connect(addr: impl Into<String>) -> Result<Self> {
         let addr = addr.into();
         let client = TcpStageClient::connect(&addr)?;
-        Ok(Self {
-            addr,
-            client: Some(client),
-        })
+        Ok(Self { addr, client: Some(client) })
     }
 
     fn ensure_client(&mut self) -> Result<&mut TcpStageClient> {
@@ -1510,8 +1416,12 @@ impl RemoteStagePair {
             );
         }
         if head_info.end_layer + 1 != tail_info.start_layer {
-            bail!(
-                "head/tail layer ranges are not contiguous: {}-{} then {}-{}",
+            // With per-stage shards each side renumbers its layers locally
+            // (e.g., both report 0..N-1). The decode functions only need each
+            // shard's own local indices, so a non-contiguous report is fine
+            // as long as the model_ids and hidden dims line up.
+            eprintln!(
+                "[gateway] note: head/tail layer ranges not contiguous in advertised indices: {}-{} then {}-{} (assuming per-stage shards)",
                 head_info.start_layer,
                 head_info.end_layer,
                 tail_info.start_layer,
@@ -1519,12 +1429,7 @@ impl RemoteStagePair {
             );
         }
 
-        Ok(Self {
-            head,
-            tail,
-            head_info,
-            tail_info,
-        })
+        Ok(Self { head, tail, head_info, tail_info })
     }
 
     pub fn reconnect(&mut self) -> Result<()> {
@@ -1565,12 +1470,11 @@ impl RemoteStagePair {
 
         self.clear_decode_session(&request_id)?;
 
-        let prompt_tokens = match self.head.request(&StageNodeRequest::Tokenize {
-            text: prompt.to_string(),
-        })? {
-            StageNodeResponse::TokenIds { token_ids } => token_ids,
-            other => bail!("expected token_ids response, got {other:?}"),
-        };
+        let prompt_tokens =
+            match self.head.request(&StageNodeRequest::Tokenize { text: prompt.to_string() })? {
+                StageNodeResponse::TokenIds { token_ids } => token_ids,
+                other => bail!("expected token_ids response, got {other:?}"),
+            };
 
         let t_head = std::time::Instant::now();
         let mut head_tensor = match self.head.request(&StageNodeRequest::BeginPrompt {
@@ -1585,13 +1489,11 @@ impl RemoteStagePair {
         let transfer_bytes = head_tensor.bytes.len();
 
         let t_tail = std::time::Instant::now();
-        let mut tail_tensor = match self
-            .tail
-            .request(&StageNodeRequest::ContinueForwardTokens {
-                tensor: head_tensor.clone(),
-                token_ids: prompt_tokens,
-                clear_memory: true,
-            })? {
+        let mut tail_tensor = match self.tail.request(&StageNodeRequest::ContinueForwardTokens {
+            tensor: head_tensor.clone(),
+            token_ids: prompt_tokens,
+            clear_memory: true,
+        })? {
             StageNodeResponse::Tensor { tensor } => tensor,
             other => bail!("expected tensor response, got {other:?}"),
         };
@@ -1609,9 +1511,10 @@ impl RemoteStagePair {
 
         for step in 0..max_tokens {
             let t_sample = std::time::Instant::now();
-            let sampled = match self.tail.request(&StageNodeRequest::SampleTailToken {
-                tensor: tail_tensor.clone(),
-            })? {
+            let sampled = match self
+                .tail
+                .request(&StageNodeRequest::SampleTailToken { tensor: tail_tensor.clone() })?
+            {
                 StageNodeResponse::TokenSample { sample } => sample,
                 other => bail!("expected token_sample response, got {other:?}"),
             };
@@ -1636,13 +1539,11 @@ impl RemoteStagePair {
             head_decode_ms_total += t_head_step.elapsed().as_millis() as u64;
 
             let t_tail_step = std::time::Instant::now();
-            tail_tensor = match self
-                .tail
-                .request(&StageNodeRequest::ContinueForwardTokens {
-                    tensor: head_tensor.clone(),
-                    token_ids: vec![sampled.token_id],
-                    clear_memory: false,
-                })? {
+            tail_tensor = match self.tail.request(&StageNodeRequest::ContinueForwardTokens {
+                tensor: head_tensor.clone(),
+                token_ids: vec![sampled.token_id],
+                clear_memory: false,
+            })? {
                 StageNodeResponse::Tensor { tensor } => tensor,
                 other => bail!("expected tensor response, got {other:?}"),
             };
@@ -1715,9 +1616,11 @@ impl RemoteStageGateway {
 
         self.pair.clear_decode_session(request_id)?;
 
-        let prompt_tokens = match self.pair.head.request(&StageNodeRequest::Tokenize {
-            text: prompt.to_string(),
-        })? {
+        let prompt_tokens = match self
+            .pair
+            .head
+            .request(&StageNodeRequest::Tokenize { text: prompt.to_string() })?
+        {
             StageNodeResponse::TokenIds { token_ids } => token_ids,
             other => bail!("expected token_ids response, got {other:?}"),
         };
@@ -1736,14 +1639,11 @@ impl RemoteStageGateway {
 
         let t_tail = std::time::Instant::now();
         let tail_tensor =
-            match self
-                .pair
-                .tail
-                .request(&StageNodeRequest::ContinueForwardTokens {
-                    tensor: head_tensor.clone(),
-                    token_ids: prompt_tokens,
-                    clear_memory: true,
-                })? {
+            match self.pair.tail.request(&StageNodeRequest::ContinueForwardTokens {
+                tensor: head_tensor.clone(),
+                token_ids: prompt_tokens,
+                clear_memory: true,
+            })? {
                 StageNodeResponse::Tensor { tensor } => tensor,
                 other => bail!("expected tensor response, got {other:?}"),
             };
@@ -1784,12 +1684,13 @@ impl RemoteStageGateway {
             .with_context(|| format!("no completion session for request_id {request_id}"))?;
 
         let t_sample = std::time::Instant::now();
-        let sampled = match self.pair.tail.request(&StageNodeRequest::SampleTailToken {
-            tensor: session.tail_tensor.clone(),
-        })? {
-            StageNodeResponse::TokenSample { sample } => sample,
-            other => bail!("expected token_sample response, got {other:?}"),
-        };
+        let sampled =
+            match self.pair.tail.request(&StageNodeRequest::SampleTailToken {
+                tensor: session.tail_tensor.clone(),
+            })? {
+                StageNodeResponse::TokenSample { sample } => sample,
+                other => bail!("expected token_sample response, got {other:?}"),
+            };
         session.timings.sample_ms += t_sample.elapsed().as_millis() as u64;
 
         session.text.push_str(&sampled.piece);
@@ -1811,22 +1712,16 @@ impl RemoteStageGateway {
                 timings: session.timings,
             };
             self.pair.clear_decode_session(request_id)?;
-            return Ok(GatewayStep::Complete {
-                request_id: request_id.to_string(),
-                completion,
-            });
+            return Ok(GatewayStep::Complete { request_id: request_id.to_string(), completion });
         }
 
         let t_head = std::time::Instant::now();
         session.head_tensor =
-            match self
-                .pair
-                .head
-                .request(&StageNodeRequest::ContinueHeadTokens {
-                    request_id: request_id.to_string(),
-                    token_ids: vec![sampled.token_id],
-                    max_tokens: Some(session.max_tokens),
-                })? {
+            match self.pair.head.request(&StageNodeRequest::ContinueHeadTokens {
+                request_id: request_id.to_string(),
+                token_ids: vec![sampled.token_id],
+                max_tokens: Some(session.max_tokens),
+            })? {
                 StageNodeResponse::Tensor { tensor } => tensor,
                 other => bail!("expected tensor response, got {other:?}"),
             };
@@ -1834,14 +1729,11 @@ impl RemoteStageGateway {
 
         let t_tail = std::time::Instant::now();
         session.tail_tensor =
-            match self
-                .pair
-                .tail
-                .request(&StageNodeRequest::ContinueForwardTokens {
-                    tensor: session.head_tensor.clone(),
-                    token_ids: vec![sampled.token_id],
-                    clear_memory: false,
-                })? {
+            match self.pair.tail.request(&StageNodeRequest::ContinueForwardTokens {
+                tensor: session.head_tensor.clone(),
+                token_ids: vec![sampled.token_id],
+                clear_memory: false,
+            })? {
                 StageNodeResponse::Tensor { tensor } => tensor,
                 other => bail!("expected tensor response, got {other:?}"),
             };
@@ -1887,33 +1779,25 @@ pub fn handle_stage_gateway_request(
             reconnect_after_prompt: gateway.reconnect_after_prompt(),
         }),
         StageGatewayRequest::Tokenize { text } => Ok(StageGatewayResponse::TokenIds {
-            token_ids: gateway
-                .pair
-                .head
-                .request(&StageNodeRequest::Tokenize { text })
-                .and_then(|response| match response {
+            token_ids: gateway.pair.head.request(&StageNodeRequest::Tokenize { text }).and_then(
+                |response| match response {
                     StageNodeResponse::TokenIds { token_ids } => Ok(token_ids),
                     other => bail!("expected token_ids response, got {other:?}"),
-                })?,
+                },
+            )?,
         }),
-        StageGatewayRequest::Complete {
-            request_id,
-            prompt,
-            max_tokens,
-        } => Ok(StageGatewayResponse::Completion {
-            completion: gateway.complete(&request_id, &prompt, max_tokens)?,
-        }),
-        StageGatewayRequest::BeginCompletion {
-            request_id,
-            prompt,
-            max_tokens,
-        } => {
+        StageGatewayRequest::Complete { request_id, prompt, max_tokens } => {
+            Ok(StageGatewayResponse::Completion {
+                completion: gateway.complete(&request_id, &prompt, max_tokens)?,
+            })
+        }
+        StageGatewayRequest::BeginCompletion { request_id, prompt, max_tokens } => {
             gateway.begin_completion(&request_id, &prompt, max_tokens)?;
             Ok(StageGatewayResponse::Started { request_id })
         }
-        StageGatewayRequest::StepCompletion { request_id } => Ok(StageGatewayResponse::Step {
-            step: gateway.step_completion(&request_id)?,
-        }),
+        StageGatewayRequest::StepCompletion { request_id } => {
+            Ok(StageGatewayResponse::Step { step: gateway.step_completion(&request_id)? })
+        }
         StageGatewayRequest::ClearCompletion { request_id } => {
             gateway.clear_completion(&request_id)?;
             Ok(StageGatewayResponse::Ack)
@@ -1922,9 +1806,7 @@ pub fn handle_stage_gateway_request(
 
     match result {
         Ok(response) => response,
-        Err(err) => StageGatewayResponse::Error {
-            message: err.to_string(),
-        },
+        Err(err) => StageGatewayResponse::Error { message: err.to_string() },
     }
 }
 
@@ -1933,42 +1815,34 @@ pub fn handle_stage_node_request(
     request: StageNodeRequest,
 ) -> StageNodeResponse {
     let result: Result<StageNodeResponse> = (|| match request {
-        StageNodeRequest::Info => Ok(StageNodeResponse::Info {
-            info: backend.node_info()?,
-        }),
-        StageNodeRequest::Tokenize { text } => Ok(StageNodeResponse::TokenIds {
-            token_ids: backend.tokenize(&text)?,
-        }),
-        StageNodeRequest::BeginPrompt {
-            request_id,
-            prompt,
-            max_tokens,
-        } => Ok(StageNodeResponse::Tensor {
-            tensor: backend.begin_prompt_session(&request_id, &prompt, max_tokens)?,
-        }),
-        StageNodeRequest::ContinueHeadTokens {
-            request_id,
-            token_ids,
-            max_tokens,
-        } => Ok(StageNodeResponse::Tensor {
-            tensor: backend.continue_head_tokens(&request_id, token_ids, max_tokens)?,
-        }),
-        StageNodeRequest::ContinueForward { tensor } => Ok(StageNodeResponse::Tensor {
-            tensor: backend.continue_forward(tensor)?,
-        }),
-        StageNodeRequest::ContinueForwardTokens {
-            tensor,
-            token_ids,
-            clear_memory,
-        } => Ok(StageNodeResponse::Tensor {
-            tensor: backend.continue_forward_with_tokens(tensor, token_ids, clear_memory)?,
-        }),
-        StageNodeRequest::SampleTail { tensor } => Ok(StageNodeResponse::Sample {
-            sample: backend.sample_tail(tensor)?,
-        }),
-        StageNodeRequest::SampleTailToken { tensor } => Ok(StageNodeResponse::TokenSample {
-            sample: backend.sample_tail_token(tensor)?,
-        }),
+        StageNodeRequest::Info => Ok(StageNodeResponse::Info { info: backend.node_info()? }),
+        StageNodeRequest::Tokenize { text } => {
+            Ok(StageNodeResponse::TokenIds { token_ids: backend.tokenize(&text)? })
+        }
+        StageNodeRequest::BeginPrompt { request_id, prompt, max_tokens } => {
+            Ok(StageNodeResponse::Tensor {
+                tensor: backend.begin_prompt_session(&request_id, &prompt, max_tokens)?,
+            })
+        }
+        StageNodeRequest::ContinueHeadTokens { request_id, token_ids, max_tokens } => {
+            Ok(StageNodeResponse::Tensor {
+                tensor: backend.continue_head_tokens(&request_id, token_ids, max_tokens)?,
+            })
+        }
+        StageNodeRequest::ContinueForward { tensor } => {
+            Ok(StageNodeResponse::Tensor { tensor: backend.continue_forward(tensor)? })
+        }
+        StageNodeRequest::ContinueForwardTokens { tensor, token_ids, clear_memory } => {
+            Ok(StageNodeResponse::Tensor {
+                tensor: backend.continue_forward_with_tokens(tensor, token_ids, clear_memory)?,
+            })
+        }
+        StageNodeRequest::SampleTail { tensor } => {
+            Ok(StageNodeResponse::Sample { sample: backend.sample_tail(tensor)? })
+        }
+        StageNodeRequest::SampleTailToken { tensor } => {
+            Ok(StageNodeResponse::TokenSample { sample: backend.sample_tail_token(tensor)? })
+        }
         StageNodeRequest::ClearDecodeSession { request_id } => {
             backend.clear_decode_session(&request_id)?;
             Ok(StageNodeResponse::Ack)
@@ -1977,9 +1851,7 @@ pub fn handle_stage_node_request(
 
     match result {
         Ok(response) => response,
-        Err(err) => StageNodeResponse::Error {
-            message: err.to_string(),
-        },
+        Err(err) => StageNodeResponse::Error { message: err.to_string() },
     }
 }
 
@@ -2032,11 +1904,7 @@ fn resolve_vendor_lib_dir() -> Result<PathBuf> {
 
     if let Ok(exe) = env::current_exe() {
         if let Some(parent) = exe.parent() {
-            for candidate in [
-                parent.to_path_buf(),
-                parent.join("lib"),
-                parent.join("../lib"),
-            ] {
+            for candidate in [parent.to_path_buf(), parent.join("lib"), parent.join("../lib")] {
                 if dir_has_libllama(&candidate) {
                     return Ok(candidate);
                 }
@@ -2120,15 +1988,32 @@ fn resolve_managed_binary_path(explicit: Option<&Path>, name: &str) -> Result<Pa
 fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
     let mut reader = BufReader::new(stderr);
     let mut line = String::new();
+    let mut captured: Vec<String> = Vec::new();
     loop {
         line.clear();
         let read = reader.read_line(&mut line)?;
         if read == 0 {
-            bail!("child exited before announcing listening address");
+            let tail = captured
+                .iter()
+                .rev()
+                .take(20)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if tail.is_empty() {
+                bail!("child exited before announcing listening address (stderr was empty)");
+            }
+            bail!(
+                "child exited before announcing listening address; last stderr lines: {tail}"
+            );
         }
         let trimmed = line.trim();
         if let Some(addr) = trimmed.strip_prefix("listening=") {
             return Ok(addr.to_string());
+        }
+        if !trimmed.is_empty() {
+            captured.push(trimmed.to_string());
         }
     }
 }
@@ -2295,11 +2180,7 @@ impl ManagedGatewayStack {
         while Instant::now() < deadline {
             match GatewayServiceClient::connect(&gateway.addr) {
                 Ok(_) => {
-                    return Ok(Self {
-                        _head: head,
-                        _tail: tail,
-                        gateway,
-                    });
+                    return Ok(Self { _head: head, _tail: tail, gateway });
                 }
                 Err(err) => {
                     last_err = Some(err);
@@ -2411,10 +2292,7 @@ impl ManagedHeadGatewayStack {
         while Instant::now() < deadline {
             match GatewayServiceClient::connect(&gateway.addr) {
                 Ok(_) => {
-                    return Ok(Self {
-                        _head: head,
-                        gateway,
-                    });
+                    return Ok(Self { _head: head, gateway });
                 }
                 Err(err) => {
                     last_err = Some(err);
@@ -2531,11 +2409,7 @@ pub fn greedy_single_node_baseline(
     let backend = LlamaStageBackend {
         api,
         model_path,
-        state: RefCell::new(BackendState {
-            layout: None,
-            model: None,
-            sessions: HashMap::new(),
-        }),
+        state: RefCell::new(BackendState { layout: None, model: None, sessions: HashMap::new() }),
     };
 
     let tokens = backend.tokenize_prompt(&model, prompt)?;
@@ -2565,11 +2439,7 @@ pub fn greedy_single_node_completion(
     let backend = LlamaStageBackend {
         api,
         model_path,
-        state: RefCell::new(BackendState {
-            layout: None,
-            model: None,
-            sessions: HashMap::new(),
-        }),
+        state: RefCell::new(BackendState { layout: None, model: None, sessions: HashMap::new() }),
     };
 
     let prompt_tokens = backend.tokenize_prompt(&model, prompt)?;
@@ -2599,9 +2469,5 @@ pub fn greedy_single_node_completion(
     session.destroy(&backend.api);
     unsafe { (backend.api.model_free)(model.model) };
 
-    Ok(GreedyCompletion {
-        completion_tokens: token_ids.len() as u32,
-        text,
-        token_ids,
-    })
+    Ok(GreedyCompletion { completion_tokens: token_ids.len() as u32, text, token_ids })
 }

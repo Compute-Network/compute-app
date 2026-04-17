@@ -1643,6 +1643,7 @@ impl DaemonRuntime {
                 } else {
                     None
                 },
+                app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             };
 
             let client = compute_network::client::OrchestratorClient::new(
