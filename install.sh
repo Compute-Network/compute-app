@@ -161,6 +161,14 @@ if [ -f "${TMPDIR}/${GATEWAY_BINARY}" ]; then
   echo "  ${GREEN}✓${RESET} Installed ${DIM}${GATEWAY_BINARY}${RESET}"
 fi
 
+# Clean up any dylibs/sos from a previous install — otherwise stale libllama
+# variants with different ABI versions can be mistakenly loaded and crash the
+# stage nodes with missing @rpath errors.
+for stale in "${INSTALL_DIR}"/*.dylib "${INSTALL_DIR}"/*.so "${INSTALL_DIR}"/*.so.*; do
+  [ -e "$stale" ] || [ -L "$stale" ] || continue
+  rm -f "$stale"
+done
+
 # Move any bundled shared libraries (libllama.dylib / libggml.dylib / .so)
 # next to the binaries so the sidecars can dlopen them via @loader_path.
 # -e fails for broken symlinks (whose targets we already moved earlier in the
@@ -192,13 +200,12 @@ echo ""
 echo "  ${DIM}To launch Compute anytime, just type${RESET} ${BOLD}compute${RESET} ${DIM}into your terminal.${RESET}"
 echo ""
 
-# Launch compute in a new terminal window
-if [ "$OS" = "darwin" ]; then
-  open -a Terminal "${INSTALL_DIR}/${BINARY_NAME}"
-elif command -v gnome-terminal >/dev/null 2>&1; then
-  gnome-terminal -- "${INSTALL_DIR}/${BINARY_NAME}"
-elif command -v xterm >/dev/null 2>&1; then
-  xterm -e "${INSTALL_DIR}/${BINARY_NAME}" &
+# `curl ... | sh` gives the installer a pipe on stdin. Reattach to the user's
+# terminal before launching the interactive CLI so the first run stays here.
+if ( : </dev/tty >/dev/tty ) 2>/dev/null; then
+  echo "  ${DIM}Launching${RESET} ${BOLD}${BINARY_NAME}${RESET} ${DIM}in this terminal...${RESET}"
+  echo ""
+  exec "${INSTALL_DIR}/${BINARY_NAME}" </dev/tty >/dev/tty 2>/dev/tty
 else
   echo "  ${DIM}Run:${RESET} ${BOLD}compute${RESET}"
 fi

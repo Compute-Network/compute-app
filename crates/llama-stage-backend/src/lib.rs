@@ -253,6 +253,17 @@ impl LlamaApi {
 
         let mut deps = Vec::new();
         for path in dylibs.iter().filter(|path| *path != &llama_path) {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            // Only pre-load ggml family deps. Any stray libllama* file (e.g.
+            // left behind by a previous install with a different ABI version)
+            // is skipped — we already resolved the single libllama we want.
+            if !(name.contains("ggml")) {
+                continue;
+            }
             let lib = unsafe { Library::new(path) }
                 .with_context(|| format!("loading dependency {}", path.display()))?;
             deps.push(lib);

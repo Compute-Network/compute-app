@@ -481,6 +481,12 @@ impl DaemonRuntime {
     pub async fn run(&self) -> Result<()> {
         info!("Daemon starting...");
 
+        // Sweep any orphaned stage-node / gateway children left behind by a
+        // previous daemon crash. These processes only ever run as our children,
+        // so it's safe to reap them unconditionally at startup — otherwise
+        // they hold ports (e.g. 9182) and the next spawn fails.
+        sweep_orphan_stage_children();
+
         let mut idle_detector = IdleDetector::new(self.config.node.idle_threshold_minutes);
         let mut inference_mgr = InferenceManager::new();
         let mut stage_runtime: Option<StagePrototypeHandle> = None;
@@ -1686,6 +1692,26 @@ fn advertised_host(config: &Config) -> Option<String> {
         return Some(configured.to_string());
     }
     detect_advertise_ip()
+}
+
+/// Kill any leftover stage-node / gateway child processes from a prior daemon
+/// run so they don't keep their bind ports held (otherwise the next spawn
+/// gets "Address already in use" on e.g. 9182).
+fn sweep_orphan_stage_children() {
+    const TARGETS: &[&str] = &[
+        "llama_stage_tcp_node",
+        "llama_stage_gateway_tcp_node",
+    ];
+    #[cfg(unix)]
+    {
+        for target in TARGETS {
+            let _ = std::process::Command::new("pkill")
+                .arg("-f")
+                .arg(target)
+                .output();
+        }
+    }
+    let _ = TARGETS;
 }
 
 /// Check if a file is a valid GGUF by reading the magic header.
