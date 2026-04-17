@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "compute-cli"
-version = "0.2.29"
+version = "0.2.30"
 dependencies = [
  "anyhow",
  "base64",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "compute-daemon"
-version = "0.2.29"
+version = "0.2.30"
 dependencies = [
  "anyhow",
  "base64",
@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "compute-network"
-version = "0.2.29"
+version = "0.2.30"
 dependencies = [
  "anyhow",
  "chrono",
@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "compute-solana"
-version = "0.2.29"
+version = "0.2.30"
 dependencies = [
  "anyhow",
  "serde",
@@ -1286,7 +1286,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "llama-stage-backend"
-version = "0.2.29"
+version = "0.2.30"
 dependencies = [
  "anyhow",
  "cmake",
@@ -2213,7 +2213,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stage-forward-lab"
-version = "0.2.29"
+version = "0.2.30"
 dependencies = [
  "anyhow",
  "dirs",

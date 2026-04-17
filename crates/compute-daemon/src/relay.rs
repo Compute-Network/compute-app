@@ -132,7 +132,8 @@ fn detect_advertise_ip() -> Option<String> {
 }
 
 fn collect_advertise_hosts() -> Vec<String> {
-    let mut hosts = BTreeSet::new();
+    let mut public_hosts = BTreeSet::new();
+    let mut private_hosts = BTreeSet::new();
 
     if let Ok(ifaces) = get_if_addrs() {
         for iface in ifaces {
@@ -143,20 +144,33 @@ fn collect_advertise_hosts() -> Vec<String> {
             if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
                 continue;
             }
-            if !ip.is_private() {
-                continue;
+            if ip.is_private() {
+                private_hosts.insert(ip.to_string());
+            } else {
+                public_hosts.insert(ip.to_string());
             }
-            hosts.insert(ip.to_string());
         }
     }
 
-    if hosts.is_empty() {
-        if let Some(ip) = detect_advertise_ip() {
-            hosts.insert(ip);
+    // Also include the outbound-interface IP (UDP-socket-to-1.1.1.1 trick).
+    // On cloud VMs this is the public address; on machines behind NAT it's a
+    // private LAN IP and duplicates what get_if_addrs already returned.
+    if let Some(ip) = detect_advertise_ip() {
+        if let Ok(parsed) = ip.parse::<Ipv4Addr>() {
+            if parsed.is_private() {
+                private_hosts.insert(ip);
+            } else {
+                public_hosts.insert(ip);
+            }
+        } else {
+            private_hosts.insert(ip);
         }
     }
 
-    hosts.into_iter().collect()
+    // Public IPs first so cross-network peers prefer the routable address.
+    let mut out: Vec<String> = public_hosts.into_iter().collect();
+    out.extend(private_hosts);
+    out
 }
 
 fn advertised_hosts_from_config(config: &Config) -> Vec<String> {
