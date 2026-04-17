@@ -1425,10 +1425,57 @@ impl RemoteStageNodeClient {
     }
 }
 
+fn connect_stage_node_with_retry(
+    addr: &str,
+    total_timeout: Duration,
+) -> Result<RemoteStageNodeClient> {
+    // The orchestrator pushes the head and tail assignments in parallel, so
+    // when the gateway spins up on the head machine it can race the tail
+    // sidecar's listener bind — and a bare TcpStream::connect just errors
+    // with ECONNREFUSED. Retry until the peer accepts, or bail after the
+    // total deadline elapses.
+    let deadline = Instant::now() + total_timeout;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match RemoteStageNodeClient::connect(addr) {
+            Ok(client) => {
+                if attempt > 1 {
+                    eprintln!("[gateway] connected to {addr} after {attempt} attempts");
+                }
+                return Ok(client);
+            }
+            Err(err) => {
+                let now = Instant::now();
+                let is_refused = err
+                    .downcast_ref::<std::io::Error>()
+                    .map(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+                    .unwrap_or(false)
+                    || err.to_string().contains("Connection refused");
+                if !is_refused || now >= deadline {
+                    return Err(err.context(format!(
+                        "connecting to {addr} (attempt {attempt})"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                if attempt % 10 == 0 {
+                    eprintln!(
+                        "[gateway] waiting for {addr} (attempt {attempt}, {:?} remaining)",
+                        deadline.saturating_duration_since(now)
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl RemoteStagePair {
     pub fn connect(head_addr: impl Into<String>, tail_addr: impl Into<String>) -> Result<Self> {
-        let mut head = RemoteStageNodeClient::connect(head_addr)?;
-        let mut tail = RemoteStageNodeClient::connect(tail_addr)?;
+        let head_addr: String = head_addr.into();
+        let tail_addr: String = tail_addr.into();
+        let retry_window = Duration::from_secs(60);
+        let mut head = connect_stage_node_with_retry(&head_addr, retry_window)?;
+        let mut tail = connect_stage_node_with_retry(&tail_addr, retry_window)?;
         let head_info = head.info()?;
         let tail_info = tail.info()?;
 
