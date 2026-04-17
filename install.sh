@@ -200,13 +200,15 @@ echo ""
 echo "  ${DIM}To launch Compute anytime, just type${RESET} ${BOLD}compute${RESET} ${DIM}into your terminal.${RESET}"
 echo ""
 
-# `curl ... | sh` gives the installer a pipe on stdin. Reattach to the user's
-# terminal before launching the interactive CLI so the first run stays here.
-if ( : </dev/tty >/dev/tty ) 2>/dev/null; then
-  echo "  ${DIM}Launching${RESET} ${BOLD}${BINARY_NAME}${RESET} ${DIM}in this terminal...${RESET}"
+# Only auto-launch when the installer was invoked directly (stdin is a tty).
+# Under `curl ... | sh` stdin is a pipe and the shell's process group doesn't
+# own the terminal, so even after redirecting to /dev/tty the launched TUI
+# can't initialise its input reader — the user has to run it themselves.
+if [ -t 0 ]; then
+  echo "  ${DIM}Launching${RESET} ${BOLD}${BINARY_NAME}${RESET}${DIM}...${RESET}"
   echo ""
-  exec "${INSTALL_DIR}/${BINARY_NAME}" </dev/tty >/dev/tty 2>/dev/tty
+  exec "${INSTALL_DIR}/${BINARY_NAME}"
 else
-  echo "  ${DIM}Run:${RESET} ${BOLD}compute${RESET}"
+  echo "  ${DIM}Run${RESET} ${BOLD}${BINARY_NAME}${RESET} ${DIM}to launch.${RESET}"
+  echo ""
 fi
-echo ""
