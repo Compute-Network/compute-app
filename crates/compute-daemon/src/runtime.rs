@@ -39,6 +39,7 @@ struct SplitGatewaySignature {
     total_stages: i32,
     tail_addr: Option<String>,
     tail_bind: Option<String>,
+    shard_url: Option<String>,
 }
 
 fn classify_gateway_error_message(message: &str) -> (&'static str, String) {
@@ -160,6 +161,37 @@ fn gateway_model_path(config: &Config) -> PathBuf {
         default_gemma_model_path()
     } else {
         config.experimental.stage_gateway_model_path.clone().into()
+    }
+}
+
+/// Resolves the (model_path, local_start_layer, local_end_layer) that the
+/// managed gateway stack should load for a split assignment.
+///
+/// When `shard_url` is set, the per-stage GGUF has renumbered layers 0..(N-1),
+/// so the bounds we pass to llama-stage-backend must be LOCAL indices even
+/// though the assignment carries original (shard-global) indices.
+async fn resolve_gateway_stage_inputs(
+    config: &Config,
+    model_name: &str,
+    role: &str,
+    shard_url: Option<&str>,
+    start_layer: i32,
+    end_layer: i32,
+) -> anyhow::Result<(PathBuf, u32, u32)> {
+    match shard_url {
+        Some(url) if !url.is_empty() => {
+            let path = crate::inference::stage_artifacts::ensure_gguf_shard(
+                model_name,
+                role,
+                start_layer as u32,
+                end_layer as u32,
+                url,
+            )
+            .await?;
+            let local_end = (end_layer - start_layer) as u32;
+            Ok((path, 0, local_end))
+        }
+        _ => Ok((gateway_model_path(config), start_layer as u32, end_layer as u32)),
     }
 }
 
@@ -643,6 +675,7 @@ impl DaemonRuntime {
                                     total_stages: assignment.total_stages,
                                     tail_addr: None,
                                     tail_bind: Some(bind.clone()),
+                                    shard_url: assignment.gateway_shard_url.clone(),
                                 };
 
                                 let already_matches = managed_tail_node.is_some()
@@ -659,17 +692,40 @@ impl DaemonRuntime {
                                     managed_gateway_stack = None;
                                     *gateway_client.lock().await = None;
 
-                                    let model_path = gateway_model_path(&self.config);
+                                    let (model_path, local_start, local_end) =
+                                        match resolve_gateway_stage_inputs(
+                                            &self.config,
+                                            &assignment.model_name,
+                                            "tail",
+                                            assignment.gateway_shard_url.as_deref(),
+                                            start,
+                                            end,
+                                        )
+                                        .await
+                                        {
+                                            Ok(tuple) => tuple,
+                                            Err(err) => {
+                                                warn!("[gateway-tail] shard prep failed: {err}");
+                                                let msg = serde_json::json!({
+                                                    "type": "node_error",
+                                                    "model_name": assignment.model_name,
+                                                    "error": format!("gateway-tail shard prep failed: {err}"),
+                                                })
+                                                .to_string();
+                                                let _ = ws_outbound_tx.send(msg).await;
+                                                continue;
+                                            }
+                                        };
                                     let launch_spec = gateway_launch_spec(&self.config);
                                     info!(
-                                        "[gateway-tail] Spawning tail worker on {bind} layers {start}-{end} model={}",
+                                        "[gateway-tail] Spawning tail worker on {bind} orig_layers={start}-{end} local_layers={local_start}-{local_end} model={}",
                                         model_path.display()
                                     );
                                     match ManagedTailNode::spawn(
                                         model_path.clone(),
                                         bind.clone(),
-                                        start as u32,
-                                        end as u32,
+                                        local_start,
+                                        local_end,
                                         &launch_spec,
                                     ) {
                                         Ok(node) => {
@@ -745,6 +801,7 @@ impl DaemonRuntime {
                                     total_stages: assignment.total_stages,
                                     tail_addr: Some(tail_addr.clone()),
                                     tail_bind: None,
+                                    shard_url: assignment.gateway_shard_url.clone(),
                                 };
 
                                 let already_matches = managed_head_gateway_stack.is_some()
@@ -761,16 +818,39 @@ impl DaemonRuntime {
                                     managed_gateway_stack = None;
                                     *gateway_client.lock().await = None;
 
-                                    let model_path = gateway_model_path(&self.config);
+                                    let (model_path, local_start, local_end) =
+                                        match resolve_gateway_stage_inputs(
+                                            &self.config,
+                                            &assignment.model_name,
+                                            "head",
+                                            assignment.gateway_shard_url.as_deref(),
+                                            start,
+                                            end,
+                                        )
+                                        .await
+                                        {
+                                            Ok(tuple) => tuple,
+                                            Err(err) => {
+                                                warn!("[gateway-head] shard prep failed: {err}");
+                                                let msg = serde_json::json!({
+                                                    "type": "node_error",
+                                                    "model_name": assignment.model_name,
+                                                    "error": format!("gateway-head shard prep failed: {err}"),
+                                                })
+                                                .to_string();
+                                                let _ = ws_outbound_tx.send(msg).await;
+                                                continue;
+                                            }
+                                        };
                                     let launch_spec = gateway_launch_spec(&self.config);
                                     info!(
-                                        "[gateway-head] Spawning head + remote-tail gateway head_layers={start}-{end} tail={tail_addr} model={}",
+                                        "[gateway-head] Spawning head + remote-tail gateway orig_layers={start}-{end} local_layers={local_start}-{local_end} tail={tail_addr} model={}",
                                         model_path.display()
                                     );
                                     match ManagedHeadGatewayStack::spawn_with_remote_tail(
                                         model_path.clone(),
-                                        start as u32,
-                                        end as u32,
+                                        local_start,
+                                        local_end,
                                         tail_addr.clone(),
                                         false,
                                         &launch_spec,

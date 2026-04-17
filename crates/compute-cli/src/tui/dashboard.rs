@@ -66,17 +66,17 @@ fn model_entries() -> Vec<ModelEntry> {
         },
         ModelEntry {
             id: "gemma-4-e4b-q4-stage-head",
-            label: "Gemma4 Stage 0-20 — 3.4GB (head)",
+            label: "Gemma4 Stage 0-20 — 2.5GB (head)",
             desc: "Pipeline head · layers 0-20",
-            gguf_filename: "packed-stage-0-20.tar",
-            hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-stages/resolve/main/packed-stage-0-20.tar",
+            gguf_filename: "head-0-20.gguf",
+            hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-gguf-stages/resolve/main/gemma-4-e4b-q4-head-0-20.gguf",
         },
         ModelEntry {
             id: "gemma-4-e4b-q4-stage-tail",
-            label: "Gemma4 Stage 21-41 — 3.4GB (tail)",
+            label: "Gemma4 Stage 21-41 — 2.5GB (tail)",
             desc: "Pipeline tail · layers 21-41",
-            gguf_filename: "packed-stage-21-41.tar",
-            hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-stages/resolve/main/packed-stage-21-41.tar",
+            gguf_filename: "tail-21-41.gguf",
+            hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-gguf-stages/resolve/main/gemma-4-e4b-q4-tail-21-41.gguf",
         },
     ]
 }
@@ -85,26 +85,42 @@ fn is_stage_entry(model_id: &str) -> bool {
     model_id.contains("-stage-head") || model_id.contains("-stage-tail")
 }
 
-fn stage_extract_dir(filename: &str) -> std::path::PathBuf {
-    let stem = filename.trim_end_matches(".tar");
+/// Path where per-stage GGUF shards are cached. Mirrors
+/// `stage_artifacts::gguf_shard_path` in compute-daemon so the TUI download
+/// and the daemon's lazy download share the same cache.
+fn stage_shard_path(filename: &str) -> std::path::PathBuf {
     dirs::home_dir()
         .unwrap_or_default()
         .join(".compute")
         .join("stages")
         .join("gemma-4-e4b-q4")
-        .join(stem)
+        .join(filename)
 }
 
 fn is_model_downloaded(model_id: &str) -> bool {
     if model_id == "auto" {
         return true;
     }
-    // Stage artifacts: check for extracted directory with index file
     if is_stage_entry(model_id) {
         for entry in model_entries() {
             if entry.id == model_id && !entry.gguf_filename.is_empty() {
-                let dir = stage_extract_dir(entry.gguf_filename);
-                return dir.is_dir() && dir.join(".done").exists();
+                let path = stage_shard_path(entry.gguf_filename);
+                if !path.exists() {
+                    return false;
+                }
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    if meta.len() < 100 * 1024 * 1024 {
+                        return false;
+                    }
+                }
+                if let Ok(mut f) = std::fs::File::open(&path) {
+                    use std::io::Read;
+                    let mut magic = [0u8; 4];
+                    if f.read_exact(&mut magic).is_err() || magic != [0x47, 0x47, 0x55, 0x46] {
+                        return false;
+                    }
+                }
+                return true;
             }
         }
         return false;
@@ -1037,7 +1053,9 @@ impl Dashboard {
                 if config.experimental.stage_mode_enabled { "On" } else { "Off" }.into()
             }
             "experimental.stage_backend" => match config.experimental.stage_backend.as_str() {
-                "llama-stage-gateway" | "llama_stage_gateway" | "gateway" => "LlamaStageGateway".into(),
+                "llama-stage-gateway" | "llama_stage_gateway" | "gateway" => {
+                    "LlamaStageGateway".into()
+                }
                 "llamacpp" => "LlamaCpp".into(),
                 "tail-llama" => "TailLlama".into(),
                 "real_forward" | "real-forward" => "RealForward".into(),
@@ -1314,11 +1332,10 @@ impl Dashboard {
         let is_stage = is_stage_entry(entry.id);
 
         std::thread::spawn(move || {
-            let (cache_dir, dest, tmp) = if is_stage {
-                let dir = stage_extract_dir(&filename);
-                let parent = dir.parent().unwrap_or(&dir).to_path_buf();
+            let (_cache_dir, dest, tmp) = if is_stage {
+                let dest = stage_shard_path(&filename);
+                let parent = dest.parent().unwrap_or(std::path::Path::new("")).to_path_buf();
                 let _ = std::fs::create_dir_all(&parent);
-                let dest = parent.join(&filename);
                 let tmp = dest.with_extension("tmp");
                 (parent, dest, tmp)
             } else {
@@ -1492,43 +1509,23 @@ impl Dashboard {
                 }
             }
 
-            if is_stage {
-                // Extract tar to stage directory
-                let extract_dir = stage_extract_dir(&filename);
-                let _ = std::fs::create_dir_all(&extract_dir);
-                let status = std::process::Command::new("tar")
-                    .arg("xf")
-                    .arg(&tmp)
-                    .arg("-C")
-                    .arg(&extract_dir)
-                    .status();
-                let _ = std::fs::remove_file(&tmp);
-                match status {
-                    Ok(s) if s.success() => {
-                        // Write .done marker
-                        let _ = std::fs::write(extract_dir.join(".done"), "");
-                        let _ = tx.send((model_id.clone(), 1.0));
-                    }
-                    _ => {
+            // Verify GGUF magic header (stage shards are plain GGUF files)
+            {
+                use std::io::Read;
+                if let Ok(mut f) = std::fs::File::open(&tmp) {
+                    let mut magic = [0u8; 4];
+                    if f.read_exact(&mut magic).is_err() || magic != [0x47, 0x47, 0x55, 0x46] {
+                        let _ = std::fs::remove_file(&tmp);
                         let _ = tx.send((model_id, -1.0));
                         return;
                     }
                 }
-            } else {
-                // Verify GGUF magic header
-                {
-                    use std::io::Read;
-                    if let Ok(mut f) = std::fs::File::open(&tmp) {
-                        let mut magic = [0u8; 4];
-                        if f.read_exact(&mut magic).is_err() || magic != [0x47, 0x47, 0x55, 0x46] {
-                            let _ = std::fs::remove_file(&tmp);
-                            let _ = tx.send((model_id, -1.0));
-                            return;
-                        }
-                    }
-                }
-                let _ = std::fs::rename(&tmp, &dest);
-                let _ = tx.send((model_id.clone(), 1.0));
+            }
+            let _ = std::fs::rename(&tmp, &dest);
+            let _ = tx.send((model_id.clone(), 1.0));
+            // Only flip active_model for full-model entries — stage shards are
+            // a capability advertisement, not a default backend selection.
+            if !is_stage {
                 let mut config = compute_daemon::config::Config::load().unwrap_or_default();
                 config.models.active_model = model_id;
                 let _ = config.save();

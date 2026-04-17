@@ -10,6 +10,63 @@ pub fn packed_stage_dir(model_id: &str, start_layer: u32, end_layer: u32) -> Pat
     stages_cache_dir().join(model_id).join(format!("packed-stage-{}-{}", start_layer, end_layer))
 }
 
+/// Path to a per-stage GGUF shard cached by [`ensure_gguf_shard`].
+pub fn gguf_shard_path(model_id: &str, role: &str, start_layer: u32, end_layer: u32) -> PathBuf {
+    stages_cache_dir().join(model_id).join(format!("{}-{}-{}.gguf", role, start_layer, end_layer))
+}
+
+/// Download a per-stage GGUF shard whose layers are renumbered 0..(N-1).
+/// Returns the local file path, reusing the cached file if it already exists
+/// and passes the GGUF magic check.
+pub async fn ensure_gguf_shard(
+    model_id: &str,
+    role: &str,
+    start_layer: u32,
+    end_layer: u32,
+    shard_url: &str,
+) -> Result<PathBuf> {
+    let dest = gguf_shard_path(model_id, role, start_layer, end_layer);
+
+    if dest.exists() && gguf_magic_ok(&dest).unwrap_or(false) {
+        info!(
+            "GGUF shard for {} {} layers {}-{} already cached at {}",
+            model_id,
+            role,
+            start_layer,
+            end_layer,
+            dest.display()
+        );
+        return Ok(dest);
+    }
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create shard dir {}", parent.display()))?;
+    }
+
+    info!(
+        "Downloading GGUF shard for {} {} layers {}-{} from {}",
+        model_id, role, start_layer, end_layer, shard_url
+    );
+    download_file(shard_url, &dest).await?;
+
+    if !gguf_magic_ok(&dest).unwrap_or(false) {
+        let _ = std::fs::remove_file(&dest);
+        anyhow::bail!("Downloaded shard is not a valid GGUF file: {}", dest.display());
+    }
+
+    info!("GGUF shard ready at {}", dest.display());
+    Ok(dest)
+}
+
+fn gguf_magic_ok(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)?;
+    Ok(&magic == b"GGUF")
+}
+
 pub fn is_stage_cached(model_id: &str, start_layer: u32, end_layer: u32) -> bool {
     let dir = packed_stage_dir(model_id, start_layer, end_layer);
     if !dir.is_dir() {

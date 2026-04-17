@@ -108,6 +108,12 @@ pub struct AssignmentPush {
     /// (e.g. "0.0.0.0:9182"). Falls back to "0.0.0.0:9182" if missing.
     #[serde(default)]
     pub gateway_tail_bind: Option<String>,
+    /// When set, download this GGUF shard and use it as the model file for
+    /// the gateway-head/tail stack. The shard's layers are renumbered to
+    /// 0..(N-1), so the daemon must translate the assignment's layer
+    /// bounds to LOCAL indices before handing them to llama-stage-backend.
+    #[serde(default)]
+    pub gateway_shard_url: Option<String>,
 }
 
 /// Channel for sending messages back through the WebSocket from other tasks
