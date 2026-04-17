@@ -1585,6 +1585,7 @@ impl RemoteStagePair {
         let mut token_ids = Vec::new();
         let mut head_decode_ms_total = 0u64;
         let mut sample_ms_total = 0u64;
+        let mut ttft_ms = 0u64;
 
         for step in 0..max_tokens {
             let t_sample = std::time::Instant::now();
@@ -1596,6 +1597,10 @@ impl RemoteStagePair {
                 other => bail!("expected token_sample response, got {other:?}"),
             };
             sample_ms_total += t_sample.elapsed().as_millis() as u64;
+
+            if ttft_ms == 0 {
+                ttft_ms = head_prefill_ms + tail_decode_ms_total + sample_ms_total;
+            }
 
             text.push_str(&sampled.piece);
             token_ids.push(sampled.token_id);
@@ -1627,7 +1632,6 @@ impl RemoteStagePair {
             tail_decode_ms_total += t_tail_step.elapsed().as_millis() as u64;
         }
 
-        let ttft_ms = head_prefill_ms + tail_decode_ms_total + sample_ms_total;
         let total_ms =
             head_prefill_ms + head_decode_ms_total + tail_decode_ms_total + sample_ms_total;
 
@@ -1770,14 +1774,20 @@ impl RemoteStageGateway {
             };
         session.timings.sample_ms += t_sample.elapsed().as_millis() as u64;
 
+        // Record TTFT on the first token only. Later tokens accumulate into
+        // sample_ms / tail_decode_ms, so overwriting ttft at `done` would
+        // report cumulative (not first-token) latency.
+        if session.timings.ttft_ms == 0 {
+            session.timings.ttft_ms = session.timings.head_prefill_ms
+                + session.timings.tail_decode_ms
+                + session.timings.sample_ms;
+        }
+
         session.text.push_str(&sampled.piece);
         session.token_ids.push(sampled.token_id);
 
         let done = sampled.is_eog || session.token_ids.len() as u32 >= session.max_tokens;
         if done {
-            session.timings.ttft_ms = session.timings.head_prefill_ms
-                + session.timings.tail_decode_ms
-                + session.timings.sample_ms;
             session.timings.total_ms = session.timings.head_prefill_ms
                 + session.timings.head_decode_ms
                 + session.timings.tail_decode_ms
