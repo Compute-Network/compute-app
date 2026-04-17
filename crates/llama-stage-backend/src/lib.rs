@@ -499,7 +499,16 @@ pub enum StageNodeRequest {
 pub enum StageNodeResponse {
     Info { info: StageNodeInfo },
     TokenIds { token_ids: Vec<i32> },
-    Tensor { tensor: StageTensor },
+    // `tail_sample` is populated when the tail stage produces a token as a
+    // side-effect of the decode (i.e. on ContinueForwardTokens / BeginPrompt
+    // that lands on the tail). It lets the gateway skip a separate
+    // SampleTailToken round-trip per token. Optional so mixed-version pairs
+    // still interoperate: if absent, the gateway falls back to the old RTT.
+    Tensor {
+        tensor: StageTensor,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tail_sample: Option<GreedyTokenSample>,
+    },
     Sample { sample: StageSample },
     TokenSample { sample: GreedyTokenSample },
     Ack,
@@ -590,6 +599,11 @@ struct GatewaySessionState {
     text: String,
     token_ids: Vec<i32>,
     timings: RemoteStageTimings,
+    // Sample produced by the tail as a side-effect of the most recent
+    // ContinueForwardTokens call, ready for the next step_completion to
+    // consume without a SampleTailToken round-trip. None on the very first
+    // step only if the tail is an old build that doesn't ship inline samples.
+    pending_tail_sample: Option<GreedyTokenSample>,
 }
 
 pub struct RemoteStageGateway {
@@ -1280,6 +1294,23 @@ impl LlamaStageBackend {
             is_eog: cached.is_eog,
         })
     }
+
+    /// Returns the cached greedy sample for the tail stage, if one is
+    /// available. Used to piggyback the sample onto ContinueForwardTokens /
+    /// BeginPrompt responses so the gateway can skip a separate
+    /// SampleTailToken round-trip. Returns None when the backend is not a
+    /// tail, the session does not exist, or no sample has been cached yet.
+    pub fn cached_tail_sample(&self, request_id: &str) -> Option<GreedyTokenSample> {
+        let state = self.state.borrow();
+        let layout = state.layout.as_ref()?;
+        if !layout.is_tail {
+            return None;
+        }
+        let session = state.sessions.get(request_id)?;
+        let cached = session.cached_sample.as_ref()?;
+        let piece = cached.sample.text.clone();
+        Some(GreedyTokenSample { token_id: cached.token_id, piece, is_eog: cached.is_eog })
+    }
 }
 
 pub fn build_stage_backend(config: &StageNodeConfig) -> Result<LlamaStageBackend> {
@@ -1559,19 +1590,21 @@ impl RemoteStagePair {
             prompt: prompt.to_string(),
             max_tokens: Some(max_tokens),
         })? {
-            StageNodeResponse::Tensor { tensor } => tensor,
+            StageNodeResponse::Tensor { tensor, .. } => tensor,
             other => bail!("expected tensor response, got {other:?}"),
         };
         let head_prefill_ms = t_head.elapsed().as_millis() as u64;
         let transfer_bytes = head_tensor.bytes.len();
 
         let t_tail = std::time::Instant::now();
-        let mut tail_tensor = match self.tail.request(&StageNodeRequest::ContinueForwardTokens {
-            tensor: head_tensor.clone(),
-            token_ids: prompt_tokens,
-            clear_memory: true,
-        })? {
-            StageNodeResponse::Tensor { tensor } => tensor,
+        let (mut tail_tensor, mut pending_sample) = match self
+            .tail
+            .request(&StageNodeRequest::ContinueForwardTokens {
+                tensor: head_tensor.clone(),
+                token_ids: prompt_tokens,
+                clear_memory: true,
+            })? {
+            StageNodeResponse::Tensor { tensor, tail_sample } => (tensor, tail_sample),
             other => bail!("expected tensor response, got {other:?}"),
         };
         let mut tail_decode_ms_total = t_tail.elapsed().as_millis() as u64;
@@ -1589,12 +1622,15 @@ impl RemoteStagePair {
 
         for step in 0..max_tokens {
             let t_sample = std::time::Instant::now();
-            let sampled = match self
-                .tail
-                .request(&StageNodeRequest::SampleTailToken { tensor: tail_tensor.clone() })?
-            {
-                StageNodeResponse::TokenSample { sample } => sample,
-                other => bail!("expected token_sample response, got {other:?}"),
+            let sampled = if let Some(sampled) = pending_sample.take() {
+                sampled
+            } else {
+                match self.tail.request(&StageNodeRequest::SampleTailToken {
+                    tensor: tail_tensor.clone(),
+                })? {
+                    StageNodeResponse::TokenSample { sample } => sample,
+                    other => bail!("expected token_sample response, got {other:?}"),
+                }
             };
             sample_ms_total += t_sample.elapsed().as_millis() as u64;
 
@@ -1615,20 +1651,24 @@ impl RemoteStagePair {
                 token_ids: vec![sampled.token_id],
                 max_tokens: Some(max_tokens),
             })? {
-                StageNodeResponse::Tensor { tensor } => tensor,
+                StageNodeResponse::Tensor { tensor, .. } => tensor,
                 other => bail!("expected tensor response, got {other:?}"),
             };
             head_decode_ms_total += t_head_step.elapsed().as_millis() as u64;
 
             let t_tail_step = std::time::Instant::now();
-            tail_tensor = match self.tail.request(&StageNodeRequest::ContinueForwardTokens {
-                tensor: head_tensor.clone(),
-                token_ids: vec![sampled.token_id],
-                clear_memory: false,
-            })? {
-                StageNodeResponse::Tensor { tensor } => tensor,
+            let (new_tail_tensor, new_pending) = match self.tail.request(
+                &StageNodeRequest::ContinueForwardTokens {
+                    tensor: head_tensor.clone(),
+                    token_ids: vec![sampled.token_id],
+                    clear_memory: false,
+                },
+            )? {
+                StageNodeResponse::Tensor { tensor, tail_sample } => (tensor, tail_sample),
                 other => bail!("expected tensor response, got {other:?}"),
             };
+            tail_tensor = new_tail_tensor;
+            pending_sample = new_pending;
             tail_decode_ms_total += t_tail_step.elapsed().as_millis() as u64;
         }
 
@@ -1712,20 +1752,20 @@ impl RemoteStageGateway {
             prompt: prompt.to_string(),
             max_tokens: Some(max_tokens),
         })? {
-            StageNodeResponse::Tensor { tensor } => tensor,
+            StageNodeResponse::Tensor { tensor, .. } => tensor,
             other => bail!("expected tensor response, got {other:?}"),
         };
         let head_prefill_ms = t_head.elapsed().as_millis() as u64;
         let transfer_bytes = head_tensor.bytes.len();
 
         let t_tail = std::time::Instant::now();
-        let tail_tensor =
+        let (tail_tensor, pending_tail_sample) =
             match self.pair.tail.request(&StageNodeRequest::ContinueForwardTokens {
                 tensor: head_tensor.clone(),
                 token_ids: prompt_tokens,
                 clear_memory: true,
             })? {
-                StageNodeResponse::Tensor { tensor } => tensor,
+                StageNodeResponse::Tensor { tensor, tail_sample } => (tensor, tail_sample),
                 other => bail!("expected tensor response, got {other:?}"),
             };
         let tail_decode_ms = t_tail.elapsed().as_millis() as u64;
@@ -1752,6 +1792,7 @@ impl RemoteStageGateway {
                     ttft_ms: 0,
                     total_ms: 0,
                 },
+                pending_tail_sample,
             },
         );
 
@@ -1765,13 +1806,19 @@ impl RemoteStageGateway {
             .with_context(|| format!("no completion session for request_id {request_id}"))?;
 
         let t_sample = std::time::Instant::now();
-        let sampled =
+        let sampled = if let Some(sampled) = session.pending_tail_sample.take() {
+            // Tail shipped the sample inline with the previous forward pass —
+            // zero-cost consume, no round-trip.
+            sampled
+        } else {
+            // Fallback for older tail builds that don't populate tail_sample.
             match self.pair.tail.request(&StageNodeRequest::SampleTailToken {
                 tensor: session.tail_tensor.clone(),
             })? {
                 StageNodeResponse::TokenSample { sample } => sample,
                 other => bail!("expected token_sample response, got {other:?}"),
-            };
+            }
+        };
         session.timings.sample_ms += t_sample.elapsed().as_millis() as u64;
 
         // Record TTFT on the first token only. Later tokens accumulate into
@@ -1809,21 +1856,23 @@ impl RemoteStageGateway {
                 token_ids: vec![sampled.token_id],
                 max_tokens: Some(session.max_tokens),
             })? {
-                StageNodeResponse::Tensor { tensor } => tensor,
+                StageNodeResponse::Tensor { tensor, .. } => tensor,
                 other => bail!("expected tensor response, got {other:?}"),
             };
         session.timings.head_decode_ms += t_head.elapsed().as_millis() as u64;
 
         let t_tail = std::time::Instant::now();
-        session.tail_tensor =
+        let (new_tail_tensor, new_pending) =
             match self.pair.tail.request(&StageNodeRequest::ContinueForwardTokens {
                 tensor: session.head_tensor.clone(),
                 token_ids: vec![sampled.token_id],
                 clear_memory: false,
             })? {
-                StageNodeResponse::Tensor { tensor } => tensor,
+                StageNodeResponse::Tensor { tensor, tail_sample } => (tensor, tail_sample),
                 other => bail!("expected tensor response, got {other:?}"),
             };
+        session.tail_tensor = new_tail_tensor;
+        session.pending_tail_sample = new_pending;
         session.timings.tail_decode_ms += t_tail.elapsed().as_millis() as u64;
 
         let text = session.text.clone();
@@ -1907,22 +1956,27 @@ pub fn handle_stage_node_request(
             Ok(StageNodeResponse::TokenIds { token_ids: backend.tokenize(&text)? })
         }
         StageNodeRequest::BeginPrompt { request_id, prompt, max_tokens } => {
-            Ok(StageNodeResponse::Tensor {
-                tensor: backend.begin_prompt_session(&request_id, &prompt, max_tokens)?,
-            })
+            let tensor = backend.begin_prompt_session(&request_id, &prompt, max_tokens)?;
+            let tail_sample = backend.cached_tail_sample(&request_id);
+            Ok(StageNodeResponse::Tensor { tensor, tail_sample })
         }
         StageNodeRequest::ContinueHeadTokens { request_id, token_ids, max_tokens } => {
-            Ok(StageNodeResponse::Tensor {
-                tensor: backend.continue_head_tokens(&request_id, token_ids, max_tokens)?,
-            })
+            let tensor = backend.continue_head_tokens(&request_id, token_ids, max_tokens)?;
+            // Head never caches a tail sample; cached_tail_sample returns None.
+            Ok(StageNodeResponse::Tensor { tensor, tail_sample: None })
         }
         StageNodeRequest::ContinueForward { tensor } => {
-            Ok(StageNodeResponse::Tensor { tensor: backend.continue_forward(tensor)? })
+            let request_id = tensor.request_id.clone();
+            let tensor = backend.continue_forward(tensor)?;
+            let tail_sample = backend.cached_tail_sample(&request_id);
+            Ok(StageNodeResponse::Tensor { tensor, tail_sample })
         }
         StageNodeRequest::ContinueForwardTokens { tensor, token_ids, clear_memory } => {
-            Ok(StageNodeResponse::Tensor {
-                tensor: backend.continue_forward_with_tokens(tensor, token_ids, clear_memory)?,
-            })
+            let request_id = tensor.request_id.clone();
+            let tensor =
+                backend.continue_forward_with_tokens(tensor, token_ids, clear_memory)?;
+            let tail_sample = backend.cached_tail_sample(&request_id);
+            Ok(StageNodeResponse::Tensor { tensor, tail_sample })
         }
         StageNodeRequest::SampleTail { tensor } => {
             Ok(StageNodeResponse::Sample { sample: backend.sample_tail(tensor)? })
