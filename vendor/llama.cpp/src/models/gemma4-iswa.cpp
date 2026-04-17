@@ -19,9 +19,12 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
     inp_prompt = ggml_scale(ctx0, inp_prompt, ubatch.token ? sqrtf(n_embd) : 1.0f);
     cb(inp_prompt, "inp_prompt_scaled", -1);
 
-    inpL = (start_layer > 0 && ubatch.embd) ? build_inp_embd_select(model.tok_embd, true) : inp_prompt;
+    // If the ubatch carries hidden-state embeddings, consume them as layer input regardless of
+    // start_layer. A tail shard with renumbered layers reports start_layer == 0 but still receives
+    // hidden states from an upstream head shard.
+    inpL = (ubatch.embd != nullptr) ? build_inp_embd_select(model.tok_embd, true) : inp_prompt;
     // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
-    if (start_layer > 0 && ubatch.embd) {
+    if (ubatch.embd != nullptr) {
         inpL = ggml_scale(ctx0, inpL, 1.0f);
     }
     cb(inpL, "inp_scaled", -1);

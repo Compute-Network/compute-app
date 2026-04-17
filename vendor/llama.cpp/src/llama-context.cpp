@@ -2190,7 +2190,10 @@ llm_graph_params llama_context::graph_params(
                           llm_graph_type   gtype) const {
     const int32_t stage_start_layer = split_stage_active ? split_stage_start_layer : 0;
     const int32_t stage_end_layer = split_stage_active ? split_stage_end_layer : (int32_t) model.hparams.n_layer - 1;
-    const bool prefer_embd_input = ubatch.embd != nullptr && (split_stage_active ? stage_start_layer > 0 : ubatch.token == nullptr);
+    // In split mode, a tail shard with renumbered layers has stage_start_layer == 0 even
+    // though its input is hidden states from an upstream stage. Trust ubatch.embd as the
+    // authoritative signal that the input is already an embedding, independent of start_layer.
+    const bool prefer_embd_input = ubatch.embd != nullptr && (split_stage_active || ubatch.token == nullptr);
 
     return {
         /*.arch        =*/ model.arch,

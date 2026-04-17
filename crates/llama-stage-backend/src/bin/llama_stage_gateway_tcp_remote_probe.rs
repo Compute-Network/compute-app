@@ -44,11 +44,7 @@ fn parse_args() -> Result<(PathBuf, String, u32, bool, Vec<String>)> {
         }
     }
 
-    let prompts = if args.len() > idx {
-        args[idx..].to_vec()
-    } else {
-        default_prompts()
-    };
+    let prompts = if args.len() > idx { args[idx..].to_vec() } else { default_prompts() };
 
     let gateway_addr =
         gateway_addr.ok_or_else(|| anyhow::anyhow!("missing --gateway <addr:port>"))?;
@@ -114,9 +110,7 @@ fn main() -> Result<()> {
                             token_ids: completion.token_ids,
                         });
                     }
-                    StageGatewayResponse::Step {
-                        step: GatewayStep::Token { .. },
-                    } => {}
+                    StageGatewayResponse::Step { step: GatewayStep::Token { .. } } => {}
                     other => bail!("unexpected response for gw-a: {other:?}"),
                 }
             }
@@ -133,9 +127,7 @@ fn main() -> Result<()> {
                             token_ids: completion.token_ids,
                         });
                     }
-                    StageGatewayResponse::Step {
-                        step: GatewayStep::Token { .. },
-                    } => {}
+                    StageGatewayResponse::Step { step: GatewayStep::Token { .. } } => {}
                     other => bail!("unexpected response for gw-b: {other:?}"),
                 }
             }

@@ -851,11 +851,8 @@ impl LlamaStageEngine {
         _hidden_dim_hint: usize,
     ) -> Result<Activation> {
         let backend = self.backend()?;
-        let token_ids = backend
-            .tokenize(prompt)?
-            .into_iter()
-            .map(|token| token as u32)
-            .collect::<Vec<_>>();
+        let token_ids =
+            backend.tokenize(prompt)?.into_iter().map(|token| token as u32).collect::<Vec<_>>();
         let stage_tensor = backend.begin_prompt_session(&request_id, prompt, max_tokens)?;
         self.mark_request_active(&request_id);
         Self::stage_tensor_to_activation(request_id, stage_tensor, token_ids)
@@ -888,7 +885,8 @@ impl LlamaStageEngine {
 
         if config.is_first_stage && payload.kind == StagePayloadKind::PromptV1 {
             let prompt = payload.prompt.as_deref().unwrap_or("");
-            let activation = self.begin_prompt(input.request_id, prompt, payload.max_tokens, 2048)?;
+            let activation =
+                self.begin_prompt(input.request_id, prompt, payload.max_tokens, 2048)?;
             return Ok(ForwardResult::Activations(activation));
         }
 
@@ -933,12 +931,7 @@ impl LlamaStageEngine {
     }
 
     fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
-        Ok(self
-            .backend()?
-            .tokenize(text)?
-            .into_iter()
-            .map(|token| token as u32)
-            .collect())
+        Ok(self.backend()?.tokenize(text)?.into_iter().map(|token| token as u32).collect())
     }
 
     fn detokenize(&self, tokens: &[u32]) -> Result<String> {
@@ -950,10 +943,7 @@ impl LlamaStageEngine {
     }
 
     fn clear_decode_session(&self, request_id: &str) {
-        self.active_requests
-            .lock()
-            .expect("llama-stage request set poisoned")
-            .remove(request_id);
+        self.active_requests.lock().expect("llama-stage request set poisoned").remove(request_id);
         if let Ok(backend) = self.backend() {
             let _ = backend.clear_decode_session(request_id);
         }

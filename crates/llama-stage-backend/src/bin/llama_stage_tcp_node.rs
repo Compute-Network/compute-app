@@ -97,9 +97,7 @@ fn handle_stream(
 
         let response = match serde_json::from_str::<StageNodeRequest>(trimmed) {
             Ok(request) => handle_stage_node_request(backend, request),
-            Err(err) => StageNodeResponse::Error {
-                message: format!("invalid request: {err}"),
-            },
+            Err(err) => StageNodeResponse::Error { message: format!("invalid request: {err}") },
         };
 
         serde_json::to_writer(&mut writer, &response)?;

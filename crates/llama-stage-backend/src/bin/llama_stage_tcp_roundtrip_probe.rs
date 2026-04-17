@@ -40,11 +40,7 @@ fn parse_args() -> (PathBuf, u32, bool, Vec<String>) {
         }
     }
 
-    let prompts = if args.len() > idx {
-        args[idx..].to_vec()
-    } else {
-        default_prompts()
-    };
+    let prompts = if args.len() > idx { args[idx..].to_vec() } else { default_prompts() };
 
     (model_path, max_tokens, reconnect_after_prompt, prompts)
 }

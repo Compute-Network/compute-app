@@ -47,23 +47,12 @@ fn parse_args() -> Result<(PathBuf, String, String, u32, bool, Vec<String>)> {
         }
     }
 
-    let prompts = if args.len() > idx {
-        args[idx..].to_vec()
-    } else {
-        default_prompts()
-    };
+    let prompts = if args.len() > idx { args[idx..].to_vec() } else { default_prompts() };
 
     let head_addr = head_addr.ok_or_else(|| anyhow::anyhow!("missing --head <addr:port>"))?;
     let tail_addr = tail_addr.ok_or_else(|| anyhow::anyhow!("missing --tail <addr:port>"))?;
 
-    Ok((
-        model_path,
-        head_addr,
-        tail_addr,
-        max_tokens,
-        reconnect_after_prompt,
-        prompts,
-    ))
+    Ok((model_path, head_addr, tail_addr, max_tokens, reconnect_after_prompt, prompts))
 }
 
 fn main() -> Result<()> {
@@ -89,14 +78,8 @@ fn main() -> Result<()> {
         println!("tail_addr={tail_addr}");
         println!("head_stage={}", pair.head_info.stage_id);
         println!("tail_stage={}", pair.tail_info.stage_id);
-        println!(
-            "head_layers={}-{}",
-            pair.head_info.start_layer, pair.head_info.end_layer
-        );
-        println!(
-            "tail_layers={}-{}",
-            pair.tail_info.start_layer, pair.tail_info.end_layer
-        );
+        println!("head_layers={}-{}", pair.head_info.start_layer, pair.head_info.end_layer);
+        println!("tail_layers={}-{}", pair.tail_info.start_layer, pair.tail_info.end_layer);
         println!("max_tokens={max_tokens}");
         println!("reconnect_after_prompt={reconnect_after_prompt}");
         println!("baseline_text={:?}", baseline.text);

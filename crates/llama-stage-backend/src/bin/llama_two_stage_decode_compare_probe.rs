@@ -26,11 +26,7 @@ fn parse_args() -> (std::path::PathBuf, u32, Vec<String>) {
         idx += 2;
     }
 
-    let prompts = if args.len() > idx {
-        args[idx..].to_vec()
-    } else {
-        default_prompts()
-    };
+    let prompts = if args.len() > idx { args[idx..].to_vec() } else { default_prompts() };
 
     (model_path, max_tokens, prompts)
 }
@@ -124,10 +120,7 @@ fn main() -> Result<()> {
         println!("transfer_bytes={transfer_bytes}");
         println!("tail_decode_ms={tail_decode_ms_total}");
         println!("sample_ms={sample_ms_total}");
-        println!(
-            "ttft_ms={}",
-            head_prefill_ms + prompt_tail_ms + sample_ms_total
-        );
+        println!("ttft_ms={}", head_prefill_ms + prompt_tail_ms + sample_ms_total);
         println!("match={matches}");
         println!();
 

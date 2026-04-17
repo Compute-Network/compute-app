@@ -32,11 +32,7 @@ fn parse_args() -> (PathBuf, u32, Vec<String>) {
         idx += 2;
     }
 
-    let prompts = if args.len() > idx {
-        args[idx..].to_vec()
-    } else {
-        default_prompts()
-    };
+    let prompts = if args.len() > idx { args[idx..].to_vec() } else { default_prompts() };
 
     (model_path, max_tokens, prompts)
 }
@@ -118,11 +114,7 @@ impl StageNodeChild {
 
         let stdin = child.stdin.take().context("missing child stdin")?;
         let stdout = child.stdout.take().context("missing child stdout")?;
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        })
+        Ok(Self { child, stdin, stdout: BufReader::new(stdout) })
     }
 
     fn request(&mut self, request: &StageNodeRequest) -> Result<StageNodeResponse> {
@@ -193,9 +185,8 @@ fn main() -> Result<()> {
         let baseline = greedy_single_node_completion(&model_path, prompt, max_tokens)?;
         let baseline_ms = t_baseline.elapsed().as_millis();
 
-        let prompt_tokens = expect_token_ids(head.request(&StageNodeRequest::Tokenize {
-            text: prompt.clone(),
-        })?)?;
+        let prompt_tokens =
+            expect_token_ids(head.request(&StageNodeRequest::Tokenize { text: prompt.clone() })?)?;
 
         let t_head = Instant::now();
         let mut head_tensor = expect_tensor(head.request(&StageNodeRequest::BeginPrompt {
@@ -273,10 +264,7 @@ fn main() -> Result<()> {
         println!("transfer_bytes={transfer_bytes}");
         println!("tail_decode_ms={tail_decode_ms_total}");
         println!("sample_ms={sample_ms_total}");
-        println!(
-            "ttft_ms={}",
-            head_prefill_ms + prompt_tail_ms + sample_ms_total
-        );
+        println!("ttft_ms={}", head_prefill_ms + prompt_tail_ms + sample_ms_total);
         println!("match={matches}");
         println!();
 

@@ -7,10 +7,7 @@ use std::time::Instant;
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let (model_path, arg_idx) = resolve_model_arg(&args);
-    let prompt = args
-        .get(arg_idx)
-        .cloned()
-        .unwrap_or_else(|| "Hello".to_string());
+    let prompt = args.get(arg_idx).cloned().unwrap_or_else(|| "Hello".to_string());
 
     let mut head = LlamaStageBackend::new(&model_path)?;
     head.load_layout(StageLayout {

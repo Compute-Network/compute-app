@@ -302,10 +302,7 @@ pub async fn start_stage_prototype_with_bind_addr(
         })?,
         StageBackendKind::LlamaStageGateway => {
             resolve_model_path(&spec.model_name).with_context(|| {
-                format!(
-                    "No local GGUF found for llama-stage runtime model {}",
-                    spec.model_name
-                )
+                format!("No local GGUF found for llama-stage runtime model {}", spec.model_name)
             })?
         }
         StageBackendKind::RealForward => {

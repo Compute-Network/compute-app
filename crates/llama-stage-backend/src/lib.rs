@@ -914,6 +914,17 @@ impl LlamaStageBackend {
         }
 
         let floats = unsafe { slice::from_raw_parts(ptr, token_count * hidden_dim) };
+        if env::var_os("LLAMA_STAGE_DUMP_HIDDEN").is_some() {
+            let n = 8.min(floats.len());
+            eprintln!(
+                "[llama-stage] HEAD_EMIT request={} token_count={} hidden_dim={} first{}={:?}",
+                request_id,
+                token_count,
+                hidden_dim,
+                n,
+                &floats[..n]
+            );
+        }
         let mut bytes = Vec::with_capacity(floats.len() * std::mem::size_of::<f32>());
         for value in floats {
             bytes.extend_from_slice(&value.to_le_bytes());
@@ -1070,6 +1081,14 @@ impl LlamaStageBackend {
         let token_count = hidden.len() / input.hidden_dim;
         if token_count == 0 {
             bail!("empty hidden-state payload");
+        }
+
+        if env::var_os("LLAMA_STAGE_DUMP_HIDDEN").is_some() {
+            let n = 8.min(hidden.len());
+            eprintln!(
+                "[llama-stage] TAIL_RECV request={} stage={} token_count={} hidden_dim={} first{}={:?}",
+                input.request_id, layout.stage_id, token_count, input.hidden_dim, n, &hidden[..n]
+            );
         }
 
         let tokens = if let Some(token_ids) = token_ids {
@@ -2021,7 +2040,25 @@ fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
         }
         let trimmed = line.trim();
         if let Some(addr) = trimmed.strip_prefix("listening=") {
-            return Ok(addr.to_string());
+            let addr = addr.to_string();
+            let forward = env::var_os("LLAMA_STAGE_FORWARD_STDERR").is_some();
+            let label = addr.clone();
+            thread::spawn(move || {
+                let mut reader = reader;
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    match reader.read_line(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {
+                            if forward {
+                                eprint!("[child:{}] {}", label, buf);
+                            }
+                        }
+                    }
+                }
+            });
+            return Ok(addr);
         }
         if !trimmed.is_empty() {
             captured.push(trimmed.to_string());

@@ -45,19 +45,9 @@ fn parse_args() -> (PathBuf, u32, bool, bool, Vec<String>) {
         }
     }
 
-    let prompts = if args.len() > idx {
-        args[idx..].to_vec()
-    } else {
-        default_prompts()
-    };
+    let prompts = if args.len() > idx { args[idx..].to_vec() } else { default_prompts() };
 
-    (
-        model_path,
-        max_tokens,
-        reconnect_after_prompt,
-        interleave,
-        prompts,
-    )
+    (model_path, max_tokens, reconnect_after_prompt, interleave, prompts)
 }
 
 struct TcpStageChild {
@@ -181,11 +171,7 @@ impl GatewayChild {
         let stdin = child.stdin.take().context("missing gateway stdin")?;
         let stdout = child.stdout.take().context("missing gateway stdout")?;
 
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        })
+        Ok(Self { child, stdin, stdout: BufReader::new(stdout) })
     }
 
     fn request(&mut self, request: &StageGatewayRequest) -> Result<StageGatewayResponse> {
@@ -265,9 +251,7 @@ fn main() -> Result<()> {
                             token_ids: completion.token_ids,
                         });
                     }
-                    StageGatewayResponse::Step {
-                        step: GatewayStep::Token { .. },
-                    } => {}
+                    StageGatewayResponse::Step { step: GatewayStep::Token { .. } } => {}
                     other => bail!("unexpected response for gw-a: {other:?}"),
                 }
             }
@@ -284,9 +268,7 @@ fn main() -> Result<()> {
                             token_ids: completion.token_ids,
                         });
                     }
-                    StageGatewayResponse::Step {
-                        step: GatewayStep::Token { .. },
-                    } => {}
+                    StageGatewayResponse::Step { step: GatewayStep::Token { .. } } => {}
                     other => bail!("unexpected response for gw-b: {other:?}"),
                 }
             }

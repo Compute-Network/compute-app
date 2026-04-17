@@ -24,9 +24,7 @@ fn parse_args() -> Result<Args> {
         }
     }
 
-    Ok(Args {
-        gateway_addr: gateway_addr.context("missing --gateway")?,
-    })
+    Ok(Args { gateway_addr: gateway_addr.context("missing --gateway")? })
 }
 
 fn main() -> Result<()> {
@@ -53,9 +51,7 @@ fn main() -> Result<()> {
 
         let response = match serde_json::from_str::<StageGatewayRequest>(trimmed) {
             Ok(request) => handle_gateway_service_client_request(&mut client, request),
-            Err(err) => StageGatewayResponse::Error {
-                message: format!("invalid request: {err}"),
-            },
+            Err(err) => StageGatewayResponse::Error { message: format!("invalid request: {err}") },
         };
 
         serde_json::to_writer(&mut writer, &response)?;

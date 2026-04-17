@@ -11,10 +11,7 @@ use std::process::{Child, ChildStderr, Command, Stdio};
 use std::time::Instant;
 
 fn default_prompts() -> Vec<String> {
-    vec![
-        "The capital of France is".to_string(),
-        "The opposite of hot is".to_string(),
-    ]
+    vec!["The capital of France is".to_string(), "The opposite of hot is".to_string()]
 }
 
 fn parse_args() -> (PathBuf, u32, Vec<String>) {
@@ -31,11 +28,7 @@ fn parse_args() -> (PathBuf, u32, Vec<String>) {
         idx += 2;
     }
 
-    let prompts = if args.len() > idx {
-        args[idx..].to_vec()
-    } else {
-        default_prompts()
-    };
+    let prompts = if args.len() > idx { args[idx..].to_vec() } else { default_prompts() };
 
     (model_path, max_tokens, prompts)
 }
@@ -97,11 +90,7 @@ impl TcpStageChild {
         let addr = Self::read_listening_addr(stderr)?;
         let client = TcpStageClient::connect(&addr)?;
 
-        Ok(Self {
-            child,
-            addr,
-            client,
-        })
+        Ok(Self { child, addr, client })
     }
 
     fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
@@ -183,9 +172,8 @@ fn main() -> Result<()> {
     for (idx, prompt) in prompts.iter().enumerate() {
         let request_id = format!("interleave-{idx}");
         let baseline = greedy_single_node_completion(&model_path, prompt, max_tokens)?;
-        let prompt_tokens = expect_token_ids(head.request(&StageNodeRequest::Tokenize {
-            text: prompt.clone(),
-        })?)?;
+        let prompt_tokens =
+            expect_token_ids(head.request(&StageNodeRequest::Tokenize { text: prompt.clone() })?)?;
 
         let t_head = Instant::now();
         let head_tensor = expect_tensor(head.request(&StageNodeRequest::BeginPrompt {

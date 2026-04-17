@@ -45,19 +45,9 @@ fn parse_args() -> (PathBuf, u32, bool, bool, Vec<String>) {
         }
     }
 
-    let prompts = if args.len() > idx {
-        args[idx..].to_vec()
-    } else {
-        default_prompts()
-    };
+    let prompts = if args.len() > idx { args[idx..].to_vec() } else { default_prompts() };
 
-    (
-        model_path,
-        max_tokens,
-        reconnect_after_prompt,
-        interleave,
-        prompts,
-    )
+    (model_path, max_tokens, reconnect_after_prompt, interleave, prompts)
 }
 
 struct TcpStageChild {
@@ -229,30 +219,24 @@ fn main() -> Result<()> {
         let baseline_a = greedy_single_node_completion(&model_path, &prompts[0], max_tokens)?;
         let baseline_b = greedy_single_node_completion(&model_path, &prompts[1], max_tokens)?;
 
-        let _ = gateway
-            .client
-            .request(&StageGatewayRequest::BeginCompletion {
-                request_id: "gw-a".to_string(),
-                prompt: prompts[0].clone(),
-                max_tokens,
-            })?;
-        let _ = gateway
-            .client
-            .request(&StageGatewayRequest::BeginCompletion {
-                request_id: "gw-b".to_string(),
-                prompt: prompts[1].clone(),
-                max_tokens,
-            })?;
+        let _ = gateway.client.request(&StageGatewayRequest::BeginCompletion {
+            request_id: "gw-a".to_string(),
+            prompt: prompts[0].clone(),
+            max_tokens,
+        })?;
+        let _ = gateway.client.request(&StageGatewayRequest::BeginCompletion {
+            request_id: "gw-b".to_string(),
+            prompt: prompts[1].clone(),
+            max_tokens,
+        })?;
 
         let mut done_a = None;
         let mut done_b = None;
         while done_a.is_none() || done_b.is_none() {
             if done_a.is_none() {
-                match gateway
-                    .client
-                    .request(&StageGatewayRequest::StepCompletion {
-                        request_id: "gw-a".to_string(),
-                    })? {
+                match gateway.client.request(&StageGatewayRequest::StepCompletion {
+                    request_id: "gw-a".to_string(),
+                })? {
                     StageGatewayResponse::Step {
                         step: GatewayStep::Complete { completion, .. },
                     } => {
@@ -262,18 +246,14 @@ fn main() -> Result<()> {
                             token_ids: completion.token_ids,
                         });
                     }
-                    StageGatewayResponse::Step {
-                        step: GatewayStep::Token { .. },
-                    } => {}
+                    StageGatewayResponse::Step { step: GatewayStep::Token { .. } } => {}
                     other => bail!("unexpected response for gw-a: {other:?}"),
                 }
             }
             if done_b.is_none() {
-                match gateway
-                    .client
-                    .request(&StageGatewayRequest::StepCompletion {
-                        request_id: "gw-b".to_string(),
-                    })? {
+                match gateway.client.request(&StageGatewayRequest::StepCompletion {
+                    request_id: "gw-b".to_string(),
+                })? {
                     StageGatewayResponse::Step {
                         step: GatewayStep::Complete { completion, .. },
                     } => {
@@ -283,9 +263,7 @@ fn main() -> Result<()> {
                             token_ids: completion.token_ids,
                         });
                     }
-                    StageGatewayResponse::Step {
-                        step: GatewayStep::Token { .. },
-                    } => {}
+                    StageGatewayResponse::Step { step: GatewayStep::Token { .. } } => {}
                     other => bail!("unexpected response for gw-b: {other:?}"),
                 }
             }

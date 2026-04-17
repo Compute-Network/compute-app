@@ -66,9 +66,7 @@ fn handle_stream(stream: TcpStream, gateway: &mut RemoteStageGateway) -> Result<
 
         let response = match serde_json::from_str::<StageGatewayRequest>(trimmed) {
             Ok(request) => handle_stage_gateway_request(gateway, request),
-            Err(err) => StageGatewayResponse::Error {
-                message: format!("invalid request: {err}"),
-            },
+            Err(err) => StageGatewayResponse::Error { message: format!("invalid request: {err}") },
         };
 
         serde_json::to_writer(&mut writer, &response)?;
@@ -81,11 +79,8 @@ fn handle_stream(stream: TcpStream, gateway: &mut RemoteStageGateway) -> Result<
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let mut gateway = RemoteStageGateway::connect(
-        &args.head_addr,
-        &args.tail_addr,
-        args.reconnect_after_prompt,
-    )?;
+    let mut gateway =
+        RemoteStageGateway::connect(&args.head_addr, &args.tail_addr, args.reconnect_after_prompt)?;
 
     let listener = TcpListener::bind(&args.bind_addr)
         .with_context(|| format!("binding {}", args.bind_addr))?;

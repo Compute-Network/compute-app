@@ -15,11 +15,7 @@ fn default_prompts() -> Vec<String> {
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let (model_path, arg_idx) = resolve_model_arg(&args);
-    let prompts = if args.len() > arg_idx {
-        args[arg_idx..].to_vec()
-    } else {
-        default_prompts()
-    };
+    let prompts = if args.len() > arg_idx { args[arg_idx..].to_vec() } else { default_prompts() };
 
     let mut head = LlamaStageBackend::new(&model_path)?;
     head.load_layout(StageLayout {
