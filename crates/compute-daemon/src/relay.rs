@@ -15,7 +15,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::inference::llama_stage_gateway::LlamaStageGatewayRelayClient;
+use crate::inference::llama_stage_gateway::{
+    LlamaStageGatewayRelayClient, extract_request_prompt, extract_stop_sequences,
+};
 use crate::stage_runtime::StagePrototypeClient;
 use if_addrs::{IfAddr, get_if_addrs};
 use std::collections::BTreeSet;
@@ -1133,96 +1135,6 @@ async fn handle_stage_gateway_request(
             status: 502,
             body: serde_json::json!({"error": format!("Stage gateway request failed: {err}")}),
         },
-    }
-}
-
-fn extract_request_prompt(body: &serde_json::Value) -> String {
-    if let Some(prompt) = body.get("prompt").and_then(|value| value.as_str()) {
-        return prompt.to_string();
-    }
-
-    if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
-        for message in messages.iter().rev() {
-            let role = message.get("role").and_then(|value| value.as_str()).unwrap_or("user");
-            if role != "user" {
-                continue;
-            }
-
-            if let Some(content) = message.get("content") {
-                if let Some(text) = content.as_str() {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        return trimmed.to_string();
-                    }
-                } else if let Some(parts) = content.as_array() {
-                    let text = parts
-                        .iter()
-                        .filter_map(|part| {
-                            if part.get("type").and_then(|value| value.as_str()) == Some("text") {
-                                part.get("text")
-                                    .and_then(|value| value.as_str())
-                                    .map(str::to_string)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .trim()
-                        .to_string();
-                    if !text.is_empty() {
-                        return text;
-                    }
-                }
-            }
-        }
-
-        let combined = messages
-            .iter()
-            .filter_map(|message| {
-                let role = message.get("role").and_then(|value| value.as_str()).unwrap_or("user");
-                let content = message.get("content")?;
-                if let Some(text) = content.as_str() {
-                    Some(format!("{role}: {text}"))
-                } else if let Some(parts) = content.as_array() {
-                    let text = parts
-                        .iter()
-                        .filter_map(|part| {
-                            if part.get("type").and_then(|value| value.as_str()) == Some("text") {
-                                part.get("text")
-                                    .and_then(|value| value.as_str())
-                                    .map(str::to_string)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if text.is_empty() { None } else { Some(format!("{role}: {text}")) }
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !combined.is_empty() {
-            return combined;
-        }
-    }
-
-    String::new()
-}
-
-fn extract_stop_sequences(body: &serde_json::Value) -> Vec<String> {
-    match body.get("stop") {
-        Some(serde_json::Value::String(stop)) if !stop.is_empty() => vec![stop.clone()],
-        Some(serde_json::Value::Array(values)) => values
-            .iter()
-            .filter_map(|value| value.as_str())
-            .filter(|stop| !stop.is_empty())
-            .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
     }
 }
 

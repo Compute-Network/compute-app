@@ -309,43 +309,35 @@ fn connect_gateway_service_client(
 }
 
 pub fn extract_request_prompt(body: &serde_json::Value) -> String {
+    // Legacy completion-style API: pass a pre-formed prompt through untouched
+    // so callers can opt out of the chat template if they want to drive the
+    // tokenizer directly.
     if let Some(prompt) = body.get("prompt").and_then(|value| value.as_str()) {
         return prompt.to_string();
     }
 
     if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
+        // Chat-style API: format with the model's chat template before
+        // tokenization. Without this, the head tokenizes raw user text and
+        // the model treats it as a continuation — which is why short prompts
+        // like `say "hi"` loop ("hi" and then "hi" again, and then...) while
+        // long prompts coincidentally work because the instruction itself
+        // disambiguates. Currently only Gemma runs through the split path;
+        // other families fall back to the legacy last-user behaviour.
+        let model = body.get("model").and_then(|value| value.as_str()).unwrap_or("");
+        if is_gemma_model(model) {
+            return format_gemma_chat(messages);
+        }
+
         for message in messages.iter().rev() {
             let role = message.get("role").and_then(|value| value.as_str()).unwrap_or("user");
             if role != "user" {
                 continue;
             }
 
-            if let Some(content) = message.get("content") {
-                if let Some(text) = content.as_str() {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        return trimmed.to_string();
-                    }
-                } else if let Some(parts) = content.as_array() {
-                    let text = parts
-                        .iter()
-                        .filter_map(|part| {
-                            if part.get("type").and_then(|value| value.as_str()) == Some("text") {
-                                part.get("text")
-                                    .and_then(|value| value.as_str())
-                                    .map(str::to_string)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .trim()
-                        .to_string();
-                    if !text.is_empty() {
-                        return text;
-                    }
-                }
+            let text = message_content_text(message);
+            if !text.is_empty() {
+                return text;
             }
         }
 
@@ -383,6 +375,96 @@ pub fn extract_request_prompt(body: &serde_json::Value) -> String {
     }
 
     String::new()
+}
+
+fn is_gemma_model(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("gemma")
+}
+
+fn message_content_text(message: &serde_json::Value) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
+    if let Some(text) = content.as_str() {
+        return text.trim().to_string();
+    }
+    if let Some(parts) = content.as_array() {
+        return parts
+            .iter()
+            .filter_map(|part| {
+                if part.get("type").and_then(|value| value.as_str()) == Some("text") {
+                    part.get("text").and_then(|value| value.as_str()).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+    }
+    String::new()
+}
+
+/// Format chat messages with Gemma's chat template so the model sees proper
+/// turn markers. Gemma does not have a native `system` role, so system
+/// messages are prepended to the first user turn (matching the HF tokenizer
+/// config's fallback behaviour). BOS is added automatically by llama.cpp's
+/// tokenize() when `add_special=true`, so we start directly with
+/// `<start_of_turn>user`.
+fn format_gemma_chat(messages: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    let mut system_prefix = String::new();
+    let mut first_user_emitted = false;
+
+    for message in messages {
+        let role = message.get("role").and_then(|value| value.as_str()).unwrap_or("user");
+        let content = message_content_text(message);
+        if content.is_empty() {
+            continue;
+        }
+
+        if role == "system" {
+            if !system_prefix.is_empty() {
+                system_prefix.push_str("\n\n");
+            }
+            system_prefix.push_str(&content);
+            continue;
+        }
+
+        let gemma_role = if role == "assistant" { "model" } else { "user" };
+
+        let body = if gemma_role == "user" && !first_user_emitted && !system_prefix.is_empty() {
+            let merged = format!("{system_prefix}\n\n{content}");
+            system_prefix.clear();
+            merged
+        } else {
+            content
+        };
+
+        if gemma_role == "user" {
+            first_user_emitted = true;
+        }
+
+        out.push_str("<start_of_turn>");
+        out.push_str(gemma_role);
+        out.push('\n');
+        out.push_str(&body);
+        out.push_str("<end_of_turn>\n");
+    }
+
+    // Bare system-only input: emit it as a user turn so the model has
+    // something to respond to.
+    if out.is_empty() && !system_prefix.is_empty() {
+        out.push_str("<start_of_turn>user\n");
+        out.push_str(&system_prefix);
+        out.push_str("<end_of_turn>\n");
+    }
+
+    // Generation prompt tells the model it's its turn to speak.
+    out.push_str("<start_of_turn>model\n");
+    out
 }
 
 pub fn extract_stop_sequences(body: &serde_json::Value) -> Vec<String> {
@@ -549,6 +631,74 @@ mod tests {
             ]
         });
         assert_eq!(extract_request_prompt(&body), "Second request");
+    }
+
+    #[test]
+    fn extract_request_prompt_applies_gemma_chat_template_for_short_prompt() {
+        // Without the template, short prompts like `Say "hi"` get tokenized as
+        // raw text and Gemma continues them in a loop instead of answering.
+        // The template wraps the turn in `<start_of_turn>user` markers and
+        // closes with `<start_of_turn>model` so the model knows it's replying.
+        let body = serde_json::json!({
+            "model": "gemma-4-e4b-q4",
+            "messages": [
+                {"role": "user", "content": "Say \"hi\""}
+            ]
+        });
+        assert_eq!(
+            extract_request_prompt(&body),
+            "<start_of_turn>user\nSay \"hi\"<end_of_turn>\n<start_of_turn>model\n"
+        );
+    }
+
+    #[test]
+    fn extract_request_prompt_merges_system_into_first_user_for_gemma() {
+        // Gemma has no native system role; HF fallback folds it into the first
+        // user turn separated by a blank line.
+        let body = serde_json::json!({
+            "model": "gemma-4-e4b-q4",
+            "messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "user", "content": "Say hi"}
+            ]
+        });
+        assert_eq!(
+            extract_request_prompt(&body),
+            "<start_of_turn>user\nYou are terse.\n\nSay hi<end_of_turn>\n<start_of_turn>model\n"
+        );
+    }
+
+    #[test]
+    fn extract_request_prompt_renders_gemma_multi_turn_dialogue() {
+        let body = serde_json::json!({
+            "model": "gemma-4-e4b-q4",
+            "messages": [
+                {"role": "user", "content": "Who won?"},
+                {"role": "assistant", "content": "Nobody."},
+                {"role": "user", "content": "Why?"}
+            ]
+        });
+        assert_eq!(
+            extract_request_prompt(&body),
+            "<start_of_turn>user\nWho won?<end_of_turn>\n\
+             <start_of_turn>model\nNobody.<end_of_turn>\n\
+             <start_of_turn>user\nWhy?<end_of_turn>\n\
+             <start_of_turn>model\n"
+        );
+    }
+
+    #[test]
+    fn extract_request_prompt_gemma_preserves_raw_prompt_field() {
+        // When the caller passes `prompt`, they've already formatted it —
+        // don't double-wrap.
+        let body = serde_json::json!({
+            "model": "gemma-4-e4b-q4",
+            "prompt": "<start_of_turn>user\npre-baked<end_of_turn>\n<start_of_turn>model\n",
+        });
+        assert_eq!(
+            extract_request_prompt(&body),
+            "<start_of_turn>user\npre-baked<end_of_turn>\n<start_of_turn>model\n"
+        );
     }
 
     #[test]
