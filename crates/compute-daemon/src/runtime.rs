@@ -1767,5 +1767,69 @@ fn detect_downloaded_models() -> String {
             }
         }
     }
+
+    // Also advertise per-stage shards. The scheduler uses these synthetic IDs
+    // (e.g. "gemma-4-e4b-q4-stage-head-0-20") to pick head/tail assignments
+    // that match what each node already has cached, avoiding redundant
+    // 2.5 GB downloads for the opposite role.
+    for shard in detect_cached_stage_shards() {
+        if !models.contains(&shard) {
+            models.push(shard);
+        }
+    }
+
     models.join(",")
+}
+
+/// Scan ~/.compute/stages/<model_id>/<role>-<start>-<end>.gguf and return
+/// synthetic IDs like "gemma-4-e4b-q4-stage-head-0-20" for each valid shard.
+fn detect_cached_stage_shards() -> Vec<String> {
+    let stages_dir = dirs::home_dir().unwrap_or_default().join(".compute").join("stages");
+    let mut shards = Vec::new();
+
+    let Ok(model_dirs) = std::fs::read_dir(&stages_dir) else {
+        return shards;
+    };
+
+    for model_entry in model_dirs.flatten() {
+        if !model_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let model_id = model_entry.file_name().to_string_lossy().to_string();
+        let Ok(files) = std::fs::read_dir(model_entry.path()) else { continue };
+
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".gguf") {
+                continue;
+            }
+            // Expect "<role>-<start>-<end>.gguf".
+            let stem = name.trim_end_matches(".gguf");
+            let parts: Vec<&str> = stem.splitn(3, '-').collect();
+            if parts.len() != 3 {
+                continue;
+            }
+            let role = parts[0];
+            if role != "head" && role != "tail" {
+                continue;
+            }
+            let (Ok(start), Ok(end)) = (parts[1].parse::<u32>(), parts[2].parse::<u32>()) else {
+                continue;
+            };
+
+            // Basic size + magic sanity (shards are 2-3 GB).
+            if let Ok(meta) = file.metadata() {
+                if meta.len() < 100 * 1024 * 1024 {
+                    continue;
+                }
+            }
+            if !is_valid_gguf(&file.path()) {
+                continue;
+            }
+
+            shards.push(format!("{}-stage-{}-{}-{}", model_id, role, start, end));
+        }
+    }
+
+    shards
 }
