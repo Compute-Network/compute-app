@@ -2792,6 +2792,12 @@ fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
         let trimmed = line.trim();
         if let Some(addr) = trimmed.strip_prefix("listening=") {
             let addr = addr.to_string();
+            // Forward the pre-`listening=` banner lines (draft_model=, spec_active=, etc.)
+            // to the parent's stderr so they show up in the daemon log. Without this,
+            // capability negotiation results are only visible if the child crashes.
+            for prior in &captured {
+                eprintln!("[child:{}] {}", addr, prior);
+            }
             let forward = env::var_os("LLAMA_STAGE_FORWARD_STDERR").is_some();
             let label = addr.clone();
             thread::spawn(move || {
