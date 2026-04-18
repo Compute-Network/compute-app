@@ -173,6 +173,7 @@ type FnInitFromModel =
 type FnContextFree = unsafe extern "C" fn(*mut ffi::LlamaContext);
 type FnGetMemory = unsafe extern "C" fn(*const ffi::LlamaContext) -> *mut ffi::LlamaMemory;
 type FnMemoryClear = unsafe extern "C" fn(*mut ffi::LlamaMemory, bool);
+type FnMemorySeqRm = unsafe extern "C" fn(*mut ffi::LlamaMemory, i32, i32, i32) -> bool;
 type FnModelGetVocab = unsafe extern "C" fn(*const ffi::LlamaModel) -> *const ffi::LlamaVocab;
 type FnModelNEmbdOut = unsafe extern "C" fn(*const ffi::LlamaModel) -> i32;
 type FnVocabNTokens = unsafe extern "C" fn(*const ffi::LlamaVocab) -> i32;
@@ -208,6 +209,7 @@ struct LlamaApi {
     context_free: FnContextFree,
     get_memory: FnGetMemory,
     memory_clear: FnMemoryClear,
+    memory_seq_rm: FnMemorySeqRm,
     model_get_vocab: FnModelGetVocab,
     model_n_embd_out: FnModelNEmbdOut,
     vocab_n_tokens: FnVocabNTokens,
@@ -287,6 +289,7 @@ impl LlamaApi {
                 context_free: load_symbol(&llama, b"llama_free\0")?,
                 get_memory: load_symbol(&llama, b"llama_get_memory\0")?,
                 memory_clear: load_symbol(&llama, b"llama_memory_clear\0")?,
+                memory_seq_rm: load_symbol(&llama, b"llama_memory_seq_rm\0")?,
                 model_get_vocab: load_symbol(&llama, b"llama_model_get_vocab\0")?,
                 model_n_embd_out: load_symbol(&llama, b"llama_model_n_embd_out\0")?,
                 vocab_n_tokens: load_symbol(&llama, b"llama_vocab_n_tokens\0")?,
@@ -2629,4 +2632,80 @@ pub fn greedy_single_node_completion(
     unsafe { (backend.api.model_free)(model.model) };
 
     Ok(GreedyCompletion { completion_tokens: token_ids.len() as u32, text, token_ids })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 0 spike helpers — temporary scaffolding for batched_decode_bench.
+//
+// These exist purely to time llama_decode at varying batch sizes from a
+// minimal probe binary. Not used by the production gateway code; safe to
+// delete once the spike concludes.
+// ---------------------------------------------------------------------------
+
+pub struct BenchHandles {
+    pub model_ptr: *mut ffi::LlamaModel,
+    pub session_ctx: *mut ffi::LlamaContext,
+}
+
+impl LlamaStageBackend {
+    pub fn single_node_for_bench(model_path: PathBuf) -> Result<Self> {
+        let api = LlamaApi::load()?;
+        Ok(Self {
+            api,
+            model_path,
+            state: RefCell::new(BackendState {
+                layout: None,
+                model: None,
+                sessions: HashMap::new(),
+            }),
+        })
+    }
+
+    pub fn bench_prefill_and_seed(
+        &self,
+        prompt: &str,
+    ) -> Result<(*mut ffi::LlamaModel, *mut ffi::LlamaContext, i32)> {
+        let model = LlamaModelHandle::new(&self.api, &self.model_path)?;
+        let session = model.create_session(&self.api)?;
+        session.clear_memory(&self.api);
+
+        let prompt_tokens = self.tokenize_prompt(&model, prompt)?;
+        let prefill = OwnedBatch::token_only(prompt_tokens.clone());
+        let rc = unsafe { (self.api.decode)(session.ctx, prefill.raw) };
+        if rc != 0 && rc != 1 {
+            bail!("bench prefill failed with {}", rc);
+        }
+        let seed = self.greedy_sample(model.model, &session, "bench", "bench")?;
+
+        let session_ctx = session.ctx;
+        let model_ptr = model.model;
+        // Intentionally leak — bench_cleanup releases.
+        std::mem::forget(session);
+        std::mem::forget(model);
+        Ok((model_ptr, session_ctx, seed.token_id))
+    }
+
+    pub fn bench_decode_batch(
+        &self,
+        session_ctx: *mut ffi::LlamaContext,
+        token_id: i32,
+        batch_size: usize,
+    ) -> Result<()> {
+        let tokens = vec![token_id; batch_size];
+        let batch = OwnedBatch::token_only(tokens);
+        let rc = unsafe { (self.api.decode)(session_ctx, batch.raw) };
+        if rc != 0 && rc != 1 {
+            bail!("bench decode failed with {}", rc);
+        }
+        Ok(())
+    }
+
+    pub fn bench_cleanup(
+        &self,
+        model_ptr: *mut ffi::LlamaModel,
+        session_ctx: *mut ffi::LlamaContext,
+    ) {
+        unsafe { (self.api.context_free)(session_ctx) };
+        unsafe { (self.api.model_free)(model_ptr) };
+    }
 }
