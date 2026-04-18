@@ -746,9 +746,9 @@ impl Default for SpecDecodeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            start_k: 6,
+            start_k: 4,
             min_k: 1,
-            max_k: 12,
+            max_k: 4,
             disable_after_consec_zero: 3,
         }
     }

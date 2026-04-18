@@ -31,32 +31,57 @@ fn main() -> Result<()> {
     let prompt = args.next().unwrap_or_else(|| "The capital of France is".to_string());
     let max_tokens: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(48);
 
+    // Per-stage overrides (for testing with reindexed shard GGUFs, where each
+    // shard has its own layer range 0..N-1). Fall back to target_path so the
+    // single-file path still works.
+    let head_model_path = std::env::var("HEAD_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| target_path.clone());
+    let tail_model_path = std::env::var("TAIL_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| target_path.clone());
+
     if !draft_path.exists() {
         bail!("draft model not found: {}", draft_path.display());
     }
-    if !target_path.exists() {
-        bail!("target model not found: {}", target_path.display());
+    if !head_model_path.exists() {
+        bail!("head model not found: {}", head_model_path.display());
+    }
+    if !tail_model_path.exists() {
+        bail!("tail model not found: {}", tail_model_path.display());
     }
 
-    eprintln!("[probe] draft  = {}", draft_path.display());
-    eprintln!("[probe] target = {}", target_path.display());
+    eprintln!("[probe] draft      = {}", draft_path.display());
+    eprintln!("[probe] head model = {}", head_model_path.display());
+    eprintln!("[probe] tail model = {}", tail_model_path.display());
     eprintln!("[probe] prompt = {prompt:?} max_tokens = {max_tokens}");
 
-    // Match production split: 42 layers, head 0..=20, tail 21..=41.
+    // Match production split: 42 layers, head 0..=20, tail 21..=41. For
+    // reindexed shards (HEAD_MODEL/TAIL_MODEL pointing at per-stage GGUFs),
+    // each shard renumbers to 0..N-1, so override HEAD_START=0 HEAD_END=20
+    // TAIL_START=0 TAIL_END=20.
+    let head_start: u32 =
+        std::env::var("HEAD_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let head_end: u32 = std::env::var("HEAD_END").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
     let tail_start: u32 = std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(21);
     let tail_end: u32 = std::env::var("TAIL_END").ok().and_then(|s| s.parse().ok()).unwrap_or(41);
 
     let launch = ManagedGatewayLaunchSpec::default();
 
-    eprintln!("[probe] spawning head (layers 0..={head_end})");
-    let head = ManagedHeadNode::spawn(target_path.clone(), "127.0.0.1:0", 0, head_end, &launch)
-        .context("spawn head")?;
+    eprintln!("[probe] spawning head (layers {head_start}..={head_end})");
+    let head = ManagedHeadNode::spawn(
+        head_model_path.clone(),
+        "127.0.0.1:0",
+        head_start,
+        head_end,
+        &launch,
+    )
+    .context("spawn head")?;
     eprintln!("[probe] head listening on {}", head.addr());
 
     eprintln!("[probe] spawning tail (layers {tail_start}..={tail_end})");
     let tail = ManagedTailNode::spawn(
-        target_path.clone(),
+        tail_model_path.clone(),
         "127.0.0.1:0",
         tail_start,
         tail_end,
