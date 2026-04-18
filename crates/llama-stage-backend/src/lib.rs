@@ -2,6 +2,8 @@ use anyhow::{Context, Result, bail};
 use libloading::Library;
 use serde::{Deserialize, Serialize};
 use stage_forward_lab::{PayloadKind, StageForwardBackend, StageLayout, StageSample, StageTensor};
+
+pub use stage_forward_lab::{PayloadKind as StagePayloadKind, StageTensor as StageTensorPayload};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
@@ -197,7 +199,7 @@ type FnGetEmbeddings = unsafe extern "C" fn(*mut ffi::LlamaContext) -> *mut f32;
 type FnGetLogitsIth = unsafe extern "C" fn(*mut ffi::LlamaContext, i32) -> *mut f32;
 type FnVocabIsEog = unsafe extern "C" fn(*const ffi::LlamaVocab, i32) -> bool;
 
-struct LlamaApi {
+pub(crate) struct LlamaApi {
     _deps: Vec<Library>,
     _llama: Library,
     backend_init: FnBackendInit,
@@ -225,7 +227,7 @@ struct LlamaApi {
 }
 
 impl LlamaApi {
-    fn load() -> Result<Self> {
+    pub(crate) fn load() -> Result<Self> {
         let lib_dir = resolve_vendor_lib_dir()?;
         let mut dylibs: Vec<PathBuf> = fs::read_dir(&lib_dir)
             .with_context(|| format!("reading {}", lib_dir.display()))?
@@ -313,12 +315,12 @@ impl LlamaApi {
     }
 }
 
-struct LlamaModelHandle {
-    model: *mut ffi::LlamaModel,
+pub(crate) struct LlamaModelHandle {
+    pub(crate) model: *mut ffi::LlamaModel,
 }
 
 impl LlamaModelHandle {
-    fn new(api: &LlamaApi, model_path: &Path) -> Result<Self> {
+    pub(crate) fn new(api: &LlamaApi, model_path: &Path) -> Result<Self> {
         let path = CString::new(model_path.to_string_lossy().as_bytes())?;
         let force_cpu = std::env::var_os("LLAMA_STAGE_FORCE_CPU").is_some();
 
@@ -344,7 +346,7 @@ impl LlamaModelHandle {
         unsafe { (api.model_n_embd_out)(self.model) as usize }
     }
 
-    fn create_session(&self, api: &LlamaApi) -> Result<LlamaSession> {
+    pub(crate) fn create_session(&self, api: &LlamaApi) -> Result<LlamaSession> {
         let force_cpu = std::env::var_os("LLAMA_STAGE_FORCE_CPU").is_some();
 
         let mut cparams = unsafe { (api.context_default_params)() };
@@ -375,8 +377,8 @@ impl LlamaModelHandle {
     }
 }
 
-struct LlamaSession {
-    ctx: *mut ffi::LlamaContext,
+pub(crate) struct LlamaSession {
+    pub(crate) ctx: *mut ffi::LlamaContext,
 }
 
 impl LlamaSession {
@@ -395,6 +397,7 @@ impl LlamaSession {
 struct OwnedBatch {
     _tokens: Option<Vec<i32>>,
     _embd: Option<Vec<f32>>,
+    _logits: Option<Vec<i8>>,
     raw: ffi::llama_batch,
 }
 
@@ -411,7 +414,7 @@ impl OwnedBatch {
             seq_id: std::ptr::null_mut(),
             logits: std::ptr::null_mut(),
         };
-        Self { _tokens: Some(tokens), _embd: None, raw }
+        Self { _tokens: Some(tokens), _embd: None, _logits: None, raw }
     }
 
     fn token_and_hidden(tokens: Option<Vec<i32>>, hidden: Vec<f32>, token_count: usize) -> Self {
@@ -432,7 +435,41 @@ impl OwnedBatch {
             logits: std::ptr::null_mut(),
         };
 
-        Self { _tokens: token_buf, _embd: Some(embd), raw }
+        Self { _tokens: token_buf, _embd: Some(embd), _logits: None, raw }
+    }
+
+    /// Builds a batch from a stack of pre-computed hidden states (k+1 wide for
+    /// spec verification) and requests logits at every batch position. Used
+    /// only by the tail's verify path — the per-position logits let us
+    /// greedy-sample each candidate position to compare against the draft.
+    /// Mirrors `token_and_hidden` (carries the token IDs as well) so the tail
+    /// sees the same batch shape as in the production single-step path.
+    fn hidden_with_per_pos_logits(
+        tokens: Vec<i32>,
+        hidden: Vec<f32>,
+        token_count: usize,
+    ) -> Self {
+        let mut token_buf = tokens;
+        let mut embd = hidden;
+        let mut logits = vec![1i8; token_count];
+        let n_tokens = token_count as i32;
+
+        let raw = ffi::llama_batch {
+            n_tokens,
+            token: token_buf.as_mut_ptr(),
+            embd: embd.as_mut_ptr(),
+            pos: std::ptr::null_mut(),
+            n_seq_id: std::ptr::null_mut(),
+            seq_id: std::ptr::null_mut(),
+            logits: logits.as_mut_ptr(),
+        };
+
+        Self {
+            _tokens: Some(token_buf),
+            _embd: Some(embd),
+            _logits: Some(logits),
+            raw,
+        }
     }
 }
 
@@ -446,6 +483,11 @@ struct CachedSample {
 struct SessionState {
     session: LlamaSession,
     cached_sample: Option<CachedSample>,
+    /// Next free KV-cache position for this sequence. Maintained at every
+    /// successful decode site so speculative-decode verification can compute
+    /// the rollback target (`keep_count = n_pos_before + accepted + 1`) after
+    /// partial draft acceptance.
+    n_pos: i32,
 }
 
 struct BackendState {
@@ -495,6 +537,30 @@ pub enum StageNodeRequest {
     SampleTail { tensor: StageTensor },
     SampleTailToken { tensor: StageTensor },
     ClearDecodeSession { request_id: String },
+    // Speculative decoding (spec_decode_v1). Head produces `draft_k` candidate
+    // tokens via a small draft model, then runs the head stage of the target
+    // model on those tokens in a single batched forward. Returns the stacked
+    // hidden states + the candidate ids the tail will verify.
+    ContinueHeadDraftK {
+        request_id: String,
+        last_token: i32,
+        draft_k: u32,
+        max_tokens: Option<u32>,
+    },
+    // Tail-side verification: runs the tail stage on `tensor` (k stacked hidden
+    // states), greedy-samples each position, and accepts the longest prefix
+    // that matches `draft_tokens`. KV writes for accepted positions are
+    // committed; rejected suffix is rolled back before responding.
+    ContinueForwardVerifyK {
+        request_id: String,
+        tensor: StageTensor,
+        last_token: i32,
+        draft_tokens: Vec<i32>,
+        clear_memory: bool,
+    },
+    // KV-cache rollback after partial draft acceptance. `keep_count` is the
+    // number of token positions to retain from the start of the sequence.
+    RollbackKv { request_id: String, keep_count: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +580,22 @@ pub enum StageNodeResponse {
     },
     Sample { sample: StageSample },
     TokenSample { sample: GreedyTokenSample },
+    // Result of ContinueForwardVerifyK. `accepted_count` is the number of
+    // draft tokens that matched the target's prediction (0..=draft_k).
+    // `accepted_token_ids` has length accepted_count + 1: the accepted draft
+    // prefix plus one bonus token (the target's own prediction at the
+    // divergence point, or after the full match). `is_eog` is true if the
+    // bonus token is an end-of-generation marker.
+    VerifiedBatch {
+        accepted_count: u32,
+        accepted_token_ids: Vec<i32>,
+        // Detokenized piece for each id in `accepted_token_ids`, in matching
+        // order. Populated so the gateway can stream text without an extra
+        // round-trip; same `token_to_piece` path as `cached_tail_sample`.
+        #[serde(default)]
+        accepted_pieces: Vec<String>,
+        is_eog: bool,
+    },
     Ack,
     Error { message: String },
 }
@@ -539,6 +621,11 @@ pub struct StageNodeInfo {
     pub end_layer: u32,
     pub is_head: bool,
     pub is_tail: bool,
+    // Capability flag for spec_decode_v1 (ContinueHeadDraftK /
+    // ContinueForwardVerifyK / RollbackKv). Defaulted false for back-compat
+    // with v≤0.2.34 peers that omit the field.
+    #[serde(default)]
+    pub spec_decode_v1: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,12 +694,58 @@ struct GatewaySessionState {
     // consume without a SampleTailToken round-trip. None on the very first
     // step only if the tail is an old build that doesn't ship inline samples.
     pending_tail_sample: Option<GreedyTokenSample>,
+    // Tokens that the most recent spec round committed but haven't been
+    // surfaced through step_completion yet. step_completion drains this
+    // before scheduling the next forward pass, which is what lets us amortize
+    // a single (head_batch + tail_verify) round-trip over multiple emissions.
+    pending_committed: std::collections::VecDeque<GreedyTokenSample>,
+    // Tracked head-side KV position. Required for partial-accept rollback
+    // (`head.rollback_kv(head_n_pos_before_batch + accepted + 1)`); the head
+    // is remote so we can't query it cheaply per round.
+    head_n_pos: i32,
+    // Per-session adaptive spec-decode state. `current_k` shrinks on
+    // consecutive low-acceptance rounds and recovers on full accepts.
+    current_k: u32,
+    consec_low_accept: u32,
+}
+
+/// Tunables for the adaptive speculative-decoding loop. A request can opt out
+/// entirely by passing `enabled=false`; otherwise `start_k` is the initial
+/// draft window and the loop will shrink it on consecutive low-acceptance
+/// rounds. Defaults align with the validated bench sweet spot (k=4) and the
+/// "drop to k=1 then disable" rule from the Phase 0 plan.
+#[derive(Debug, Clone, Copy)]
+pub struct SpecDecodeConfig {
+    pub enabled: bool,
+    pub start_k: u32,
+    pub min_k: u32,
+    pub max_k: u32,
+    /// After this many consecutive 0-accept rounds at the smallest k, suspend
+    /// speculation for the remainder of the session.
+    pub disable_after_consec_zero: u32,
+}
+
+impl Default for SpecDecodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            start_k: 4,
+            min_k: 1,
+            max_k: 4,
+            disable_after_consec_zero: 3,
+        }
+    }
 }
 
 pub struct RemoteStageGateway {
     pair: RemoteStagePair,
     reconnect_after_prompt: bool,
     sessions: HashMap<String, GatewaySessionState>,
+    /// Optional draft engine for speculative decoding. When present AND both
+    /// head/tail advertise spec_decode_v1, step_completion runs the batched
+    /// spec path; otherwise it falls back to the per-token loop.
+    draft: Option<DraftEngine>,
+    spec_config: SpecDecodeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -902,9 +1035,10 @@ impl LlamaStageBackend {
         if !state.sessions.contains_key(request_id) {
             let session =
                 state.model.as_ref().expect("model initialized").create_session(&self.api)?;
-            state
-                .sessions
-                .insert(request_id.to_string(), SessionState { session, cached_sample: None });
+            state.sessions.insert(
+                request_id.to_string(),
+                SessionState { session, cached_sample: None, n_pos: 0 },
+            );
         }
         Ok(state.sessions.get_mut(request_id).expect("session initialized"))
     }
@@ -1062,6 +1196,7 @@ impl LlamaStageBackend {
         if clear_memory {
             session_state.cached_sample = None;
             session_state.session.clear_memory(&self.api);
+            session_state.n_pos = 0;
         }
 
         let batch = OwnedBatch::token_only(token_ids.clone());
@@ -1071,6 +1206,7 @@ impl LlamaStageBackend {
         if rc != 0 && rc != 1 {
             bail!("llama_decode_head failed with {}", rc);
         }
+        session_state.n_pos += token_ids.len() as i32;
 
         self.embeddings_to_tensor(
             &session_state.session,
@@ -1137,6 +1273,7 @@ impl LlamaStageBackend {
         if clear_memory {
             session_state.cached_sample = None;
             session_state.session.clear_memory(&self.api);
+            session_state.n_pos = 0;
         }
 
         if layout.is_tail {
@@ -1150,6 +1287,7 @@ impl LlamaStageBackend {
             if rc != 0 && rc != 1 {
                 bail!("llama_decode_tail failed with {}", rc);
             }
+            session_state.n_pos += token_count as i32;
             session_state.cached_sample = Some(self.greedy_sample(
                 model_ptr,
                 &session_state.session,
@@ -1184,6 +1322,7 @@ impl LlamaStageBackend {
         if rc != 0 && rc != 1 {
             bail!("llama_decode_middle failed with {}", rc);
         }
+        session_state.n_pos += token_count as i32;
 
         let mut stage_trace = input.stage_trace;
         stage_trace.push(layout.stage_id.clone());
@@ -1245,6 +1384,11 @@ impl LlamaStageBackend {
             end_layer: layout.end_layer,
             is_head: layout.is_head,
             is_tail: layout.is_tail,
+            // Phase 3 lands tail-side verify_batch_at_tail + rollback_kv, and
+            // the head already supports batched continue_head_tokens. Both
+            // sides can serve the spec round; gateway opts in via its own
+            // config flag once both peers advertise the capability.
+            spec_decode_v1: true,
         })
     }
 
@@ -1314,6 +1458,246 @@ impl LlamaStageBackend {
         let piece = cached.sample.text.clone();
         Some(GreedyTokenSample { token_id: cached.token_id, piece, is_eog: cached.is_eog })
     }
+
+    /// Returns the next free KV-cache position for `request_id`, or 0 if no
+    /// session exists yet. Used by the gateway to compute rollback targets
+    /// (`keep_count = pre_decode_n_pos + accepted_count + 1`) without having
+    /// to mirror the n_pos accounting itself.
+    pub fn session_n_pos(&self, request_id: &str) -> i32 {
+        let state = self.state.borrow();
+        state.sessions.get(request_id).map(|s| s.n_pos).unwrap_or(0)
+    }
+
+    /// Tail-side speculative-decode verification.
+    ///
+    /// Input layout: `tensor` carries `k+1` stacked hidden states for
+    /// `[last_token, D_1, ..., D_k]`, computed by the head from the same
+    /// k+1 inputs. `draft_tokens` is `[D_1, ..., D_k]` — the candidates
+    /// produced by the draft model.
+    ///
+    /// Decodes the full k+1 batch through the tail in one call (amortizing
+    /// the per-call Metal setup cost), then greedy-samples each position to
+    /// find the longest prefix of drafts that matches the target's choice.
+    /// Always returns one bonus token: either the target's mismatch sample
+    /// at the divergence point (partial accept) or a fresh prediction past
+    /// the last accepted draft (full accept).
+    ///
+    /// KV-cache rollback: writes for accepted positions stay; rejected suffix
+    /// is removed via `memory_seq_rm`. The bonus token itself is NOT in the
+    /// KV — it'll be the `last_token` for the next round and gets committed
+    /// when its hidden state is decoded.
+    pub fn verify_batch_at_tail(
+        &self,
+        request_id: &str,
+        input: StageTensor,
+        last_token: i32,
+        draft_tokens: Vec<i32>,
+        clear_memory: bool,
+    ) -> Result<VerifiedOutcome> {
+        let mut state = self.state.borrow_mut();
+        let layout = self.layout(&state)?.clone();
+        if !layout.is_tail {
+            bail!(
+                "verify_batch_at_tail requires tail stage, got {}",
+                layout.stage_id
+            );
+        }
+
+        let model_handle = self.ensure_model(&mut state)?;
+        let model_ptr = model_handle.model;
+        let hidden_dim = model_handle.hidden_dim(&self.api);
+
+        let k = draft_tokens.len();
+        if k == 0 {
+            bail!("verify_batch_at_tail requires at least one draft token");
+        }
+        let expected_tokens = k + 1;
+
+        if input.hidden_dim != hidden_dim {
+            bail!(
+                "hidden_dim mismatch: backend={hidden_dim}, tensor={}",
+                input.hidden_dim
+            );
+        }
+
+        let hidden = Self::hidden_bytes_to_f32(&input)?;
+        if hidden.len() != expected_tokens * hidden_dim {
+            bail!(
+                "verify expected {expected_tokens} tokens × hidden_dim {hidden_dim} = {} f32 entries, got {}",
+                expected_tokens * hidden_dim,
+                hidden.len()
+            );
+        }
+
+        let session_state = self.ensure_session(&mut state, request_id)?;
+        if clear_memory {
+            session_state.cached_sample = None;
+            session_state.session.clear_memory(&self.api);
+            session_state.n_pos = 0;
+        }
+
+        let n_pos_before = session_state.n_pos;
+
+        let batch_tokens: Vec<i32> = std::iter::once(last_token)
+            .chain(draft_tokens.iter().copied())
+            .collect();
+        let batch = OwnedBatch::hidden_with_per_pos_logits(batch_tokens, hidden, expected_tokens);
+        let rc = unsafe {
+            (self.api.decode_tail)(
+                session_state.session.ctx,
+                batch.raw,
+                layout.start_layer as i32,
+            )
+        };
+        if rc != 0 && rc != 1 {
+            bail!("llama_decode_tail (verify) failed with {rc}");
+        }
+        session_state.n_pos += expected_tokens as i32;
+
+        let vocab = unsafe { (self.api.model_get_vocab)(model_ptr) };
+        if vocab.is_null() {
+            bail!("model vocab unavailable");
+        }
+        let n_vocab = unsafe { (self.api.vocab_n_tokens)(vocab) as usize };
+
+        let sample_at = |pos: usize| -> Result<i32> {
+            let logits_ptr =
+                unsafe { (self.api.get_logits_ith)(session_state.session.ctx, pos as i32) };
+            if logits_ptr.is_null() {
+                bail!("tail logits null at batch position {pos}");
+            }
+            let logits = unsafe { slice::from_raw_parts(logits_ptr, n_vocab) };
+            let (token_id, _) = logits
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|lhs, rhs| {
+                    lhs.1.partial_cmp(&rhs.1).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .context("empty logits at verify position")?;
+            Ok(token_id as i32)
+        };
+
+        let mut accepted_count: u32 = 0;
+        let mut accepted_token_ids: Vec<i32> = Vec::with_capacity(expected_tokens);
+        let mut bonus_token: i32 = 0;
+        let mut all_matched = true;
+
+        for i in 0..k {
+            let sampled = sample_at(i)?;
+            if sampled == draft_tokens[i] {
+                accepted_count += 1;
+                accepted_token_ids.push(sampled);
+            } else {
+                bonus_token = sampled;
+                accepted_token_ids.push(sampled);
+                all_matched = false;
+                break;
+            }
+        }
+
+        if all_matched {
+            bonus_token = sample_at(k)?;
+            accepted_token_ids.push(bonus_token);
+        }
+
+        let is_eog = unsafe { (self.api.vocab_is_eog)(vocab, bonus_token) };
+
+        // KV rollback. We retain n_pos_before + accepted + 1 positions: the
+        // pre-existing committed state, the last_token (always the first batch
+        // input), and `accepted` matched drafts. The bonus token is NOT
+        // committed to KV — it's only an output sample.
+        let keep_count = n_pos_before + accepted_count as i32 + 1;
+        let n_pos_after_decode = n_pos_before + expected_tokens as i32;
+        if keep_count < n_pos_after_decode {
+            let memory = unsafe { (self.api.get_memory)(session_state.session.ctx) };
+            if memory.is_null() {
+                bail!("tail session memory unavailable for rollback");
+            }
+            let ok = unsafe { (self.api.memory_seq_rm)(memory, 0, keep_count, -1) };
+            if !ok {
+                bail!("tail memory_seq_rm failed (keep_count={keep_count})");
+            }
+        }
+        session_state.n_pos = keep_count;
+
+        // Detokenize each accepted id (and the bonus) so the gateway can
+        // stream text without an extra round-trip back to the head's vocab.
+        let mut accepted_pieces = Vec::with_capacity(accepted_token_ids.len());
+        for tid in &accepted_token_ids {
+            accepted_pieces.push(self.token_to_piece(vocab, *tid)?);
+        }
+
+        // Cache the bonus token so legacy `cached_tail_sample` callers still
+        // see a valid "last sampled" entry after a verify round.
+        let bonus_piece = accepted_pieces
+            .last()
+            .cloned()
+            .unwrap_or_default();
+        session_state.cached_sample = Some(CachedSample {
+            sample: StageSample {
+                request_id: request_id.to_string(),
+                model_id: layout.model_id.clone(),
+                text: bonus_piece,
+                token_ids: vec![bonus_token as u32],
+                completion_tokens: 1,
+            },
+            token_id: bonus_token,
+            is_eog,
+        });
+
+        Ok(VerifiedOutcome {
+            accepted_count,
+            accepted_token_ids,
+            accepted_pieces,
+            is_eog,
+        })
+    }
+
+    /// Roll the KV cache for `request_id` back to `keep_count` committed
+    /// positions. No-op when `keep_count == n_pos`. Errors if `keep_count`
+    /// exceeds the current n_pos. Used by the gateway to align the head's
+    /// KV with the tail's after a partial spec-decode acceptance.
+    pub fn rollback_kv(&self, request_id: &str, keep_count: u32) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        let session_state = self.ensure_session(&mut state, request_id)?;
+        let keep = keep_count as i32;
+        if keep > session_state.n_pos {
+            bail!(
+                "rollback keep_count={keep} exceeds current n_pos={}",
+                session_state.n_pos
+            );
+        }
+        if keep == session_state.n_pos {
+            return Ok(());
+        }
+        let memory = unsafe { (self.api.get_memory)(session_state.session.ctx) };
+        if memory.is_null() {
+            bail!("session memory unavailable for rollback");
+        }
+        let ok = unsafe { (self.api.memory_seq_rm)(memory, 0, keep, -1) };
+        if !ok {
+            bail!("memory_seq_rm failed (keep_count={keep})");
+        }
+        session_state.n_pos = keep;
+        // Cached sample's position no longer aligns; invalidate.
+        session_state.cached_sample = None;
+        Ok(())
+    }
+}
+
+/// Result of a tail-side speculative-decode verification round.
+///
+/// `accepted_count` ranges over `0..=draft_k`. `accepted_token_ids` always has
+/// length `accepted_count + 1`: the matched draft prefix followed by one bonus
+/// token (the target's own prediction at the divergence point on partial
+/// accept, or a fresh prediction past the last draft on full accept).
+#[derive(Debug, Clone)]
+pub struct VerifiedOutcome {
+    pub accepted_count: u32,
+    pub accepted_token_ids: Vec<i32>,
+    pub accepted_pieces: Vec<String>,
+    pub is_eog: bool,
 }
 
 pub fn build_stage_backend(config: &StageNodeConfig) -> Result<LlamaStageBackend> {
@@ -1708,7 +2092,52 @@ impl RemoteStageGateway {
             pair: RemoteStagePair::connect(head_addr, tail_addr)?,
             reconnect_after_prompt,
             sessions: HashMap::new(),
+            draft: None,
+            spec_config: SpecDecodeConfig {
+                enabled: false,
+                ..SpecDecodeConfig::default()
+            },
         })
+    }
+
+    /// Construct a gateway with a draft engine for speculative decoding.
+    /// `draft_path` must point to a tokenizer-compatible draft GGUF (the canary
+    /// check at startup catches catastrophic mismatches; per-vocab id parity is
+    /// the caller's responsibility — see the draft_model_compat memory).
+    pub fn connect_with_draft(
+        head_addr: impl Into<String>,
+        tail_addr: impl Into<String>,
+        reconnect_after_prompt: bool,
+        draft_path: impl AsRef<Path>,
+        spec_config: SpecDecodeConfig,
+    ) -> Result<Self> {
+        let pair = RemoteStagePair::connect(head_addr, tail_addr)?;
+        let draft = DraftEngine::load(draft_path)?;
+        let mut spec_config = spec_config;
+        if !pair.head_info.spec_decode_v1 || !pair.tail_info.spec_decode_v1 {
+            // One of the peers is too old to verify batched drafts. Keep the
+            // draft engine around (callers may re-negotiate after upgrade)
+            // but don't take the spec path.
+            spec_config.enabled = false;
+        }
+        Ok(Self {
+            pair,
+            reconnect_after_prompt,
+            sessions: HashMap::new(),
+            draft: Some(draft),
+            spec_config,
+        })
+    }
+
+    pub fn spec_config(&self) -> &SpecDecodeConfig {
+        &self.spec_config
+    }
+
+    pub fn spec_active(&self) -> bool {
+        self.spec_config.enabled
+            && self.draft.is_some()
+            && self.pair.head_info.spec_decode_v1
+            && self.pair.tail_info.spec_decode_v1
     }
 
     pub fn head_info(&self) -> &StageNodeInfo {
@@ -1765,7 +2194,7 @@ impl RemoteStageGateway {
         let (tail_tensor, pending_tail_sample) =
             match self.pair.tail.request(&StageNodeRequest::ContinueForwardTokens {
                 tensor: head_tensor.clone(),
-                token_ids: prompt_tokens,
+                token_ids: prompt_tokens.clone(),
                 clear_memory: true,
             })? {
                 StageNodeResponse::Tensor { tensor, tail_sample } => (tensor, tail_sample),
@@ -1776,6 +2205,21 @@ impl RemoteStageGateway {
         if self.reconnect_after_prompt {
             self.pair.disconnect();
             self.pair.reconnect()?;
+        }
+
+        let n_pos_after_prefill = prompt_tokens.len() as i32;
+        if self.spec_active() {
+            // Prime the draft engine with prompt[..n-1]; greedy_step_k() seeds
+            // with the last prompt token on the first round so its logit is
+            // computed against the full prompt context.
+            let draft = self
+                .draft
+                .as_mut()
+                .expect("spec_active() implies draft is Some");
+            draft.reset();
+            if prompt_tokens.len() > 1 {
+                draft.prefill(&prompt_tokens[..prompt_tokens.len() - 1])?;
+            }
         }
 
         self.sessions.insert(
@@ -1796,6 +2240,10 @@ impl RemoteStageGateway {
                     total_ms: 0,
                 },
                 pending_tail_sample,
+                pending_committed: std::collections::VecDeque::new(),
+                head_n_pos: n_pos_after_prefill,
+                current_k: self.spec_config.start_k.max(self.spec_config.min_k),
+                consec_low_accept: 0,
             },
         );
 
@@ -1852,31 +2300,18 @@ impl RemoteStageGateway {
             return Ok(GatewayStep::Complete { request_id: request_id.to_string(), completion });
         }
 
-        let t_head = std::time::Instant::now();
-        session.head_tensor =
-            match self.pair.head.request(&StageNodeRequest::ContinueHeadTokens {
-                request_id: request_id.to_string(),
-                token_ids: vec![sampled.token_id],
-                max_tokens: Some(session.max_tokens),
-            })? {
-                StageNodeResponse::Tensor { tensor, .. } => tensor,
-                other => bail!("expected tensor response, got {other:?}"),
-            };
-        session.timings.head_decode_ms += t_head.elapsed().as_millis() as u64;
-
-        let t_tail = std::time::Instant::now();
-        let (new_tail_tensor, new_pending) =
-            match self.pair.tail.request(&StageNodeRequest::ContinueForwardTokens {
-                tensor: session.head_tensor.clone(),
-                token_ids: vec![sampled.token_id],
-                clear_memory: false,
-            })? {
-                StageNodeResponse::Tensor { tensor, tail_sample } => (tensor, tail_sample),
-                other => bail!("expected tensor response, got {other:?}"),
-            };
-        session.tail_tensor = new_tail_tensor;
-        session.pending_tail_sample = new_pending;
-        session.timings.tail_decode_ms += t_tail.elapsed().as_millis() as u64;
+        // Refill pending_tail_sample for the next call. Three paths:
+        //   1. Drain pending_committed (zero new work — these were committed
+        //      by an earlier spec round).
+        //   2. Spec round (batched draft + verify) when spec is active.
+        //   3. Single-token decode (legacy path) otherwise.
+        if let Some(next) = session.pending_committed.pop_front() {
+            session.pending_tail_sample = Some(next);
+        } else if self.spec_active() {
+            self.run_spec_round(request_id, &mut session, sampled.token_id)?;
+        } else {
+            self.run_single_step(request_id, &mut session, sampled.token_id)?;
+        }
 
         let text = session.text.clone();
         let token_ids = session.token_ids.clone();
@@ -1888,6 +2323,176 @@ impl RemoteStageGateway {
             text,
             token_ids,
         })
+    }
+
+    fn run_single_step(
+        &mut self,
+        request_id: &str,
+        session: &mut GatewaySessionState,
+        last_token: i32,
+    ) -> Result<()> {
+        let t_head = std::time::Instant::now();
+        session.head_tensor =
+            match self.pair.head.request(&StageNodeRequest::ContinueHeadTokens {
+                request_id: request_id.to_string(),
+                token_ids: vec![last_token],
+                max_tokens: Some(session.max_tokens),
+            })? {
+                StageNodeResponse::Tensor { tensor, .. } => tensor,
+                other => bail!("expected tensor response, got {other:?}"),
+            };
+        session.head_n_pos += 1;
+        session.timings.head_decode_ms += t_head.elapsed().as_millis() as u64;
+
+        let t_tail = std::time::Instant::now();
+        let (new_tail_tensor, new_pending) =
+            match self.pair.tail.request(&StageNodeRequest::ContinueForwardTokens {
+                tensor: session.head_tensor.clone(),
+                token_ids: vec![last_token],
+                clear_memory: false,
+            })? {
+                StageNodeResponse::Tensor { tensor, tail_sample } => (tensor, tail_sample),
+                other => bail!("expected tensor response, got {other:?}"),
+            };
+        session.tail_tensor = new_tail_tensor;
+        session.pending_tail_sample = new_pending;
+        session.timings.tail_decode_ms += t_tail.elapsed().as_millis() as u64;
+        Ok(())
+    }
+
+    fn run_spec_round(
+        &mut self,
+        request_id: &str,
+        session: &mut GatewaySessionState,
+        last_token: i32,
+    ) -> Result<()> {
+        let k = session
+            .current_k
+            .max(self.spec_config.min_k)
+            .min(self.spec_config.max_k);
+
+        let draft = self
+            .draft
+            .as_mut()
+            .expect("run_spec_round invoked while spec_active() is true");
+        let draft_pos_before = draft.current_pos();
+        let drafts = draft.greedy_step_k(last_token, k)?;
+
+        let mut batch_tokens = Vec::with_capacity(drafts.len() + 1);
+        batch_tokens.push(last_token);
+        batch_tokens.extend(drafts.iter().copied());
+
+        let head_n_pos_before = session.head_n_pos;
+
+        let t_head = std::time::Instant::now();
+        let head_tensor = match self.pair.head.request(&StageNodeRequest::ContinueHeadTokens {
+            request_id: request_id.to_string(),
+            token_ids: batch_tokens.clone(),
+            max_tokens: Some(session.max_tokens),
+        })? {
+            StageNodeResponse::Tensor { tensor, .. } => tensor,
+            other => bail!("expected tensor response, got {other:?}"),
+        };
+        session.head_n_pos += batch_tokens.len() as i32;
+        session.head_tensor = head_tensor.clone();
+        session.timings.head_decode_ms += t_head.elapsed().as_millis() as u64;
+
+        let t_tail = std::time::Instant::now();
+        let (accepted_count, accepted_token_ids, accepted_pieces, is_eog) = match self
+            .pair
+            .tail
+            .request(&StageNodeRequest::ContinueForwardVerifyK {
+                request_id: request_id.to_string(),
+                tensor: head_tensor,
+                last_token,
+                draft_tokens: drafts.clone(),
+                clear_memory: false,
+            })? {
+            StageNodeResponse::VerifiedBatch {
+                accepted_count,
+                accepted_token_ids,
+                accepted_pieces,
+                is_eog,
+            } => (accepted_count, accepted_token_ids, accepted_pieces, is_eog),
+            other => bail!("expected verified_batch response, got {other:?}"),
+        };
+        session.timings.tail_decode_ms += t_tail.elapsed().as_millis() as u64;
+
+        if accepted_pieces.len() != accepted_token_ids.len() {
+            bail!(
+                "verify response shape mismatch: ids={} pieces={}",
+                accepted_token_ids.len(),
+                accepted_pieces.len()
+            );
+        }
+
+        // Roll head's KV back to match what tail kept (T + accepted drafts).
+        // Bonus is sampled-only, never written to either KV.
+        let head_keep = head_n_pos_before + accepted_count as i32 + 1;
+        if head_keep < session.head_n_pos {
+            self.pair
+                .head
+                .request(&StageNodeRequest::RollbackKv {
+                    request_id: request_id.to_string(),
+                    keep_count: head_keep as u32,
+                })?;
+            session.head_n_pos = head_keep;
+        }
+
+        // Roll the draft KV back to (state-before-greedy) + last_token + accepted.
+        // greedy_step writes its INPUT to KV then samples the next token, so
+        // after greedy_step_k(T, k) the chain wrote T, D_1, ..., D_{k-1} but
+        // NOT D_k (D_k was sampled past the written window). When tail accepts
+        // all k drafts, the draft KV is one position short of target — feed
+        // D_k now so subsequent rounds seed cleanly with the bonus token.
+        let target_pos = draft_pos_before + 1 + accepted_count as i32;
+        if target_pos > draft.current_pos() {
+            if let Some(&last_draft) = drafts.last() {
+                let _ = draft.greedy_step(last_draft)?;
+            }
+        }
+        draft.rollback_to(target_pos)?;
+
+        // Adaptive k: shrink on consecutive low accepts, recover on full
+        // accepts. Bound by [min_k, max_k] from spec_config.
+        if accepted_count == 0 {
+            session.consec_low_accept = session.consec_low_accept.saturating_add(1);
+            if session.consec_low_accept >= 2 {
+                session.current_k = (session.current_k / 2).max(self.spec_config.min_k);
+            }
+        } else if accepted_count == k {
+            session.consec_low_accept = 0;
+            session.current_k = (session.current_k.saturating_mul(2))
+                .min(self.spec_config.max_k)
+                .max(self.spec_config.min_k);
+        } else {
+            session.consec_low_accept = 0;
+        }
+
+        // Emit plan: pending_tail_sample = first id (next call's emit), and
+        // queue the rest in pending_committed so subsequent step_completion
+        // calls can drain them without another forward pass. The very last id
+        // is the bonus and carries `is_eog` for the round.
+        let total = accepted_token_ids.len();
+        for (idx, (tid, piece)) in accepted_token_ids
+            .into_iter()
+            .zip(accepted_pieces.into_iter())
+            .enumerate()
+        {
+            let is_last = idx == total - 1;
+            let sample = GreedyTokenSample {
+                token_id: tid,
+                piece,
+                is_eog: is_last && is_eog,
+            };
+            if idx == 0 {
+                session.pending_tail_sample = Some(sample);
+            } else {
+                session.pending_committed.push_back(sample);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn complete(
@@ -1990,6 +2595,38 @@ pub fn handle_stage_node_request(
         StageNodeRequest::ClearDecodeSession { request_id } => {
             backend.clear_decode_session(&request_id)?;
             Ok(StageNodeResponse::Ack)
+        }
+        StageNodeRequest::ContinueForwardVerifyK {
+            request_id,
+            tensor,
+            last_token,
+            draft_tokens,
+            clear_memory,
+        } => {
+            let outcome = backend.verify_batch_at_tail(
+                &request_id,
+                tensor,
+                last_token,
+                draft_tokens,
+                clear_memory,
+            )?;
+            Ok(StageNodeResponse::VerifiedBatch {
+                accepted_count: outcome.accepted_count,
+                accepted_token_ids: outcome.accepted_token_ids,
+                accepted_pieces: outcome.accepted_pieces,
+                is_eog: outcome.is_eog,
+            })
+        }
+        StageNodeRequest::RollbackKv { request_id, keep_count } => {
+            backend.rollback_kv(&request_id, keep_count)?;
+            Ok(StageNodeResponse::Ack)
+        }
+        // ContinueHeadDraftK is reserved for a future variant where the head
+        // node owns the draft engine. v0.3.0 keeps drafting on the gateway
+        // (which calls ContinueHeadTokens with [last_token, D_1..D_k]
+        // directly), so this remains unimplemented here.
+        StageNodeRequest::ContinueHeadDraftK { .. } => {
+            bail!("ContinueHeadDraftK is not implemented on this node (gateway-side drafting)")
         }
     })();
 
@@ -2232,6 +2869,7 @@ impl ManagedServiceChild {
         head_addr: &str,
         tail_addr: &str,
         reconnect_after_prompt: bool,
+        draft_model: Option<&Path>,
     ) -> Result<Self> {
         let mut command = Command::new(bin_path);
         command
@@ -2243,6 +2881,9 @@ impl ManagedServiceChild {
             .arg(tail_addr);
         if reconnect_after_prompt {
             command.arg("--reconnect-after-prompt");
+        }
+        if let Some(path) = draft_model {
+            command.arg("--draft-model").arg(path);
         }
 
         let mut child = command
@@ -2277,6 +2918,10 @@ pub struct ManagedGatewayLaunchSpec {
     pub head_bind: Option<String>,
     pub tail_bind: Option<String>,
     pub gateway_bind: Option<String>,
+    /// Optional draft model GGUF for speculative decoding. When set, the
+    /// gateway child opens it via `RemoteStageGateway::connect_with_draft`
+    /// and runs the spec path as long as both peers advertise spec_decode_v1.
+    pub draft_model: Option<PathBuf>,
 }
 
 impl ManagedGatewayStack {
@@ -2335,6 +2980,7 @@ impl ManagedGatewayStack {
             &head.addr,
             &tail.addr,
             reconnect_after_prompt,
+            launch_spec.draft_model.as_deref(),
         )?;
 
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -2402,6 +3048,47 @@ impl ManagedTailNode {
     }
 }
 
+/// A standalone head-only stage worker. Mirrors `ManagedTailNode` so probes
+/// and integration tests can stand up a head + tail pair without the bundled
+/// gateway binary (e.g., when the gateway lives in-process — spec decode).
+pub struct ManagedHeadNode {
+    _child: ManagedServiceChild,
+    addr: String,
+}
+
+impl ManagedHeadNode {
+    pub fn spawn(
+        model_path: impl Into<PathBuf>,
+        bind_addr: impl Into<String>,
+        start_layer: u32,
+        end_layer: u32,
+        launch_spec: &ManagedGatewayLaunchSpec,
+    ) -> Result<Self> {
+        let model_path = model_path.into();
+        let bind_addr = bind_addr.into();
+        let stage_node_bin = resolve_managed_binary_path(
+            launch_spec.stage_node_bin.as_deref(),
+            "llama_stage_tcp_node",
+        )?;
+        let child = ManagedServiceChild::spawn_stage_from_bin(
+            &stage_node_bin,
+            &model_path,
+            &bind_addr,
+            "stage-head",
+            start_layer,
+            end_layer,
+            true,
+            false,
+        )?;
+        let addr = child.addr.clone();
+        Ok(Self { _child: child, addr })
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+}
+
 /// A head + gateway stack that talks to a remote tail worker over TCP.
 /// Spawns the local head stage node and a gateway pointing at `tail_remote_addr`.
 pub struct ManagedHeadGatewayStack {
@@ -2447,6 +3134,7 @@ impl ManagedHeadGatewayStack {
             &head.addr,
             &tail_remote_addr,
             reconnect_after_prompt,
+            launch_spec.draft_model.as_deref(),
         )?;
 
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -2707,5 +3395,338 @@ impl LlamaStageBackend {
     ) {
         unsafe { (self.api.context_free)(session_ctx) };
         unsafe { (self.api.model_free)(model_ptr) };
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use stage_forward_lab::PayloadKind;
+
+    fn sample_tensor() -> StageTensor {
+        StageTensor {
+            request_id: "req-1".to_string(),
+            kind: PayloadKind::HiddenState,
+            stage_trace: vec!["head".to_string()],
+            hidden_dim: 8,
+            bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            prompt_text: None,
+            max_tokens: Some(64),
+            continuation: None,
+            transient: None,
+            carry: None,
+        }
+    }
+
+    fn round_trip_request(req: &StageNodeRequest) -> StageNodeRequest {
+        let json = serde_json::to_string(req).expect("serialize request");
+        serde_json::from_str(&json).expect("deserialize request")
+    }
+
+    fn round_trip_response(resp: &StageNodeResponse) -> StageNodeResponse {
+        let json = serde_json::to_string(resp).expect("serialize response");
+        serde_json::from_str(&json).expect("deserialize response")
+    }
+
+    #[test]
+    fn continue_head_draft_k_round_trips() {
+        let req = StageNodeRequest::ContinueHeadDraftK {
+            request_id: "req-1".to_string(),
+            last_token: 42,
+            draft_k: 4,
+            max_tokens: Some(128),
+        };
+        match round_trip_request(&req) {
+            StageNodeRequest::ContinueHeadDraftK {
+                request_id,
+                last_token,
+                draft_k,
+                max_tokens,
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(last_token, 42);
+                assert_eq!(draft_k, 4);
+                assert_eq!(max_tokens, Some(128));
+            }
+            other => panic!("unexpected variant after round-trip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn continue_forward_verify_k_round_trips() {
+        let req = StageNodeRequest::ContinueForwardVerifyK {
+            request_id: "req-1".to_string(),
+            tensor: sample_tensor(),
+            last_token: 7,
+            draft_tokens: vec![10, 20, 30, 40],
+            clear_memory: false,
+        };
+        match round_trip_request(&req) {
+            StageNodeRequest::ContinueForwardVerifyK {
+                request_id, tensor, last_token, draft_tokens, clear_memory,
+            } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(tensor.hidden_dim, 8);
+                assert_eq!(last_token, 7);
+                assert_eq!(draft_tokens, vec![10, 20, 30, 40]);
+                assert!(!clear_memory);
+            }
+            other => panic!("unexpected variant after round-trip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollback_kv_round_trips() {
+        let req = StageNodeRequest::RollbackKv {
+            request_id: "req-1".to_string(),
+            keep_count: 5,
+        };
+        match round_trip_request(&req) {
+            StageNodeRequest::RollbackKv { request_id, keep_count } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(keep_count, 5);
+            }
+            other => panic!("unexpected variant after round-trip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verified_batch_round_trips() {
+        let resp = StageNodeResponse::VerifiedBatch {
+            accepted_count: 3,
+            accepted_token_ids: vec![10, 20, 30, 99],
+            accepted_pieces: vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+            is_eog: false,
+        };
+        match round_trip_response(&resp) {
+            StageNodeResponse::VerifiedBatch {
+                accepted_count, accepted_token_ids, accepted_pieces, is_eog,
+            } => {
+                assert_eq!(accepted_count, 3);
+                assert_eq!(accepted_token_ids, vec![10, 20, 30, 99]);
+                assert_eq!(accepted_pieces, vec!["a", "b", "c", "d"]);
+                assert!(!is_eog);
+            }
+            other => panic!("unexpected variant after round-trip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage_node_info_back_compat_default_spec_decode_flag() {
+        // Old peers (v≤0.2.34) ship StageNodeInfo without the spec_decode_v1
+        // field. Make sure the new code accepts those payloads and defaults to
+        // false rather than failing deserialization.
+        let legacy_json = r#"{
+            "protocol_version": 1,
+            "model_id": "gemma-4-e4b",
+            "stage_id": "head",
+            "start_layer": 0,
+            "end_layer": 17,
+            "is_head": true,
+            "is_tail": false
+        }"#;
+        let info: StageNodeInfo =
+            serde_json::from_str(legacy_json).expect("legacy info should deserialize");
+        assert_eq!(info.protocol_version, 1);
+        assert!(!info.spec_decode_v1);
+    }
+
+    #[test]
+    fn tensor_response_back_compat_omits_tail_sample() {
+        // Skip-serializing-if-none keeps the wire size identical for peers that
+        // don't ship a tail sample. Confirm the field is absent in the JSON
+        // when None.
+        let resp = StageNodeResponse::Tensor {
+            tensor: sample_tensor(),
+            tail_sample: None,
+        };
+        let json = serde_json::to_string(&resp).expect("serialize");
+        assert!(
+            !json.contains("tail_sample"),
+            "tail_sample should be skipped when None: {json}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Speculative decoding: head-side draft engine.
+//
+// Wraps a small companion model (e.g. Gemma-3-270M when targeting Gemma-4-E4B)
+// in its own llama context so it can predict k candidate tokens before the
+// target model burns the per-call Metal command-buffer setup cost. Tail-side
+// verification (Phase 3) decides which drafts to accept.
+//
+// Owns its FFI handles directly. Greedy-only sampling for now — temperature
+// and top-k can land alongside production tuning.
+// ---------------------------------------------------------------------------
+
+pub struct DraftEngine {
+    api: LlamaApi,
+    model: LlamaModelHandle,
+    session: LlamaSession,
+    n_vocab: usize,
+    next_pos: i32,
+}
+
+// SAFETY: Same constraints as LlamaStageBackend — caller must serialize
+// access. The draft engine is owned per-process (head node) and accessed
+// behind the same outer mutex that guards the stage backend.
+unsafe impl Send for DraftEngine {}
+unsafe impl Sync for DraftEngine {}
+
+impl DraftEngine {
+    pub fn load(model_path: impl AsRef<Path>) -> Result<Self> {
+        let api = LlamaApi::load()?;
+        let model = LlamaModelHandle::new(&api, model_path.as_ref())?;
+        let session = model.create_session(&api)?;
+        session.clear_memory(&api);
+        let vocab = unsafe { (api.model_get_vocab)(model.model) };
+        if vocab.is_null() {
+            bail!("draft model vocab unavailable");
+        }
+        let n_vocab = unsafe { (api.vocab_n_tokens)(vocab) as usize };
+        Ok(Self { api, model, session, n_vocab, next_pos: 0 })
+    }
+
+    pub fn n_vocab(&self) -> usize {
+        self.n_vocab
+    }
+
+    pub fn current_pos(&self) -> i32 {
+        self.next_pos
+    }
+
+    /// Reset the KV cache and seek back to position 0. Use between independent
+    /// requests (the gateway's session boundary).
+    pub fn reset(&mut self) {
+        self.session.clear_memory(&self.api);
+        self.next_pos = 0;
+    }
+
+    /// Tokenize text using the draft model's vocab. For canary-string startup
+    /// checks against the target's tokenizer.
+    pub fn tokenize(&self, text: &str) -> Result<Vec<i32>> {
+        let vocab = unsafe { (self.api.model_get_vocab)(self.model.model) };
+        if vocab.is_null() {
+            bail!("draft model vocab unavailable");
+        }
+        let prompt = CString::new(text)?;
+        let max_tokens = (text.len() + 64) as i32;
+        let mut buf = vec![0i32; max_tokens as usize];
+        let n = unsafe {
+            (self.api.tokenize)(
+                vocab,
+                prompt.as_ptr(),
+                text.len() as i32,
+                buf.as_mut_ptr(),
+                max_tokens,
+                true,
+                true,
+            )
+        };
+        if n < 0 {
+            bail!("draft tokenize returned {n}");
+        }
+        buf.truncate(n as usize);
+        Ok(buf)
+    }
+
+    /// Run a batch of `tokens` through the draft model. Advances next_pos by
+    /// tokens.len(). Used for prompt prefill.
+    pub fn prefill(&mut self, tokens: &[i32]) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let batch = OwnedBatch::token_only(tokens.to_vec());
+        let rc = unsafe { (self.api.decode)(self.session.ctx, batch.raw) };
+        if rc != 0 && rc != 1 {
+            bail!("draft prefill llama_decode returned {rc}");
+        }
+        self.next_pos += tokens.len() as i32;
+        Ok(())
+    }
+
+    /// Decode one token and greedy-sample the next. Returns the sampled token
+    /// id, advances next_pos by 1 (the position consumed by `last_token`).
+    /// The sampled id is NOT yet in the KV cache — callers either feed it
+    /// back via greedy_step (for chained drafting) or discard.
+    pub fn greedy_step(&mut self, last_token: i32) -> Result<i32> {
+        let batch = OwnedBatch::token_only(vec![last_token]);
+        let rc = unsafe { (self.api.decode)(self.session.ctx, batch.raw) };
+        if rc != 0 && rc != 1 {
+            bail!("draft greedy_step llama_decode returned {rc}");
+        }
+        self.next_pos += 1;
+        let logits = unsafe { (self.api.get_logits_ith)(self.session.ctx, -1) };
+        if logits.is_null() {
+            bail!("draft logits null after decode");
+        }
+        let logits = unsafe { slice::from_raw_parts(logits, self.n_vocab) };
+        let (token_id, _) = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|lhs, rhs| lhs.1.partial_cmp(&rhs.1).unwrap_or(std::cmp::Ordering::Equal))
+            .context("empty draft logits buffer")?;
+        Ok(token_id as i32)
+    }
+
+    /// Chain k greedy steps starting from `last_token`. Returns the k draft
+    /// tokens in order. Each iteration commits the previous draft to the KV
+    /// cache so the next prediction is conditioned on it.
+    pub fn greedy_step_k(&mut self, last_token: i32, k: u32) -> Result<Vec<i32>> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::with_capacity(k as usize);
+        let mut cur = last_token;
+        for _ in 0..k {
+            let next = self.greedy_step(cur)?;
+            out.push(next);
+            cur = next;
+        }
+        Ok(out)
+    }
+
+    /// Roll back the KV cache so only the first `keep_count` token positions
+    /// remain. Tail-side verification calls this on the draft after rejecting
+    /// a suffix so the next round starts from the accepted prefix.
+    pub fn rollback_to(&mut self, keep_count: i32) -> Result<()> {
+        if keep_count < 0 || keep_count > self.next_pos {
+            bail!(
+                "draft rollback keep_count={keep_count} out of range (current pos={})",
+                self.next_pos
+            );
+        }
+        if keep_count == self.next_pos {
+            return Ok(());
+        }
+        let memory = unsafe { (self.api.get_memory)(self.session.ctx) };
+        if memory.is_null() {
+            bail!("draft session memory unavailable");
+        }
+        // seq_id 0 is the only sequence in single-sequence contexts. p0=keep_count
+        // p1=-1 means "all positions >= keep_count". Returns true on success.
+        let ok = unsafe { (self.api.memory_seq_rm)(memory, 0, keep_count, -1) };
+        if !ok {
+            bail!("memory_seq_rm failed for draft (keep_count={keep_count})");
+        }
+        self.next_pos = keep_count;
+        Ok(())
+    }
+}
+
+impl Drop for DraftEngine {
+    fn drop(&mut self) {
+        // Match the explicit destroy/free pattern used elsewhere — we own the
+        // raw handles and they must be released before the LlamaApi (which
+        // owns the dlopen) is dropped.
+        unsafe { (self.api.context_free)(self.session.ctx) };
+        unsafe { (self.api.model_free)(self.model.model) };
     }
 }

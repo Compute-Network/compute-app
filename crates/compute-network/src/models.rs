@@ -30,6 +30,20 @@ pub struct ModelDefinition {
     pub recommended_stages: u32,
     /// HuggingFace model ID or download URL.
     pub source: String,
+    /// Speculative-decoding draft model id (must also exist in the catalog).
+    /// When set, the daemon auto-pairs this target with that draft so the
+    /// gateway runs the spec_decode_v1 path.
+    #[serde(default)]
+    pub draft_model_id: Option<String>,
+    /// Direct download URL for this model's GGUF (used by the daemon's
+    /// auto-download path for sidecar models like spec-decode drafts; the
+    /// stage-shard models go through their own per-shard manifest).
+    #[serde(default)]
+    pub gguf_download_url: Option<String>,
+    /// Local filename for the cached GGUF, relative to the models cache dir.
+    /// Only set for direct-download models (drafts, single-file targets).
+    #[serde(default)]
+    pub gguf_filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +112,9 @@ impl ModelCatalog {
                     min_total_vram_mb: 20000,
                     recommended_stages: 1,
                     source: "unsloth/gemma-4-26B-A4B-it-GGUF".into(),
+                    draft_model_id: None,
+                    gguf_download_url: None,
+                    gguf_filename: None,
                 },
                 ModelDefinition {
                     id: "gemma-4-e4b-q4".into(),
@@ -110,6 +127,27 @@ impl ModelCatalog {
                     min_total_vram_mb: 5000,
                     recommended_stages: 2,
                     source: "unsloth/gemma-4-E4B-it-GGUF".into(),
+                    draft_model_id: Some("gemma-3-270m-q4-draft".into()),
+                    gguf_download_url: None,
+                    gguf_filename: None,
+                },
+                ModelDefinition {
+                    id: "gemma-3-270m-q4-draft".into(),
+                    name: "Gemma 3 270M (Q4, draft)".into(),
+                    family: ModelFamily::Other("Gemma".into()),
+                    total_layers: 18,
+                    vram_per_layer_mb: 14,
+                    total_size_mb: 253,
+                    quantization: Quantization::Q4,
+                    min_total_vram_mb: 512,
+                    recommended_stages: 1,
+                    source: "unsloth/gemma-3-270m-it-GGUF".into(),
+                    draft_model_id: None,
+                    gguf_download_url: Some(
+                        "https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q4_K_M.gguf"
+                            .into(),
+                    ),
+                    gguf_filename: Some("gemma-3-270m-it-Q4_K_M.gguf".into()),
                 },
                 ModelDefinition {
                     id: "qwen3.5-27b-q4".into(),
@@ -122,6 +160,9 @@ impl ModelCatalog {
                     min_total_vram_mb: 20000,
                     recommended_stages: 1,
                     source: "unsloth/Qwen3.5-27B-GGUF".into(),
+                    draft_model_id: None,
+                    gguf_download_url: None,
+                    gguf_filename: None,
                 },
                 ModelDefinition {
                     id: "llama-3.1-8b-q4".into(),
@@ -134,6 +175,9 @@ impl ModelCatalog {
                     min_total_vram_mb: 6000,
                     recommended_stages: 1,
                     source: "meta-llama/Llama-3.1-8B".into(),
+                    draft_model_id: None,
+                    gguf_download_url: None,
+                    gguf_filename: None,
                 },
                 ModelDefinition {
                     id: "llama-3.1-70b-q4".into(),
@@ -146,6 +190,9 @@ impl ModelCatalog {
                     min_total_vram_mb: 42000,
                     recommended_stages: 3,
                     source: "meta-llama/Llama-3.1-70B".into(),
+                    draft_model_id: None,
+                    gguf_download_url: None,
+                    gguf_filename: None,
                 },
                 ModelDefinition {
                     id: "llama-3.1-70b-fp16".into(),
@@ -158,6 +205,9 @@ impl ModelCatalog {
                     min_total_vram_mb: 144000,
                     recommended_stages: 5,
                     source: "meta-llama/Llama-3.1-70B".into(),
+                    draft_model_id: None,
+                    gguf_download_url: None,
+                    gguf_filename: None,
                 },
                 ModelDefinition {
                     id: "deepseek-r1-q4".into(),
@@ -170,6 +220,9 @@ impl ModelCatalog {
                     min_total_vram_mb: 180000,
                     recommended_stages: 8,
                     source: "deepseek-ai/DeepSeek-R1".into(),
+                    draft_model_id: None,
+                    gguf_download_url: None,
+                    gguf_filename: None,
                 },
                 ModelDefinition {
                     id: "qwen-2.5-72b-q4".into(),
@@ -182,6 +235,9 @@ impl ModelCatalog {
                     min_total_vram_mb: 43000,
                     recommended_stages: 3,
                     source: "Qwen/Qwen2.5-72B".into(),
+                    draft_model_id: None,
+                    gguf_download_url: None,
+                    gguf_filename: None,
                 },
                 ModelDefinition {
                     id: "mistral-7b-q4".into(),
@@ -194,6 +250,9 @@ impl ModelCatalog {
                     min_total_vram_mb: 5000,
                     recommended_stages: 1,
                     source: "mistralai/Mistral-7B-v0.3".into(),
+                    draft_model_id: None,
+                    gguf_download_url: None,
+                    gguf_filename: None,
                 },
             ],
         }

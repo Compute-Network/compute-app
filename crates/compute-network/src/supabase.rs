@@ -459,6 +459,9 @@ mod tests {
             app_version: Some("0.1.0".into()),
             region: Some("auto".into()),
             tflops_fp16: Some(14.2),
+            pipeline_capable: Some(true),
+            memory_bandwidth_gbps: Some(400.0),
+            stage_backend_kind: Some("llama_stage_gateway".into()),
         };
 
         let json = serde_json::to_string(&node).unwrap();
@@ -489,6 +492,9 @@ mod tests {
             inference_slots_busy: Some(1),
             gpu_vram_free_mb: Some(20480),
             last_heartbeat: "2026-03-28T12:00:00Z".into(),
+            pipeline_capable: Some(true),
+            memory_bandwidth_gbps: Some(400.0),
+            stage_backend_kind: Some("llama_stage_gateway".into()),
         };
 
         let json = serde_json::to_string(&hb).unwrap();

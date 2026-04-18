@@ -201,7 +201,55 @@ fn gateway_launch_spec(config: &Config) -> ManagedGatewayLaunchSpec {
             .then(|| config.experimental.stage_gateway_stage_node_bin.clone().into()),
         gateway_bin: (!config.experimental.stage_gateway_gateway_bin.trim().is_empty())
             .then(|| config.experimental.stage_gateway_gateway_bin.clone().into()),
+        draft_model: resolve_draft_model_path(config),
         ..ManagedGatewayLaunchSpec::default()
+    }
+}
+
+/// Resolve the draft model path the gateway should run with.
+///
+/// Precedence:
+///   1. Explicit `experimental.stage_gateway_draft_model_path` (always wins).
+///   2. Catalog auto-pair: look up the active model's `draft_model_id`,
+///      resolve to `<models.cache_dir>/<draft.gguf_filename>`, and use it
+///      if the file exists locally.
+///
+/// Returns `None` (single-step decode) if neither path resolves to an
+/// existing file.
+fn resolve_draft_model_path(config: &Config) -> Option<PathBuf> {
+    let explicit = config.experimental.stage_gateway_draft_model_path.trim();
+    if !explicit.is_empty() {
+        return Some(PathBuf::from(explicit));
+    }
+
+    let catalog = compute_network::models::ModelCatalog::default_catalog();
+    let active_id = config.models.active_model.trim();
+    let target_id = if active_id.is_empty() || active_id == "auto" {
+        "gemma-4-e4b-q4"
+    } else {
+        active_id
+    };
+
+    let target = catalog.find(target_id)?;
+    let draft_id = target.draft_model_id.as_deref()?;
+    let draft = catalog.find(draft_id)?;
+    let filename = draft.gguf_filename.as_deref()?;
+    let cached = PathBuf::from(&config.models.cache_dir).join(filename);
+    if cached.exists() {
+        info!(
+            "[gateway] auto-paired draft model: {} -> {}",
+            draft_id,
+            cached.display()
+        );
+        Some(cached)
+    } else {
+        warn!(
+            "[gateway] draft model {} configured for {} but file missing at {} — spec decode disabled",
+            draft_id,
+            target_id,
+            cached.display()
+        );
+        None
     }
 }
 

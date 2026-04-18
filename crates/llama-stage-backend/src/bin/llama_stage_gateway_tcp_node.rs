@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail};
 use llama_stage_backend::{
-    RemoteStageGateway, StageGatewayRequest, StageGatewayResponse, handle_stage_gateway_request,
+    RemoteStageGateway, SpecDecodeConfig, StageGatewayRequest, StageGatewayResponse,
+    handle_stage_gateway_request,
 };
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -12,6 +14,7 @@ struct Args {
     head_addr: String,
     tail_addr: String,
     reconnect_after_prompt: bool,
+    draft_model: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -19,6 +22,7 @@ fn parse_args() -> Result<Args> {
     let mut head_addr = None;
     let mut tail_addr = None;
     let mut reconnect_after_prompt = false;
+    let mut draft_model = None;
 
     let mut it = env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -33,6 +37,11 @@ fn parse_args() -> Result<Args> {
                 tail_addr = Some(it.next().context("missing value for --tail")?);
             }
             "--reconnect-after-prompt" => reconnect_after_prompt = true,
+            "--draft-model" => {
+                draft_model = Some(PathBuf::from(
+                    it.next().context("missing value for --draft-model")?,
+                ));
+            }
             other => bail!("unknown argument: {other}"),
         }
     }
@@ -42,6 +51,7 @@ fn parse_args() -> Result<Args> {
         head_addr: head_addr.context("missing --head")?,
         tail_addr: tail_addr.context("missing --tail")?,
         reconnect_after_prompt,
+        draft_model,
     })
 }
 
@@ -79,8 +89,27 @@ fn handle_stream(stream: TcpStream, gateway: &mut RemoteStageGateway) -> Result<
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let mut gateway =
-        RemoteStageGateway::connect(&args.head_addr, &args.tail_addr, args.reconnect_after_prompt)?;
+    let mut gateway = match args.draft_model.as_ref() {
+        Some(path) => {
+            if !path.exists() {
+                bail!("--draft-model path does not exist: {}", path.display());
+            }
+            eprintln!("draft_model={}", path.display());
+            RemoteStageGateway::connect_with_draft(
+                &args.head_addr,
+                &args.tail_addr,
+                args.reconnect_after_prompt,
+                path,
+                SpecDecodeConfig::default(),
+            )?
+        }
+        None => RemoteStageGateway::connect(
+            &args.head_addr,
+            &args.tail_addr,
+            args.reconnect_after_prompt,
+        )?,
+    };
+    eprintln!("spec_active={}", gateway.spec_active());
 
     let listener = TcpListener::bind(&args.bind_addr)
         .with_context(|| format!("binding {}", args.bind_addr))?;

@@ -87,6 +87,11 @@ pub struct ExperimentalConfig {
     pub stage_gateway_stage_node_bin: String,
     #[serde(default)]
     pub stage_gateway_gateway_bin: String,
+    /// Path to a tokenizer-compatible draft GGUF (Gemma-3-270M for the
+    /// Gemma-4-E4B target). When set, the spawned gateway opts into the
+    /// spec_decode_v1 path. Empty disables spec decoding.
+    #[serde(default)]
+    pub stage_gateway_draft_model_path: String,
     #[serde(default = "default_stage_gateway_connect_timeout_ms")]
     pub stage_gateway_connect_timeout_ms: u64,
     #[serde(default = "default_stage_gateway_retry_window_ms")]
@@ -146,6 +151,7 @@ impl Default for ExperimentalConfig {
             stage_gateway_model_path: String::new(),
             stage_gateway_stage_node_bin: String::new(),
             stage_gateway_gateway_bin: String::new(),
+            stage_gateway_draft_model_path: String::new(),
             stage_gateway_connect_timeout_ms: default_stage_gateway_connect_timeout_ms(),
             stage_gateway_retry_window_ms: default_stage_gateway_retry_window_ms(),
             stage_gateway_retry_interval_ms: default_stage_gateway_retry_interval_ms(),
@@ -301,6 +307,9 @@ impl Config {
             "experimental.stage_gateway_gateway_bin" => {
                 Some(self.experimental.stage_gateway_gateway_bin.clone())
             }
+            "experimental.stage_gateway_draft_model_path" => {
+                Some(self.experimental.stage_gateway_draft_model_path.clone())
+            }
             "experimental.stage_gateway_connect_timeout_ms" => {
                 Some(self.experimental.stage_gateway_connect_timeout_ms.to_string())
             }
@@ -356,6 +365,9 @@ impl Config {
             }
             "experimental.stage_gateway_gateway_bin" => {
                 self.experimental.stage_gateway_gateway_bin = value.to_string()
+            }
+            "experimental.stage_gateway_draft_model_path" => {
+                self.experimental.stage_gateway_draft_model_path = value.to_string()
             }
             "experimental.stage_gateway_connect_timeout_ms" => {
                 self.experimental.stage_gateway_connect_timeout_ms = value.parse()?
@@ -484,7 +496,7 @@ mod tests {
         assert_eq!(config.get("wallet.public_address").unwrap(), "");
         assert_eq!(config.get("experimental.stage_acceleration").unwrap(), "auto");
         assert_eq!(config.get("experimental.stage_acceleration_provider").unwrap(), "auto");
-        assert_eq!(config.get("experimental.stage_gateway_autostart").unwrap(), "false");
+        assert_eq!(config.get("experimental.stage_gateway_autostart").unwrap(), "true");
         assert_eq!(config.get("experimental.stage_gateway_stage_node_bin").unwrap(), "");
         assert_eq!(config.get("experimental.stage_gateway_connect_timeout_ms").unwrap(), "2000");
         assert_eq!(config.get("experimental.stage_gateway_retry_window_ms").unwrap(), "30000");

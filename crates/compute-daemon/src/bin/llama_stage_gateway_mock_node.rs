@@ -61,6 +61,7 @@ fn info_response(protocol_version: u32, model_id: &str) -> StageGatewayResponse 
             end_layer: 20,
             is_head: true,
             is_tail: false,
+            spec_decode_v1: false,
         },
         tail_info: StageNodeInfo {
             protocol_version,
@@ -70,6 +71,7 @@ fn info_response(protocol_version: u32, model_id: &str) -> StageGatewayResponse 
             end_layer: 41,
             is_head: false,
             is_tail: true,
+            spec_decode_v1: false,
         },
         reconnect_after_prompt: false,
     }

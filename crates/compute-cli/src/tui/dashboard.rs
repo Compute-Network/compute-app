@@ -78,6 +78,13 @@ fn model_entries() -> Vec<ModelEntry> {
             gguf_filename: "tail-21-41.gguf",
             hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-gguf-stages/resolve/main/gemma-4-e4b-q4-tail-21-41.gguf",
         },
+        ModelEntry {
+            id: "gemma-3-270m-q4-draft",
+            label: "Gemma3 270M — 250MB (draft)",
+            desc: "Speculative-decode helper for Gemma4 E4B",
+            gguf_filename: "gemma-3-270m-it-Q4_K_M.gguf",
+            hf_url: "https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q4_K_M.gguf",
+        },
     ]
 }
 
