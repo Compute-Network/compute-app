@@ -637,6 +637,12 @@ pub struct RemoteStageTimings {
     pub transfer_bytes: usize,
     pub ttft_ms: u64,
     pub total_ms: u64,
+    // True iff the gateway took the speculative-decode path for this run
+    // (draft engine loaded AND both peers advertise spec_decode_v1 AND spec
+    // config enabled). Surfaces into gateway_timings JSON so callers can
+    // self-diagnose without log access.
+    #[serde(default)]
+    pub spec_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2074,6 +2080,7 @@ impl RemoteStagePair {
                 transfer_bytes,
                 ttft_ms,
                 total_ms,
+                spec_active: false,
             },
         };
 
@@ -2208,7 +2215,8 @@ impl RemoteStageGateway {
         }
 
         let n_pos_after_prefill = prompt_tokens.len() as i32;
-        if self.spec_active() {
+        let spec_active_now = self.spec_active();
+        if spec_active_now {
             // Prime the draft engine with prompt[..n-1]; greedy_step_k() seeds
             // with the last prompt token on the first round so its logit is
             // computed against the full prompt context.
@@ -2238,6 +2246,7 @@ impl RemoteStageGateway {
                     transfer_bytes,
                     ttft_ms: 0,
                     total_ms: 0,
+                    spec_active: spec_active_now,
                 },
                 pending_tail_sample,
                 pending_committed: std::collections::VecDeque::new(),

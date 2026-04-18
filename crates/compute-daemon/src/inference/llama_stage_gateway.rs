@@ -518,6 +518,7 @@ fn build_chat_completion_body(
             "transfer_bytes": result.completion.timings.transfer_bytes,
             "ttft_ms": result.completion.timings.ttft_ms,
             "total_ms": result.completion.timings.total_ms,
+            "spec_active": result.completion.timings.spec_active,
         }
     })
 }
