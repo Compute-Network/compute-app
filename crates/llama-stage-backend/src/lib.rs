@@ -643,6 +643,17 @@ pub struct RemoteStageTimings {
     // self-diagnose without log access.
     #[serde(default)]
     pub spec_active: bool,
+    // Number of spec rounds executed (one head batch + one tail verify each).
+    #[serde(default)]
+    pub spec_rounds: u64,
+    // Total draft tokens proposed across all rounds (sum of K).
+    #[serde(default)]
+    pub spec_drafts_proposed: u64,
+    // Total drafts accepted by tail verify (bonus token excluded — bonus is
+    // always +1 per round). spec_drafts_accepted / spec_drafts_proposed gives
+    // the per-token acceptance rate.
+    #[serde(default)]
+    pub spec_drafts_accepted: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2081,6 +2092,9 @@ impl RemoteStagePair {
                 ttft_ms,
                 total_ms,
                 spec_active: false,
+                spec_rounds: 0,
+                spec_drafts_proposed: 0,
+                spec_drafts_accepted: 0,
             },
         };
 
@@ -2247,6 +2261,9 @@ impl RemoteStageGateway {
                     ttft_ms: 0,
                     total_ms: 0,
                     spec_active: spec_active_now,
+                    spec_rounds: 0,
+                    spec_drafts_proposed: 0,
+                    spec_drafts_accepted: 0,
                 },
                 pending_tail_sample,
                 pending_committed: std::collections::VecDeque::new(),
@@ -2426,6 +2443,9 @@ impl RemoteStageGateway {
             other => bail!("expected verified_batch response, got {other:?}"),
         };
         session.timings.tail_decode_ms += t_tail.elapsed().as_millis() as u64;
+        session.timings.spec_rounds += 1;
+        session.timings.spec_drafts_proposed += drafts.len() as u64;
+        session.timings.spec_drafts_accepted += accepted_count as u64;
 
         if accepted_pieces.len() != accepted_token_ids.len() {
             bail!(

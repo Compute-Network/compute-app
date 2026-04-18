@@ -519,6 +519,9 @@ fn build_chat_completion_body(
             "ttft_ms": result.completion.timings.ttft_ms,
             "total_ms": result.completion.timings.total_ms,
             "spec_active": result.completion.timings.spec_active,
+            "spec_rounds": result.completion.timings.spec_rounds,
+            "spec_drafts_proposed": result.completion.timings.spec_drafts_proposed,
+            "spec_drafts_accepted": result.completion.timings.spec_drafts_accepted,
         }
     })
 }
