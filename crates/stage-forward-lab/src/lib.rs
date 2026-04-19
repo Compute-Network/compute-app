@@ -16,6 +16,34 @@ pub mod tokenizer;
 const STAGE_TENSOR_BYTES_MAGIC: [u8; 4] = *b"stb1";
 const STAGE_TENSOR_BYTES_HEADER_LEN: usize = 12;
 
+/// Serde helper that encodes `Vec<u8>` as a base64 string (over JSON) instead
+/// of serde_json's default array-of-numbers. For hot-path tensor payloads on
+/// the stage wire this is ~4× smaller and dramatically cheaper to parse.
+/// Applies only to JSON; binary formats (bincode/postcard) pass raw bytes
+/// via `serialize_bytes`.
+pub mod bytes_b64 {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            STANDARD.encode(bytes).serialize(serializer)
+        } else {
+            serializer.serialize_bytes(bytes)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            STANDARD.decode(&s).map_err(serde::de::Error::custom)
+        } else {
+            Vec::<u8>::deserialize(deserializer)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StageTensorByteSections<'a> {
     pub hidden_bytes: &'a [u8],
@@ -67,6 +95,7 @@ pub struct StageTensor {
     pub kind: PayloadKind,
     pub stage_trace: Vec<String>,
     pub hidden_dim: usize,
+    #[serde(with = "bytes_b64")]
     pub bytes: Vec<u8>,
     pub prompt_text: Option<String>,
     pub max_tokens: Option<u32>,
@@ -379,6 +408,7 @@ pub struct StageTransferPayload {
     pub kind: PayloadKind,
     pub stage_trace: Vec<String>,
     pub hidden_dim: usize,
+    #[serde(with = "bytes_b64")]
     pub bytes: Vec<u8>,
     pub prompt_text: Option<String>,
     pub max_tokens: Option<u32>,
@@ -10696,5 +10726,44 @@ mod tests {
                 .unwrap_or_default()
                 .contains("attention score freshness distance 2 exceeds target limit 1")
         );
+    }
+
+    #[test]
+    fn stage_tensor_bytes_base64_json_roundtrip() {
+        let mut raw = vec![0u8; 8 * 1024];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
+        let tensor = StageTensor {
+            request_id: "req".into(),
+            kind: PayloadKind::HiddenState,
+            stage_trace: vec!["head".into()],
+            hidden_dim: 2048,
+            bytes: raw.clone(),
+            prompt_text: None,
+            max_tokens: None,
+            continuation: None,
+            transient: None,
+            carry: None,
+        };
+
+        let json = serde_json::to_string(&tensor).expect("serialize json");
+        assert!(
+            !json.contains("[0,1,2,3,4,5,6,7,8,9,10"),
+            "bytes must not serialize as json number array"
+        );
+        assert!(
+            json.contains("AAECAwQFBgcICQoL"),
+            "expected base64 prefix of 0..11 in json payload"
+        );
+        assert!(
+            json.len() < raw.len() * 2,
+            "base64 json ({}) should be < 2x raw ({}); number-array was ~4x",
+            json.len(),
+            raw.len()
+        );
+
+        let back: StageTensor = serde_json::from_str(&json).expect("deserialize json");
+        assert_eq!(back.bytes, raw, "json roundtrip must preserve bytes");
     }
 }
