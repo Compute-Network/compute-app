@@ -242,6 +242,31 @@ if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
   fi
 fi
 
+# v0.4.2: on Apple Silicon, make sure oMLX (https://github.com/jundot/omlx)
+# is available. oMLX is a Python + FastAPI server that exposes MLX-format
+# models (e.g. `mlx-community/Qwen3.6-35B-A3B-4bit`) over an OpenAI-
+# compatible API on localhost. compute-daemon spawns it as a sidecar on
+# startup when it's installed, and routes MLX-preferred model requests
+# through it in preference to the GGUF/llama-server fallback. No install
+# here is non-fatal: the daemon falls through to llama-server and the
+# user just sees a GGUF-speed path instead of the much faster MLX one.
+if [ "$OS" = "darwin" ] && [ "$ARCH" = "aarch64" ]; then
+  if ! command -v omlx >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1; then
+      (
+        brew tap jundot/omlx https://github.com/jundot/omlx >/dev/null 2>&1 || true
+        brew install jundot/omlx/omlx >/dev/null 2>&1 || true
+      ) &
+      spin "Installing oMLX (MLX inference server)" $!
+    else
+      echo "  ${DIM}Note: Homebrew not found — MLX models will use the GGUF path via llama-server.${RESET}"
+      echo "  ${DIM}      Install Homebrew (https://brew.sh) and re-run install.sh to enable MLX.${RESET}"
+    fi
+  else
+    echo "  ${GREEN}✓${RESET} oMLX already installed ${DIM}($(command -v omlx))${RESET}"
+  fi
+fi
+
 # Verify the binary we just unpacked is actually executable and matches
 # the release we intended to install. Confirms install.sh wrote real
 # files (no silent permission errors) and surfaces the version so the

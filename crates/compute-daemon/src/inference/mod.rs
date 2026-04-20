@@ -20,6 +20,7 @@ pub mod ggml_stage_worker;
 pub mod llama_stage_gateway;
 pub mod llamacpp;
 pub mod manager;
+pub mod mlx;
 pub mod real_forward_artifact;
 pub mod real_forward_provider;
 pub mod real_forward_provider_ggml;

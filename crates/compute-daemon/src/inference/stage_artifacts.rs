@@ -59,6 +59,125 @@ pub async fn ensure_gguf_shard(
     Ok(dest)
 }
 
+/// Default root for MLX snapshots under a models cache dir — matches
+/// `OmlxManager::model_dir()`, which is passed as `omlx serve --model-dir`.
+pub fn mlx_cache_root(models_cache_dir: &Path) -> PathBuf {
+    models_cache_dir.join("mlx")
+}
+
+/// Local folder for a specific MLX model under the cache root.
+pub fn mlx_model_path(models_cache_dir: &Path, folder: &str) -> PathBuf {
+    mlx_cache_root(models_cache_dir).join(folder)
+}
+
+/// Is an MLX model folder already snapshotted and usable by oMLX?
+/// Check for `config.json` as a proxy — every mlx-community snapshot
+/// has it, and its presence means `hf download` finished at least one
+/// complete pass (HF CLI writes files atomically to `.tmp/` then renames).
+pub fn mlx_model_cached(models_cache_dir: &Path, folder: &str) -> bool {
+    mlx_model_path(models_cache_dir, folder).join("config.json").exists()
+}
+
+/// Download a HuggingFace MLX snapshot via the `hf` CLI (bundled with the
+/// huggingface-hub Python package). On macOS, `brew install jundot/omlx/omlx`
+/// pulls it in transitively; otherwise `pip install huggingface-hub`.
+///
+/// Idempotent — returns the existing path if already cached. The CLI itself
+/// resumes partial downloads, so a crashed prior run doesn't re-fetch.
+///
+/// Blocking async via `tokio::process::Command` so we don't stall the
+/// runtime during a multi-GB pull.
+pub async fn ensure_mlx_snapshot(
+    models_cache_dir: &Path,
+    repo_id: &str,
+    folder: &str,
+) -> Result<PathBuf> {
+    let dest = mlx_model_path(models_cache_dir, folder);
+    if mlx_model_cached(models_cache_dir, folder) {
+        info!(
+            "MLX snapshot {} already cached at {}",
+            repo_id,
+            dest.display()
+        );
+        return Ok(dest);
+    }
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating mlx cache dir {}", parent.display()))?;
+    }
+
+    let hf_bin = locate_hf_cli()
+        .ok_or_else(|| anyhow::anyhow!(
+            "huggingface CLI (`hf` or `huggingface-cli`) not found — install via `pip install huggingface-hub` or rely on the oMLX brew formula which pulls it in"
+        ))?;
+
+    info!(
+        "Downloading MLX snapshot {} -> {}",
+        repo_id,
+        dest.display()
+    );
+    let output = tokio::process::Command::new(&hf_bin)
+        .arg("download")
+        .arg(repo_id)
+        .arg("--local-dir")
+        .arg(&dest)
+        .output()
+        .await
+        .with_context(|| format!("invoking {}", hf_bin.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("hf download {repo_id} failed: {}", stderr.trim());
+    }
+
+    if !mlx_model_cached(models_cache_dir, folder) {
+        anyhow::bail!(
+            "hf download {repo_id} returned success but config.json is missing at {}",
+            dest.display()
+        );
+    }
+
+    info!("MLX snapshot ready at {}", dest.display());
+    Ok(dest)
+}
+
+fn locate_hf_cli() -> Option<PathBuf> {
+    // `hf` is the new-style CLI (huggingface-hub ≥ 0.x); `huggingface-cli`
+    // is the legacy alias, still provided by the package.
+    let candidates: [PathBuf; 4] = [
+        PathBuf::from("/opt/homebrew/bin/hf"),
+        PathBuf::from("/usr/local/bin/hf"),
+        PathBuf::from("/opt/homebrew/bin/huggingface-cli"),
+        PathBuf::from("/usr/local/bin/huggingface-cli"),
+    ];
+    for c in candidates.iter() {
+        if c.exists() {
+            return Some(c.clone());
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        for py in ["3.9", "3.10", "3.11", "3.12", "3.13"] {
+            let p = PathBuf::from(&home).join(format!("Library/Python/{py}/bin/hf"));
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            for name in ["hf", "huggingface-cli"] {
+                let p = PathBuf::from(dir).join(name);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn gguf_magic_ok(path: &Path) -> Result<bool> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;

@@ -2,7 +2,7 @@
 //! so it can forward inference requests to the local llama-server.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -210,6 +210,12 @@ pub struct RelayClient {
     stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
     /// External full-pipeline llama.cpp stage gateway client.
     gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
+    /// Port of the local oMLX sidecar (0 = not available). Only set on
+    /// macOS + aarch64 when the oMLX binary is installed and healthy.
+    /// Requests for catalog models with an MLX variant whose snapshot is
+    /// cached locally are routed through this port in preference to the
+    /// GGUF/llama-server fallback.
+    mlx_port: Arc<AtomicU16>,
 }
 
 impl RelayClient {
@@ -246,6 +252,7 @@ impl RelayClient {
         outbound_rx: tokio::sync::mpsc::Receiver<String>,
         stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
         gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
+        mlx_port: Arc<AtomicU16>,
     ) -> Self {
         // Convert https:// to wss:// (or http:// to ws://)
         let ws_url = config
@@ -273,6 +280,7 @@ impl RelayClient {
             outbound_rx: Arc::new(tokio::sync::Mutex::new(outbound_rx)),
             stage_client,
             gateway_client,
+            mlx_port,
         }
     }
 
@@ -434,6 +442,7 @@ impl RelayClient {
                             let http_client = http_client.clone();
                             let stage_client = self.stage_client.clone();
                             let gateway_client = self.gateway_client.clone();
+                            let mlx_port = self.mlx_port.clone();
                             let is_active = self.is_active.clone();
                             let active_requests = self.active_requests.clone();
                             let last_latency_ms = self.last_latency_ms.clone();
@@ -491,6 +500,7 @@ impl RelayClient {
                                         cancel_rx,
                                         stage_client,
                                         gateway_client,
+                                        mlx_port,
                                     )
                                     .await;
                                     let total_ms = start.elapsed().as_millis() as u64;
@@ -903,8 +913,36 @@ async fn handle_inference_request(
     mut cancel_rx: oneshot::Receiver<()>,
     stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
     gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
+    mlx_port: Arc<AtomicU16>,
 ) -> RelayResponse {
     info!("[relay] Received inference request {} path={} stream=false", request.id, request.path);
+
+    // v0.4.2: MLX-preferred models get routed to the local oMLX sidecar
+    // before we consider the llama-server fallback. The sidecar is only
+    // spawned on Apple Silicon when `omlx` is installed and the MLX
+    // snapshot is cached — `mlx_port` stays 0 otherwise and this block
+    // is a noop. Split-pipeline (gateway) and stage-prototype paths still
+    // win the routing priority because they represent explicit
+    // orchestrator assignments, not single-node solo work.
+    let mlx_port_value = mlx_port.load(Ordering::Relaxed);
+    if mlx_port_value != 0 {
+        if let Some(mlx_folder) = resolve_mlx_folder_for_request(&request.body) {
+            info!(
+                "[relay] Routing request {} to local oMLX (model folder `{}` on port {})",
+                request.id, mlx_folder, mlx_port_value
+            );
+            return tokio::select! {
+                _ = &mut cancel_rx => RelayResponse {
+                    id: request.id.clone(),
+                    r#type: "inference_response".into(),
+                    status: 499,
+                    body: serde_json::json!({"error": "Request cancelled by client"}),
+                },
+                result = handle_omlx_request(client, mlx_port_value, &mlx_folder, request) => result,
+            };
+        }
+    }
+
     if let Some(gateway_client) = gateway_client.lock().await.clone() {
         info!("[relay] Routing request {} to stage gateway", request.id);
         return tokio::select! {
@@ -1052,6 +1090,92 @@ async fn wait_for_stage_head_client(
         }
 
         sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Look at a chat-completion request body and, if the requested model has
+/// an MLX variant in the catalog whose snapshot is cached on disk, return
+/// the oMLX folder name (what oMLX uses as the `model` field on its HTTP
+/// API). Returns `None` when the model is unknown, has no MLX variant, or
+/// hasn't been snapshotted locally yet — in which case the caller should
+/// fall through to the regular (llama-server / gateway) ladder.
+///
+/// Runs inside the async inference path, so keep it cheap: one catalog
+/// lookup + one filesystem stat. Everything lives in `~/.compute/models/`.
+fn resolve_mlx_folder_for_request(body: &serde_json::Value) -> Option<String> {
+    let requested = body.get("model").and_then(|v| v.as_str())?;
+    let catalog = compute_network::models::ModelCatalog::default_catalog();
+    let model = catalog.find(requested)?;
+    let mlx = model.mlx.as_ref()?;
+
+    // Local cache dir. Mirrors the daemon's models.cache_dir default
+    // (`~/.compute/models`). We don't have access to `Config` here — the
+    // relay is a child task of the runtime loop — but since oMLX is
+    // started with `--model-dir <models.cache_dir>/mlx`, the folder name
+    // on the wire is always the same as `MlxVariant::folder`.
+    let cache_root = dirs_like_models_cache_dir();
+    let cached = cache_root.join("mlx").join(&mlx.folder).join("config.json");
+    if !cached.exists() {
+        tracing::debug!(
+            "[omlx] model `{requested}` has MLX variant {} but snapshot is not cached at {} — falling through",
+            mlx.repo_id,
+            cached.parent().map(|p| p.display().to_string()).unwrap_or_default()
+        );
+        return None;
+    }
+    Some(mlx.folder.clone())
+}
+
+/// `~/.compute/models` — matches `default_models_cache_dir()` in config.rs
+/// without re-plumbing the full Config object into relay tasks.
+fn dirs_like_models_cache_dir() -> std::path::PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        return std::path::PathBuf::from(home).join(".compute").join("models");
+    }
+    std::path::PathBuf::from("/tmp/.compute/models")
+}
+
+/// Forward a chat-completion request to the local oMLX sidecar. oMLX speaks
+/// OpenAI-compatible JSON on `/v1/chat/completions`, so the only fixup we
+/// apply is rewriting the `model` field to oMLX's folder-based id (what
+/// it uses to identify a loaded MLX snapshot).
+async fn handle_omlx_request(
+    client: &reqwest::Client,
+    port: u16,
+    mlx_folder: &str,
+    request: &RelayRequest,
+) -> RelayResponse {
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let mut body = request.body.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(mlx_folder.to_string()),
+        );
+    }
+
+    match client.post(&url).json(&body).timeout(Duration::from_secs(600)).send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let body_text = resp.text().await.unwrap_or_default();
+            let parsed: serde_json::Value = serde_json::from_str(&body_text)
+                .unwrap_or_else(|_| serde_json::json!({"raw": body_text}));
+            RelayResponse {
+                id: request.id.clone(),
+                r#type: "inference_response".into(),
+                status,
+                body: parsed,
+            }
+        }
+        Err(e) => {
+            warn!("[omlx] forwarding to :{port} failed: {e}");
+            RelayResponse {
+                id: request.id.clone(),
+                r#type: "inference_response".into(),
+                status: 502,
+                body: serde_json::json!({"error": format!("oMLX unreachable: {e}")}),
+            }
+        }
     }
 }
 

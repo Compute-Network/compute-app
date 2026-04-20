@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -12,6 +12,7 @@ use crate::hardware;
 use crate::idle::{IdleDetector, IdleState};
 use crate::inference::llama_stage_gateway::LlamaStageGatewayRelayClient;
 use crate::inference::manager::{InferenceManager, InferenceStatus};
+use crate::inference::mlx::OmlxManager;
 use crate::inference::stage_backend::StageBackendKind;
 use crate::metrics::{Earnings, NetworkStats, PipelineStatus};
 use crate::relay::{AssignmentPush, RelayClient};
@@ -697,6 +698,71 @@ impl DaemonRuntime {
             }
         }
 
+        // v0.4.2: start the oMLX sidecar on Apple Silicon so MLX-format
+        // models (e.g. `qwen-3.6` → `mlx-community/Qwen3.6-35B-A3B-4bit`)
+        // can be served through Apple's MLX framework. Non-Mac hosts and
+        // Macs without the `omlx` binary (install.sh on v0.4.2+ runs the
+        // brew tap) skip this entirely and fall back to llama-server.
+        //
+        // The sidecar stays up for the daemon's lifetime; oMLX only loads
+        // a model into memory when a request for it arrives, so an idle
+        // sidecar is essentially free. Port 8091 is reserved for it (llama-
+        // server owns 8090). Relay routing consults `mlx_port` as an
+        // atomic so a crashed sidecar (value reset to 0) transparently
+        // fails over to the existing ladder.
+        let mlx_port = Arc::new(AtomicU16::new(0));
+        let mlx_model_dir = PathBuf::from(&self.config.models.cache_dir).join("mlx");
+        let mut omlx_manager: Option<OmlxManager> = None;
+        if OmlxManager::platform_supported() {
+            let mut mgr = OmlxManager::new(mlx_model_dir.clone());
+            if mgr.is_installed() {
+                match mgr.start() {
+                    Ok(()) => {
+                        let port = mgr.port();
+                        let ready_flag = mlx_port.clone();
+                        let probe = mgr.port();
+                        // Readiness probe runs on a blocking thread so the
+                        // Python+FastAPI bootstrap (a few seconds) doesn't
+                        // stall the daemon event loop. When it answers on
+                        // /v1/models we publish the port for routing.
+                        tokio::spawn(async move {
+                            let url = format!("http://127.0.0.1:{probe}/v1/models");
+                            let client = match reqwest::Client::builder()
+                                .timeout(Duration::from_millis(500))
+                                .build()
+                            {
+                                Ok(c) => c,
+                                Err(_) => return,
+                            };
+                            let deadline =
+                                tokio::time::Instant::now() + Duration::from_secs(120);
+                            while tokio::time::Instant::now() < deadline {
+                                if let Ok(resp) = client.get(&url).send().await {
+                                    if resp.status().is_success() {
+                                        ready_flag.store(port, Ordering::Relaxed);
+                                        info!("[omlx] sidecar ready on port {port}");
+                                        return;
+                                    }
+                                }
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                            }
+                            warn!(
+                                "[omlx] sidecar failed readiness probe on port {port} — MLX routing disabled"
+                            );
+                        });
+                        omlx_manager = Some(mgr);
+                    }
+                    Err(err) => {
+                        warn!("[omlx] sidecar failed to start: {err}");
+                    }
+                }
+            } else {
+                info!(
+                    "[omlx] binary not installed (expected at /opt/homebrew/bin/omlx) — MLX routing disabled; `brew install jundot/omlx/omlx` to enable"
+                );
+            }
+        }
+
         // Start WebSocket relay to orchestrator
         let relay = RelayClient::new(
             &self.config,
@@ -705,6 +771,7 @@ impl DaemonRuntime {
             ws_outbound_rx,
             stage_runtime_client.clone(),
             gateway_client.clone(),
+            mlx_port.clone(),
         );
         let relay_latency = relay.last_latency_ms();
         let relay_tps = relay.last_tps();

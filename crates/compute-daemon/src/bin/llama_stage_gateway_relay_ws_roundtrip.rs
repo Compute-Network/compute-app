@@ -167,6 +167,7 @@ async fn main() -> Result<()> {
         ws_outbound_rx,
         stage_client,
         gateway_client,
+        std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0)),
     );
 
     let relay_task = tokio::spawn(async move { relay.run().await });
