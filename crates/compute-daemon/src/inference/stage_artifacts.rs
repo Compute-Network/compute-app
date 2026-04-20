@@ -176,7 +176,7 @@ fn extract_tar(archive: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn download_file(url: &str, dest: &Path) -> Result<()> {
+pub async fn download_file(url: &str, dest: &Path) -> Result<()> {
     let client =
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(7200)).build()?;
 

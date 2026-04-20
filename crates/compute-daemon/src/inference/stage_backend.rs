@@ -33,7 +33,14 @@ impl StageBackendKind {
             "llamacpp" | "llama.cpp" | "llama" => Self::LlamaCpp,
             "llama-stage-gateway" | "llama_stage_gateway" | "gateway" => Self::LlamaStageGateway,
             "real_forward" | "realforward" | "real-forward" | "real" => Self::RealForward,
-            _ => Self::Prototype,
+            "prototype" => Self::Prototype,
+            // Any unrecognized / empty value falls back to the production
+            // gateway path — prior behavior fell through to Prototype, which
+            // is a stub that silently disables real inference on fresh
+            // installs that typo the backend name. Defaulting to the gateway
+            // matches `default_stage_backend()` in config.rs and means the
+            // user never has to faff with this setting.
+            _ => Self::LlamaStageGateway,
         }
     }
 

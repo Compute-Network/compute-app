@@ -195,13 +195,13 @@ async fn resolve_gateway_stage_inputs(
     }
 }
 
-fn gateway_launch_spec(config: &Config) -> ManagedGatewayLaunchSpec {
+async fn gateway_launch_spec(config: &Config) -> ManagedGatewayLaunchSpec {
     ManagedGatewayLaunchSpec {
         stage_node_bin: (!config.experimental.stage_gateway_stage_node_bin.trim().is_empty())
             .then(|| config.experimental.stage_gateway_stage_node_bin.clone().into()),
         gateway_bin: (!config.experimental.stage_gateway_gateway_bin.trim().is_empty())
             .then(|| config.experimental.stage_gateway_gateway_bin.clone().into()),
-        draft_model: resolve_draft_model_path(config),
+        draft_model: ensure_draft_model_path(config).await,
         ..ManagedGatewayLaunchSpec::default()
     }
 }
@@ -216,7 +216,20 @@ fn gateway_launch_spec(config: &Config) -> ManagedGatewayLaunchSpec {
 ///
 /// Returns `None` (single-step decode) if neither path resolves to an
 /// existing file.
-fn resolve_draft_model_path(config: &Config) -> Option<PathBuf> {
+/// Resolve (and auto-download if missing) the draft GGUF for the active target.
+///
+/// Resolution order:
+///   1. Explicit `experimental.stage_gateway_draft_model_path` always wins.
+///   2. Catalog auto-pair — look up the active target's `draft_model_id`,
+///      resolve to `<models.cache_dir>/<draft.gguf_filename>`.
+///   3. If the file is not cached but the catalog has a `gguf_download_url`,
+///      download it atomically via `stage_artifacts::download_file`.
+///
+/// This is the "no faf" path: users never need to manually download or point
+/// the daemon at the draft GGUF. First spec-decode-eligible assignment pays
+/// a one-time ~5s download cost (Gemma-3-270M Q4 is ~253 MB); subsequent
+/// runs find it cached.
+async fn ensure_draft_model_path(config: &Config) -> Option<PathBuf> {
     let explicit = config.experimental.stage_gateway_draft_model_path.trim();
     if !explicit.is_empty() {
         return Some(PathBuf::from(explicit));
@@ -241,15 +254,49 @@ fn resolve_draft_model_path(config: &Config) -> Option<PathBuf> {
             draft_id,
             cached.display()
         );
-        Some(cached)
-    } else {
+        return Some(cached);
+    }
+
+    let Some(url) = draft.gguf_download_url.as_deref() else {
         warn!(
-            "[gateway] draft model {} configured for {} but file missing at {} — spec decode disabled",
+            "[gateway] draft model {} configured for {} but file missing at {} and catalog has no download URL — spec decode disabled",
             draft_id,
             target_id,
             cached.display()
         );
-        None
+        return None;
+    };
+
+    if let Some(parent) = cached.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            warn!(
+                "[gateway] draft auto-download: failed to create {}: {e}",
+                parent.display()
+            );
+            return None;
+        }
+    }
+
+    info!(
+        "[gateway] draft model {} not cached — auto-downloading from {} to {}",
+        draft_id,
+        url,
+        cached.display()
+    );
+    match crate::inference::stage_artifacts::download_file(url, &cached).await {
+        Ok(()) => {
+            info!(
+                "[gateway] draft model auto-download complete: {}",
+                cached.display()
+            );
+            Some(cached)
+        }
+        Err(e) => {
+            warn!(
+                "[gateway] draft model auto-download failed ({e}) — spec decode disabled for this run"
+            );
+            None
+        }
     }
 }
 
@@ -298,7 +345,7 @@ async fn attempt_gateway_client_once(
     let mut gateway_addr = configured_gateway_addr(config, managed_gateway_stack.as_ref());
     if gateway_addr.is_none() && config.experimental.stage_gateway_autostart {
         let model_path = gateway_model_path(config);
-        let launch_spec = gateway_launch_spec(config);
+        let launch_spec = gateway_launch_spec(config).await;
         let stack =
             ManagedGatewayStack::spawn_local_with_spec(model_path.clone(), false, &launch_spec)
                 .map_err(|err| {
@@ -394,7 +441,7 @@ async fn ensure_gateway_client(
     let mut gateway_addr = configured_gateway_addr(config, managed_gateway_stack.as_ref());
     if gateway_addr.is_none() && config.experimental.stage_gateway_autostart {
         let model_path = gateway_model_path(config);
-        let launch_spec = gateway_launch_spec(config);
+        let launch_spec = gateway_launch_spec(config).await;
         let stack =
             ManagedGatewayStack::spawn_local_with_spec(model_path.clone(), false, &launch_spec)
                 .map_err(|err| {
@@ -770,7 +817,7 @@ impl DaemonRuntime {
                                                 continue;
                                             }
                                         };
-                                    let launch_spec = gateway_launch_spec(&self.config);
+                                    let launch_spec = gateway_launch_spec(&self.config).await;
                                     info!(
                                         "[gateway-tail] Spawning tail worker on {bind} orig_layers={start}-{end} local_layers={local_start}-{local_end} model={}",
                                         model_path.display()
@@ -896,7 +943,7 @@ impl DaemonRuntime {
                                                 continue;
                                             }
                                         };
-                                    let launch_spec = gateway_launch_spec(&self.config);
+                                    let launch_spec = gateway_launch_spec(&self.config).await;
                                     info!(
                                         "[gateway-head] Spawning head + remote-tail gateway orig_layers={start}-{end} local_layers={local_start}-{local_end} tail={tail_addr} model={}",
                                         model_path.display()
