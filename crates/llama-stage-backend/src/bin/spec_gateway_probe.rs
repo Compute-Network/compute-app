@@ -81,8 +81,9 @@ fn print_timings(label: &str, timings: &RemoteStageTimings) {
         timings.stage_server_response_write_us,
     );
     eprintln!(
-        "[probe] {label} spec tail_kernel={}us tail_sample={}us tail_verify_sample={}us tail_verify_detok={}us tail_verify_rollback={}us inline_samples={} sample_fallbacks={} spec_rounds={} spec_proposed={} spec_accepted={} spec_draft={}ms/{}us spec_verify={}ms/{}us spec_rollback={}ms/{}us",
+        "[probe] {label} spec tail_kernel={}us tail_sync={}us tail_sample={}us tail_verify_sample={}us tail_verify_detok={}us tail_verify_rollback={}us inline_samples={} sample_fallbacks={} spec_rounds={} spec_proposed={} spec_accepted={} spec_draft={}ms/{}us spec_verify={}ms/{}us spec_rollback={}ms/{}us",
         timings.tail_decode_kernel_us,
+        timings.tail_sync_us,
         timings.tail_sample_us,
         timings.tail_verify_sample_us,
         timings.tail_verify_detok_us,

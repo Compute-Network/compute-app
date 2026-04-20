@@ -198,6 +198,7 @@ type FnDecodeTail = unsafe extern "C" fn(*mut ffi::LlamaContext, ffi::llama_batc
 type FnGetEmbeddings = unsafe extern "C" fn(*mut ffi::LlamaContext) -> *mut f32;
 type FnGetLogitsIth = unsafe extern "C" fn(*mut ffi::LlamaContext, i32) -> *mut f32;
 type FnVocabIsEog = unsafe extern "C" fn(*const ffi::LlamaVocab, i32) -> bool;
+type FnSynchronize = unsafe extern "C" fn(*mut ffi::LlamaContext);
 
 pub(crate) struct LlamaApi {
     _deps: Vec<Library>,
@@ -224,6 +225,7 @@ pub(crate) struct LlamaApi {
     get_embeddings: FnGetEmbeddings,
     get_logits_ith: FnGetLogitsIth,
     vocab_is_eog: FnVocabIsEog,
+    synchronize: FnSynchronize,
 }
 
 impl LlamaApi {
@@ -304,6 +306,7 @@ impl LlamaApi {
                 get_embeddings: load_symbol(&llama, b"llama_get_embeddings\0")?,
                 get_logits_ith: load_symbol(&llama, b"llama_get_logits_ith\0")?,
                 vocab_is_eog: load_symbol(&llama, b"llama_vocab_is_eog\0")?,
+                synchronize: load_symbol(&llama, b"llama_synchronize\0")?,
                 _deps: deps,
                 _llama: llama,
             }
@@ -609,6 +612,12 @@ pub struct StageNodeProfile {
     pub tail_verify_detok_us: u64,
     #[serde(default)]
     pub tail_verify_rollback_us: u64,
+    /// Time spent in `llama_synchronize` after `decode_tail` to wait for
+    /// pending Metal GPU work. Surfaces what `tail_decode_kernel_us` was
+    /// previously hiding (decode_tail submits async on Metal and returns
+    /// before completion). Tail-only; zero for head/middle stages.
+    #[serde(default)]
+    pub tail_sync_us: u64,
     #[serde(default)]
     pub raw_response_bytes: usize,
     #[serde(default)]
@@ -844,6 +853,8 @@ pub struct RemoteStageTimings {
     pub tail_verify_detok_us: u64,
     #[serde(default)]
     pub tail_verify_rollback_us: u64,
+    #[serde(default)]
+    pub tail_sync_us: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1849,6 +1860,13 @@ impl LlamaStageBackend {
         if rc != 0 && rc != 1 {
             bail!("llama_decode_tail (verify) failed with {rc}");
         }
+        // Explicit GPU barrier: decode_tail submits the kernel async on Metal
+        // and returns before completion, so the cost previously leaked into
+        // the first get_logits_ith call. Calling synchronize here attributes
+        // it honestly to its own bucket.
+        let sync_started = Instant::now();
+        unsafe { (self.api.synchronize)(session_state.session.ctx) };
+        let tail_sync_us = sync_started.elapsed().as_micros() as u64;
         session_state.n_pos += expected_tokens as i32;
 
         let vocab = unsafe { (self.api.model_get_vocab)(model_ptr) };
@@ -1966,6 +1984,7 @@ impl LlamaStageBackend {
                 tail_verify_sample_us,
                 tail_verify_detok_us,
                 tail_verify_rollback_us,
+                tail_sync_us,
                 ..StageNodeProfile::default()
             };
         }
@@ -1979,6 +1998,7 @@ impl LlamaStageBackend {
             tail_verify_sample_us,
             tail_verify_detok_us,
             tail_verify_rollback_us,
+            tail_sync_us,
         })
     }
 
@@ -2030,6 +2050,7 @@ pub struct VerifiedOutcome {
     pub tail_verify_sample_us: u64,
     pub tail_verify_detok_us: u64,
     pub tail_verify_rollback_us: u64,
+    pub tail_sync_us: u64,
 }
 
 pub fn build_stage_backend(config: &StageNodeConfig) -> Result<LlamaStageBackend> {
@@ -2659,6 +2680,7 @@ impl RemoteStagePair {
                 tail_verify_sample_us: tail_verify_sample_us_total,
                 tail_verify_detok_us: tail_verify_detok_us_total,
                 tail_verify_rollback_us: tail_verify_rollback_us_total,
+                tail_sync_us: 0,
             },
         };
 
@@ -2942,6 +2964,7 @@ impl RemoteStageGateway {
                     tail_verify_sample_us: 0,
                     tail_verify_detok_us: 0,
                     tail_verify_rollback_us: 0,
+                    tail_sync_us: 0,
                 },
                 pending_tail_sample,
                 pending_committed: std::collections::VecDeque::new(),
@@ -3277,6 +3300,7 @@ impl RemoteStageGateway {
         session.timings.tail_verify_sample_us += tail_profile.tail_verify_sample_us;
         session.timings.tail_verify_detok_us += tail_profile.tail_verify_detok_us;
         session.timings.tail_verify_rollback_us += tail_profile.tail_verify_rollback_us;
+        session.timings.tail_sync_us += tail_profile.tail_sync_us;
 
         if accepted_pieces.len() != accepted_token_ids.len() {
             bail!(
@@ -3501,6 +3525,7 @@ pub fn handle_stage_node_request(
                 tail_verify_sample_us: outcome.tail_verify_sample_us,
                 tail_verify_detok_us: outcome.tail_verify_detok_us,
                 tail_verify_rollback_us: outcome.tail_verify_rollback_us,
+                tail_sync_us: outcome.tail_sync_us,
                 ..StageNodeProfile::default()
             };
             Ok(StageNodeResponse::VerifiedBatch {
