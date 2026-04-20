@@ -462,6 +462,7 @@ impl RelayClient {
                                         cancel_rx,
                                         stage_client,
                                         gateway_client,
+                                        mlx_port,
                                     )
                                     .await;
                                     let total_ms = start.elapsed().as_millis() as u64;
@@ -668,7 +669,40 @@ async fn handle_streaming_request(
     mut cancel_rx: oneshot::Receiver<()>,
     stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
     gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
+    mlx_port: Arc<AtomicU16>,
 ) -> RelayResponse {
+    // v0.4.3: MLX-preferred models stream through oMLX before we consider
+    // the llama-server fallback. Mirror of the non-streaming path in
+    // handle_inference_request — oMLX speaks OpenAI-compatible SSE so the
+    // same proxy helper works for both.
+    let mlx_port_value = mlx_port.load(Ordering::Relaxed);
+    if mlx_port_value != 0 {
+        if let Some(mlx_folder) = resolve_mlx_folder_for_request(&request.body) {
+            info!(
+                "[relay] Streaming request {} via oMLX (model folder `{}` on :{})",
+                request.id, mlx_folder, mlx_port_value
+            );
+            let mut body = request.body.clone();
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(mlx_folder.clone()),
+                );
+            }
+            let url = format!("http://127.0.0.1:{mlx_port_value}/v1/chat/completions");
+            return proxy_openai_stream(
+                client,
+                &url,
+                body,
+                &request.id,
+                response_tx,
+                &mut cancel_rx,
+                "oMLX",
+            )
+            .await;
+        }
+    }
+
     if let Some(gateway_client) = gateway_client.lock().await.clone() {
         return handle_stage_gateway_streaming_request(
             &gateway_client,
@@ -694,28 +728,56 @@ async fn handle_streaming_request(
     let url = format!("http://127.0.0.1:{port}{}", request.path);
     info!("[relay] Streaming {} {}", request.method, request.path);
 
+    proxy_openai_stream(
+        client,
+        &url,
+        request.body.clone(),
+        &request.id,
+        response_tx,
+        &mut cancel_rx,
+        "llama-server",
+    )
+    .await
+}
+
+/// Proxy an OpenAI-compatible SSE stream from an upstream HTTP endpoint
+/// back to the orchestrator via `response_tx`, aggregating usage. Shared
+/// by the llama-server and oMLX streaming paths — both speak the same
+/// wire format (`data: {...}\n\n`, terminated by `data: [DONE]`).
+///
+/// Returns a single `RelayResponse` with the aggregated usage; per-chunk
+/// forwarding happens through `response_tx` as `inference_stream_chunk`.
+async fn proxy_openai_stream(
+    client: &reqwest::Client,
+    url: &str,
+    body: serde_json::Value,
+    request_id: &str,
+    response_tx: mpsc::Sender<String>,
+    cancel_rx: &mut oneshot::Receiver<()>,
+    backend_label: &'static str,
+) -> RelayResponse {
     let resp = match tokio::select! {
-        _ = &mut cancel_rx => {
+        _ = &mut *cancel_rx => {
             return RelayResponse {
-                id: request.id.clone(),
+                id: request_id.to_string(),
                 r#type: "inference_response".into(),
                 status: 499,
                 body: serde_json::json!({"error": "Request cancelled by client"}),
             };
         }
         result = client
-            .post(&url)
-            .json(&request.body)
+            .post(url)
+            .json(&body)
             .timeout(Duration::from_secs(120))
             .send() => result
     } {
         Ok(r) => r,
         Err(e) => {
             return RelayResponse {
-                id: request.id.clone(),
+                id: request_id.to_string(),
                 r#type: "inference_response".into(),
                 status: 502,
-                body: serde_json::json!({"error": format!("Failed to reach llama-server: {e}")}),
+                body: serde_json::json!({"error": format!("Failed to reach {backend_label}: {e}")}),
             };
         }
     };
@@ -724,7 +786,7 @@ async fn handle_streaming_request(
     if status != 200 {
         let body = resp.text().await.unwrap_or_default();
         return RelayResponse {
-            id: request.id.clone(),
+            id: request_id.to_string(),
             r#type: "inference_response".into(),
             status,
             body: serde_json::json!({"error": body}),
@@ -733,16 +795,16 @@ async fn handle_streaming_request(
 
     // Read SSE stream — optimized buffer management to minimize allocations
     let mut byte_stream = resp.bytes_stream();
-    let mut buffer = String::with_capacity(4096); // Pre-allocate reasonable buffer
+    let mut buffer = String::with_capacity(4096);
     let mut last_usage: Option<serde_json::Value> = None;
     let mut prompt_tokens = 0u64;
     let mut completion_tokens = 0u64;
 
     loop {
         let chunk_result = tokio::select! {
-            _ = &mut cancel_rx => {
+            _ = &mut *cancel_rx => {
                 return RelayResponse {
-                    id: request.id.clone(),
+                    id: request_id.to_string(),
                     r#type: "inference_response".into(),
                     status: 499,
                     body: serde_json::json!({"error": "Request cancelled by client"}),
@@ -758,14 +820,13 @@ async fn handle_streaming_request(
         let chunk = match chunk_result {
             Ok(c) => c,
             Err(e) => {
-                warn!("[relay] Stream read error: {e}");
+                warn!("[relay] Stream read error ({backend_label}): {e}");
                 break;
             }
         };
 
         buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-        // Process complete SSE lines — drain from front without re-allocating
         let mut search_start = 0;
         while let Some(rel_pos) = buffer[search_start..].find('\n') {
             let pos = search_start + rel_pos;
@@ -774,11 +835,9 @@ async fn handle_streaming_request(
             if line.starts_with("data: ") {
                 let data = &line[6..];
 
-                // Forward SSE chunk to orchestrator via WebSocket
-                // Build JSON manually to avoid struct serialization overhead
                 let chunk_json = format!(
                     r#"{{"id":"{}","type":"inference_stream_chunk","chunk":"{}\\n\\n"}}"#,
-                    request.id,
+                    request_id,
                     line.replace('\\', "\\\\").replace('"', "\\\"")
                 );
                 let _ = response_tx.send(chunk_json).await;
@@ -788,7 +847,6 @@ async fn handle_streaming_request(
                     break;
                 }
 
-                // Parse only for usage tracking (only chunks with "usage" key matter)
                 if data.contains("usage") {
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
                         if let Some(usage) = parsed.get("usage") {
@@ -809,15 +867,13 @@ async fn handle_streaming_request(
             search_start = pos + 1;
         }
 
-        // Drain processed data from buffer (single allocation instead of per-line)
         if search_start > 0 {
             buffer.drain(..search_start);
         }
     }
 
-    // Return aggregated final response
     RelayResponse {
-        id: request.id.clone(),
+        id: request_id.to_string(),
         r#type: "inference_response".into(),
         status: 200,
         body: serde_json::json!({
