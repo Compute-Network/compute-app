@@ -64,6 +64,20 @@ fn model_entries() -> Vec<ModelEntry> {
             gguf_filename: "Qwen3.5-27B-UD-Q4_K_XL.gguf",
             hf_url: "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-UD-Q4_K_XL.gguf",
         },
+        // v0.4.4: qwen-3.6 unified id — daemon picks the format per host.
+        // The TUI picker needs a single user-facing entry; compute-network's
+        // ModelDefinition carries both the GGUF (Linux/Windows) and MLX
+        // (Apple Silicon via oMLX) sources. The filename here is the GGUF
+        // for download-tracking purposes on non-Mac hosts; on Mac ARM the
+        // oMLX snapshot lives under <cache>/mlx/Qwen3.6-35B-A3B-4bit/ and
+        // is tracked separately.
+        ModelEntry {
+            id: "qwen-3.6",
+            label: "Qwen3.6 — 22GB (MoE)",
+            desc: "35B-A3B MoE · auto MLX on Mac / GGUF elsewhere",
+            gguf_filename: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            hf_url: "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        },
         ModelEntry {
             id: "gemma-4-e4b-q4-stage-head",
             label: "Gemma4 Stage 0-20 — 2.5GB (head)",

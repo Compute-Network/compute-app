@@ -1961,6 +1961,39 @@ fn detect_downloaded_models() -> String {
                 if !models.contains(&"qwen3.5-27b-q4".to_string()) {
                     models.push("qwen3.5-27b-q4".to_string());
                 }
+            } else if name.contains("qwen3.6-35b") || name.contains("qwen3_6-35b") {
+                // Matches the GGUF (`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`) that
+                // Linux/Windows daemons download. Mac daemons get the MLX
+                // snapshot instead — detected via the mlx/ subdir below.
+                if !models.contains(&"qwen-3.6".to_string()) {
+                    models.push("qwen-3.6".to_string());
+                }
+            }
+        }
+    }
+
+    // MLX snapshots live under `<cache>/mlx/<folder>/` with a `config.json`
+    // marking a complete download. Map known folder names back to catalog
+    // ids so Mac daemons advertise `qwen-3.6` once the MLX variant is cached.
+    let mlx_root = cache_dir.join("mlx");
+    if let Ok(entries) = std::fs::read_dir(&mlx_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if !path.join("config.json").exists() {
+                continue;
+            }
+            let folder = entry.file_name().to_string_lossy().to_string();
+            let id = match folder.as_str() {
+                "Qwen3.6-35B-A3B-4bit" => Some("qwen-3.6"),
+                _ => None,
+            };
+            if let Some(id) = id {
+                if !models.iter().any(|m| m == id) {
+                    models.push(id.to_string());
+                }
             }
         }
     }

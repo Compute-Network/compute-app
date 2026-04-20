@@ -3711,11 +3711,16 @@ fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
         let trimmed = line.trim();
         if let Some(addr) = trimmed.strip_prefix("listening=") {
             let addr = addr.to_string();
-            // Forward the pre-`listening=` banner lines (draft_model=, spec_active=, etc.)
-            // to the parent's stderr so they show up in the daemon log. Without this,
-            // capability negotiation results are only visible if the child crashes.
+            // Forward only our own banner lines (draft_model=, spec_active=,
+            // etc.) plus anything that looks like a real error. Skip the
+            // llama.cpp startup firehose (`llama_kv_cache: layer 7: ...`,
+            // `sched_reserve: ...`, `ggml_metal_: ...`, backend enumeration,
+            // etc.) — on a 42-layer model that's 100+ lines per spawn and
+            // it floods the TUI log panel.
             for prior in &captured {
-                eprintln!("[child:{}] {}", addr, prior);
+                if child_log_is_interesting(prior) {
+                    eprintln!("[child:{}] {}", addr, prior);
+                }
             }
             let forward = env::var_os("LLAMA_STAGE_FORWARD_STDERR").is_some();
             let label = addr.clone();
@@ -3727,7 +3732,11 @@ fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
                     match reader.read_line(&mut buf) {
                         Ok(0) | Err(_) => return,
                         Ok(_) => {
-                            if forward {
+                            // Unconditional path: we always surface errors
+                            // so a crash loop is visible without needing
+                            // LLAMA_STAGE_FORWARD_STDERR=1 set.
+                            let trimmed = buf.trim_end();
+                            if forward || child_log_is_error(trimmed) {
                                 eprint!("[child:{}] {}", label, buf);
                             }
                         }
@@ -3740,6 +3749,54 @@ fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
             captured.push(trimmed.to_string());
         }
     }
+}
+
+/// Is a child stderr line worth forwarding to the parent's log by default?
+/// Matches our own banner prefixes (`draft_model=`, `spec_active=`, etc.)
+/// and obvious error/panic lines; rejects the llama.cpp / ggml verbose
+/// startup chatter.
+fn child_log_is_interesting(line: &str) -> bool {
+    if child_log_is_banner(line) || child_log_is_error(line) {
+        return true;
+    }
+    false
+}
+
+/// Matches our own sidecar-emitted banner lines. Add new prefixes here as
+/// the sidecars gain more pre-listening status output.
+fn child_log_is_banner(line: &str) -> bool {
+    const BANNER_PREFIXES: &[&str] = &[
+        "draft_model=",
+        "spec_active=",
+        "spec_config=",
+        "stage_id=",
+        "gateway_addr=",
+        "node_info=",
+    ];
+    BANNER_PREFIXES.iter().any(|p| line.starts_with(p))
+}
+
+/// Heuristic: does this line look like an actionable error we want the user
+/// to see even when forwarding is off?
+fn child_log_is_error(line: &str) -> bool {
+    // Avoid false positives on "error_count=0" etc by matching common
+    // error-log phrasings, not the bare word "error".
+    const ERROR_NEEDLES: &[&str] = &[
+        "panic",
+        "thread 'main' panicked",
+        "FATAL",
+        "Fatal",
+        "fatal:",
+        "error:",
+        "Error:",
+        " failed:",
+        " failed (",
+        "Traceback",
+        "assertion",
+        "segmentation fault",
+        "Segmentation fault",
+    ];
+    ERROR_NEEDLES.iter().any(|needle| line.contains(needle))
 }
 
 struct ManagedServiceChild {
