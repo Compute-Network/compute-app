@@ -28,7 +28,7 @@ else
   DIM='' BOLD='' GREEN='' RED='' RESET=''
 fi
 
-# Spinner
+# Spinner — \r-rewriting frame for tasks that finish in a second or two.
 spin() {
   _spin_msg="$1"
   _spin_pid="$2"
@@ -47,6 +47,50 @@ spin() {
     printf "\r  ${RED}✗${RESET} %s\n" "$_spin_msg"
   fi
   return $_spin_code
+}
+
+# Long-running loader with elapsed-time counter. Same \r-rewriting line
+# as spin(), but appends `(42s)` so the user can tell it's not hung.
+# Pads the message on overwrite so characters from longer prior frames
+# don't linger when the elapsed counter shortens — fixes the truncated-
+# message garbage we'd see on brew installs.
+loader() {
+  _load_msg="$1"
+  _load_pid="$2"
+  _load_chars='/-\|'
+  _load_i=0
+  _load_start=$(date +%s 2>/dev/null || echo 0)
+  _load_prev_len=0
+  while kill -0 "$_load_pid" 2>/dev/null; do
+    _load_i=$(( (_load_i + 1) % 4 ))
+    _load_char=$(echo "$_load_chars" | cut -c$((_load_i+1))-$((_load_i+1)))
+    _load_now=$(date +%s 2>/dev/null || echo 0)
+    _load_elapsed=$(( _load_now - _load_start ))
+    _load_render="  ${_load_char} ${_load_msg} (${_load_elapsed}s)"
+    # Pad with trailing spaces to clear any remnant from longer frames.
+    _load_pad=""
+    _load_cur_len=${#_load_render}
+    if [ "$_load_cur_len" -lt "$_load_prev_len" ]; then
+      _load_diff=$(( _load_prev_len - _load_cur_len ))
+      _load_pad=$(printf '%*s' "$_load_diff" '')
+    fi
+    _load_prev_len=$_load_cur_len
+    printf "\r  ${DIM}%s${RESET} %s ${DIM}(%ds)${RESET}%s" \
+      "$_load_char" "$_load_msg" "$_load_elapsed" "$_load_pad"
+    sleep 0.2
+  done
+  wait "$_load_pid" 2>/dev/null
+  _load_code=$?
+  _load_now=$(date +%s 2>/dev/null || echo 0)
+  _load_elapsed=$(( _load_now - _load_start ))
+  # Clear the line fully before writing the final state.
+  printf "\r%*s\r" 120 ''
+  if [ "$_load_code" -eq 0 ]; then
+    printf "  ${GREEN}✓${RESET} %s ${DIM}(%ds)${RESET}\n" "$_load_msg" "$_load_elapsed"
+  else
+    printf "  ${RED}✗${RESET} %s ${DIM}(%ds)${RESET}\n" "$_load_msg" "$_load_elapsed"
+  fi
+  return $_load_code
 }
 
 
@@ -263,25 +307,28 @@ fi
 #
 # Non-fatal: if brew is missing or the install fails, compute-daemon
 # silently falls back to llama-server for MLX-preferred models.
+OMLX_LOG="$HOME/.compute/logs/omlx-install.log"
 if [ "$OS" = "darwin" ] && [ "$ARCH" = "aarch64" ]; then
   if command -v omlx >/dev/null 2>&1; then
     echo "  ${GREEN}✓${RESET} oMLX already installed ${DIM}($(command -v omlx))${RESET}"
   elif command -v brew >/dev/null 2>&1; then
-    echo ""
-    echo "  ${BOLD}Installing oMLX${RESET} ${DIM}(Python + MLX + FastAPI; ~2–5 min on first run)${RESET}"
-    echo "  ${DIM}────────────────────────────────────────────────${RESET}"
-    # Let brew's own progress output through. Its stderr/stdout already
-    # include download percentages and per-formula status lines — that's
-    # the honest progress indicator the user asked for.
-    if brew tap jundot/omlx https://github.com/jundot/omlx && \
-       brew install jundot/omlx/omlx; then
-      echo "  ${DIM}────────────────────────────────────────────────${RESET}"
-      echo "  ${GREEN}✓${RESET} oMLX installed ${DIM}($(command -v omlx 2>/dev/null || echo "via brew"))${RESET}"
-    else
-      echo "  ${DIM}────────────────────────────────────────────────${RESET}"
-      echo "  ${RED}✗${RESET} oMLX install failed — MLX models will use the GGUF path via llama-server"
-      echo "     ${DIM}Retry: brew install jundot/omlx/omlx${RESET}"
-    fi
+    mkdir -p "$(dirname "$OMLX_LOG")"
+    # Run brew inside `script -q /dev/null` so it writes to a fake PTY
+    # instead of our real terminal. Without this, brew's native progress
+    # output leaks past stdout/stderr redirects (it opens /dev/tty
+    # directly for color + progress bars) and corrupts our spinner. The
+    # subshell captures everything to a log file the user can tail if
+    # they want the gritty details.
+    (
+      script -q /dev/null sh -c '
+        brew tap jundot/omlx https://github.com/jundot/omlx 2>&1
+        brew install jundot/omlx/omlx 2>&1
+      '
+    ) > "$OMLX_LOG" 2>&1 &
+    loader "Installing oMLX (MLX inference server)" $! || {
+      echo "     ${DIM}Log: ${OMLX_LOG}${RESET}"
+      echo "     ${DIM}MLX models will use the GGUF path via llama-server. Retry: brew install jundot/omlx/omlx${RESET}"
+    }
   else
     echo "  ${DIM}Note: Homebrew not found — MLX models will use the GGUF path via llama-server.${RESET}"
     echo "  ${DIM}      Install Homebrew (https://brew.sh) and re-run install.sh to enable MLX.${RESET}"
