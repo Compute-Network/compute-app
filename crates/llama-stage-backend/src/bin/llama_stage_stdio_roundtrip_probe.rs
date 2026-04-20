@@ -152,7 +152,9 @@ fn expect_token_ids(response: StageNodeResponse) -> Result<Vec<i32>> {
 
 fn expect_tensor(response: StageNodeResponse) -> Result<StageTensor> {
     match response {
-        StageNodeResponse::Tensor { tensor, .. } => Ok(tensor),
+        StageNodeResponse::Tensor { tensor, .. } => {
+            tensor.context("roundtrip probe expected tensor in response")
+        },
         other => bail!("expected tensor response, got {other:?}"),
     }
 }

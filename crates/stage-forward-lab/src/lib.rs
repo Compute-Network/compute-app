@@ -24,7 +24,9 @@ const STAGE_TENSOR_BYTES_HEADER_LEN: usize = 12;
 pub mod bytes_b64 {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serialize, Serializer};
+    use std::fmt;
 
     pub fn serialize<S: Serializer>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
@@ -34,13 +36,42 @@ pub mod bytes_b64 {
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        if deserializer.is_human_readable() {
-            let s = String::deserialize(deserializer)?;
-            STANDARD.decode(&s).map_err(serde::de::Error::custom)
-        } else {
-            Vec::<u8>::deserialize(deserializer)
+    struct BytesOrBase64Visitor;
+
+    impl<'de> Visitor<'de> for BytesOrBase64Visitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a base64 string or raw bytes")
         }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<u8>, E> {
+            STANDARD.decode(value).map_err(E::custom)
+        }
+
+        fn visit_string<E: de::Error>(self, value: String) -> Result<Vec<u8>, E> {
+            self.visit_str(&value)
+        }
+
+        fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(value)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let mut bytes = Vec::new();
+            while let Some(byte) = seq.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_any(BytesOrBase64Visitor)
     }
 }
 

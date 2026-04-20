@@ -1,12 +1,13 @@
 use anyhow::{Context, Result, bail};
 use llama_stage_backend::{
-    StageNodeConfig, StageNodeRequest, StageNodeResponse, build_stage_backend,
+    StageNodeConfig, StageNodeProfile, StageNodeRequest, StageNodeResponse, build_stage_backend,
     default_gemma_model_path, handle_stage_node_request,
 };
 use std::env;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -73,6 +74,31 @@ fn parse_args() -> Result<Args> {
     })
 }
 
+fn stamp_server_timing(
+    response: &mut StageNodeResponse,
+    decode_us: u64,
+    handle_us: u64,
+    prev_encode_us: u64,
+    prev_write_us: u64,
+) {
+    let stamp = |profile: &mut Option<StageNodeProfile>| {
+        let p = profile.get_or_insert_with(StageNodeProfile::default);
+        p.server_request_json_decode_us = decode_us;
+        p.server_request_json_decode_ms = decode_us / 1000;
+        p.server_handle_us = handle_us;
+        p.server_handle_ms = handle_us / 1000;
+        p.server_response_json_encode_us = prev_encode_us;
+        p.server_response_json_encode_ms = prev_encode_us / 1000;
+        p.server_response_write_us = prev_write_us;
+        p.server_response_write_ms = prev_write_us / 1000;
+    };
+    match response {
+        StageNodeResponse::Tensor { profile, .. } => stamp(profile),
+        StageNodeResponse::VerifiedBatch { profile, .. } => stamp(profile),
+        _ => {}
+    }
+}
+
 fn handle_stream(
     stream: TcpStream,
     backend: &llama_stage_backend::LlamaStageBackend,
@@ -81,28 +107,49 @@ fn handle_stream(
     let reader_stream = stream.try_clone()?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
-    let mut line = String::new();
+
+    let mut prev_encode_us: u64 = 0;
+    let mut prev_write_us: u64 = 0;
 
     loop {
-        line.clear();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            break;
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err.into()),
         }
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let request_len = u32::from_le_bytes(len_buf) as usize;
+        if request_len == 0 {
             continue;
         }
 
-        let response = match serde_json::from_str::<StageNodeRequest>(trimmed) {
+        let mut request_bytes = vec![0u8; request_len];
+        reader.read_exact(&mut request_bytes)?;
+
+        let decode_started = Instant::now();
+        let parsed = rmp_serde::from_slice::<StageNodeRequest>(&request_bytes);
+        let decode_us = decode_started.elapsed().as_micros() as u64;
+
+        let handle_started = Instant::now();
+        let mut response = match parsed {
             Ok(request) => handle_stage_node_request(backend, request),
             Err(err) => StageNodeResponse::Error { message: format!("invalid request: {err}") },
         };
+        let handle_us = handle_started.elapsed().as_micros() as u64;
 
-        serde_json::to_writer(&mut writer, &response)?;
-        writer.write_all(b"\n")?;
+        stamp_server_timing(&mut response, decode_us, handle_us, prev_encode_us, prev_write_us);
+
+        let encode_started = Instant::now();
+        let response_bytes = rmp_serde::to_vec_named(&response)?;
+        prev_encode_us = encode_started.elapsed().as_micros() as u64;
+
+        let response_len = u32::try_from(response_bytes.len()).context("stage response too large")?;
+        let write_started = Instant::now();
+        writer.write_all(&response_len.to_le_bytes())?;
+        writer.write_all(&response_bytes)?;
         writer.flush()?;
+        prev_write_us = write_started.elapsed().as_micros() as u64;
     }
 
     Ok(())

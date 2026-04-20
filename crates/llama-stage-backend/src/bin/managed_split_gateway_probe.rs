@@ -6,9 +6,73 @@
 use anyhow::{Context, Result};
 use llama_stage_backend::{
     GatewayServiceClient, ManagedGatewayLaunchSpec, ManagedHeadGatewayStack, ManagedTailNode,
-    default_gemma_model_path,
+    RemoteStageTimings, default_gemma_model_path,
 };
+use std::path::PathBuf;
 use std::time::Instant;
+
+fn current_profile_bin(name: &str) -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("resolve current executable path")?;
+    let dir = exe.parent().context("current executable has no parent directory")?;
+    let candidate = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    if candidate.exists() {
+        Ok(candidate)
+    } else {
+        anyhow::bail!(
+            "expected sibling binary for current build profile, but it was not found: {}",
+            candidate.display()
+        )
+    }
+}
+
+fn print_timings(label: &str, timings: &RemoteStageTimings) {
+    eprintln!(
+        "[probe] {label} timings head_prefill={}ms head_decode={}ms tail_decode={}ms sample={}ms ttft={}ms total={}ms",
+        timings.head_prefill_ms,
+        timings.head_decode_ms,
+        timings.tail_decode_ms,
+        timings.sample_ms,
+        timings.ttft_ms,
+        timings.total_ms,
+    );
+    eprintln!(
+        "[probe] {label} bytes transfer_initial={} transfer_total={} head_hidden_prefill={} head_hidden_decode={} prompt_tokens={} decode_steps={}",
+        timings.transfer_bytes,
+        timings.total_transfer_bytes,
+        timings.head_hidden_bytes_prefill,
+        timings.head_hidden_bytes_decode,
+        timings.prompt_tokens,
+        timings.decode_steps,
+    );
+    eprintln!(
+        "[probe] {label} transport head_pack={}ms/{}us tail_unpack={}ms/{}us json_encode={}ms/{}us json_decode={}ms/{}us write={}ms/{}us read={}ms/{}us inline_samples={} sample_fallbacks={}",
+        timings.head_pack_ms,
+        timings.head_pack_us,
+        timings.tail_unpack_ms,
+        timings.tail_unpack_us,
+        timings.stage_request_json_encode_ms,
+        timings.stage_request_json_encode_us,
+        timings.stage_response_json_decode_ms,
+        timings.stage_response_json_decode_us,
+        timings.stage_request_write_ms,
+        timings.stage_request_write_us,
+        timings.stage_response_read_ms,
+        timings.stage_response_read_us,
+        timings.inline_sample_hits,
+        timings.sample_rpc_fallbacks,
+    );
+    eprintln!(
+        "[probe] {label} server request_decode={}ms/{}us handle={}ms/{}us response_encode={}ms/{}us response_write={}ms/{}us",
+        timings.stage_server_request_json_decode_ms,
+        timings.stage_server_request_json_decode_us,
+        timings.stage_server_handle_ms,
+        timings.stage_server_handle_us,
+        timings.stage_server_response_json_encode_ms,
+        timings.stage_server_response_json_encode_us,
+        timings.stage_server_response_write_ms,
+        timings.stage_server_response_write_us,
+    );
+}
 
 fn main() -> Result<()> {
     // Per-stage model paths can be overridden via env to test sharded GGUFs.
@@ -38,7 +102,15 @@ fn main() -> Result<()> {
     let tail_start = env_layer("TAIL_START", 21);
     let tail_end = env_layer("TAIL_END", 41);
 
-    let launch_spec = ManagedGatewayLaunchSpec::default();
+    let stage_node_bin = current_profile_bin("llama_stage_tcp_node")?;
+    let gateway_bin = current_profile_bin("llama_stage_gateway_tcp_node")?;
+    let launch_spec = ManagedGatewayLaunchSpec {
+        stage_node_bin: Some(stage_node_bin.clone()),
+        gateway_bin: Some(gateway_bin.clone()),
+        ..ManagedGatewayLaunchSpec::default()
+    };
+    eprintln!("[probe] stage node bin = {}", stage_node_bin.display());
+    eprintln!("[probe] gateway bin = {}", gateway_bin.display());
 
     eprintln!("[probe] spawning tail worker (layers {tail_start}-{tail_end})");
     let t0 = Instant::now();
@@ -85,10 +157,7 @@ fn main() -> Result<()> {
     let total = t2.elapsed().as_secs_f64();
 
     eprintln!("[probe] tokens={} text={:?}", completion.completion_tokens, completion.text);
-    eprintln!(
-        "[probe] timings ttft={:?}ms total={:?}ms",
-        completion.timings.ttft_ms, completion.timings.total_ms
-    );
+    print_timings("baseline", &completion.timings);
     let tps = if total > 0.0 { completion.completion_tokens as f64 / total } else { 0.0 };
     eprintln!("[probe] elapsed={:.2}s tps={:.2}", total, tps);
 

@@ -16,10 +16,90 @@
 use anyhow::{Context, Result, bail};
 use llama_stage_backend::{
     ManagedGatewayLaunchSpec, ManagedHeadNode, ManagedTailNode, RemoteStageGateway,
-    SpecDecodeConfig, default_gemma_model_path,
+    RemoteStageTimings, SpecDecodeConfig, default_gemma_model_path,
 };
 use std::path::PathBuf;
 use std::time::Instant;
+
+fn current_profile_bin(name: &str) -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("resolve current executable path")?;
+    let dir = exe.parent().context("current executable has no parent directory")?;
+    let candidate = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    if candidate.exists() {
+        Ok(candidate)
+    } else {
+        bail!(
+            "expected sibling binary for current build profile, but it was not found: {}",
+            candidate.display()
+        )
+    }
+}
+
+fn print_timings(label: &str, timings: &RemoteStageTimings) {
+    eprintln!(
+        "[probe] {label} timings head_prefill={}ms head_decode={}ms tail_decode={}ms sample={}ms ttft={}ms total={}ms",
+        timings.head_prefill_ms,
+        timings.head_decode_ms,
+        timings.tail_decode_ms,
+        timings.sample_ms,
+        timings.ttft_ms,
+        timings.total_ms,
+    );
+    eprintln!(
+        "[probe] {label} bytes transfer_initial={} transfer_total={} head_hidden_prefill={} head_hidden_decode={} prompt_tokens={} decode_steps={}",
+        timings.transfer_bytes,
+        timings.total_transfer_bytes,
+        timings.head_hidden_bytes_prefill,
+        timings.head_hidden_bytes_decode,
+        timings.prompt_tokens,
+        timings.decode_steps,
+    );
+    eprintln!(
+        "[probe] {label} transport head_pack={}ms/{}us tail_unpack={}ms/{}us json_encode={}ms/{}us json_decode={}ms/{}us write={}ms/{}us read={}ms/{}us",
+        timings.head_pack_ms,
+        timings.head_pack_us,
+        timings.tail_unpack_ms,
+        timings.tail_unpack_us,
+        timings.stage_request_json_encode_ms,
+        timings.stage_request_json_encode_us,
+        timings.stage_response_json_decode_ms,
+        timings.stage_response_json_decode_us,
+        timings.stage_request_write_ms,
+        timings.stage_request_write_us,
+        timings.stage_response_read_ms,
+        timings.stage_response_read_us,
+    );
+    eprintln!(
+        "[probe] {label} server request_decode={}ms/{}us handle={}ms/{}us response_encode={}ms/{}us response_write={}ms/{}us",
+        timings.stage_server_request_json_decode_ms,
+        timings.stage_server_request_json_decode_us,
+        timings.stage_server_handle_ms,
+        timings.stage_server_handle_us,
+        timings.stage_server_response_json_encode_ms,
+        timings.stage_server_response_json_encode_us,
+        timings.stage_server_response_write_ms,
+        timings.stage_server_response_write_us,
+    );
+    eprintln!(
+        "[probe] {label} spec tail_kernel={}us tail_sample={}us tail_verify_sample={}us tail_verify_detok={}us tail_verify_rollback={}us inline_samples={} sample_fallbacks={} spec_rounds={} spec_proposed={} spec_accepted={} spec_draft={}ms/{}us spec_verify={}ms/{}us spec_rollback={}ms/{}us",
+        timings.tail_decode_kernel_us,
+        timings.tail_sample_us,
+        timings.tail_verify_sample_us,
+        timings.tail_verify_detok_us,
+        timings.tail_verify_rollback_us,
+        timings.inline_sample_hits,
+        timings.sample_rpc_fallbacks,
+        timings.spec_rounds,
+        timings.spec_drafts_proposed,
+        timings.spec_drafts_accepted,
+        timings.spec_draft_ms,
+        timings.spec_draft_us,
+        timings.spec_verify_ms,
+        timings.spec_verify_us,
+        timings.spec_rollback_ms,
+        timings.spec_rollback_us,
+    );
+}
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
@@ -66,7 +146,15 @@ fn main() -> Result<()> {
     let tail_start: u32 = std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(21);
     let tail_end: u32 = std::env::var("TAIL_END").ok().and_then(|s| s.parse().ok()).unwrap_or(41);
 
-    let launch = ManagedGatewayLaunchSpec::default();
+    let stage_node_bin = current_profile_bin("llama_stage_tcp_node")?;
+    let gateway_bin = current_profile_bin("llama_stage_gateway_tcp_node")?;
+    let launch = ManagedGatewayLaunchSpec {
+        stage_node_bin: Some(stage_node_bin.clone()),
+        gateway_bin: Some(gateway_bin.clone()),
+        ..ManagedGatewayLaunchSpec::default()
+    };
+    eprintln!("[probe] stage node bin = {}", stage_node_bin.display());
+    eprintln!("[probe] gateway bin = {}", gateway_bin.display());
 
     eprintln!("[probe] spawning head (layers {head_start}..={head_end})");
     let head = ManagedHeadNode::spawn(
@@ -104,6 +192,7 @@ fn main() -> Result<()> {
         "[probe] baseline tokens={} elapsed={:.2}s tps={:.2} ttft={}ms",
         baseline.completion_tokens, baseline_elapsed, baseline_tps, baseline.timings.ttft_ms
     );
+    print_timings("baseline", &baseline.timings);
     eprintln!("[probe] baseline text = {:?}", baseline.text);
     drop(baseline_gw);
 
@@ -113,7 +202,7 @@ fn main() -> Result<()> {
         enabled: true,
         start_k: 4,
         min_k: 1,
-        max_k: 4,
+        max_k: 16,
         disable_after_consec_zero: 3,
     };
     let mut spec_gw = RemoteStageGateway::connect_with_draft(
@@ -149,6 +238,7 @@ fn main() -> Result<()> {
         "[probe] spec tokens={} elapsed={:.2}s tps={:.2} ttft={}ms",
         spec.completion_tokens, spec_elapsed, spec_tps, spec.timings.ttft_ms
     );
+    print_timings("spec", &spec.timings);
     eprintln!("[probe] spec text = {:?}", spec.text);
 
     // === Equivalence check ===

@@ -4,7 +4,7 @@ use llama_stage_backend::{
     handle_stage_gateway_request,
 };
 use std::env;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 
@@ -60,27 +60,32 @@ fn handle_stream(stream: TcpStream, gateway: &mut RemoteStageGateway) -> Result<
     let reader_stream = stream.try_clone()?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
-    let mut line = String::new();
 
     loop {
-        line.clear();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            break;
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err.into()),
         }
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let request_len = u32::from_le_bytes(len_buf) as usize;
+        if request_len == 0 {
             continue;
         }
 
-        let response = match serde_json::from_str::<StageGatewayRequest>(trimmed) {
+        let mut request_bytes = vec![0u8; request_len];
+        reader.read_exact(&mut request_bytes)?;
+
+        let response = match rmp_serde::from_slice::<StageGatewayRequest>(&request_bytes) {
             Ok(request) => handle_stage_gateway_request(gateway, request),
             Err(err) => StageGatewayResponse::Error { message: format!("invalid request: {err}") },
         };
 
-        serde_json::to_writer(&mut writer, &response)?;
-        writer.write_all(b"\n")?;
+        let response_bytes = rmp_serde::to_vec_named(&response)?;
+        let response_len = u32::try_from(response_bytes.len()).context("gateway response too large")?;
+        writer.write_all(&response_len.to_le_bytes())?;
+        writer.write_all(&response_bytes)?;
         writer.flush()?;
     }
 
