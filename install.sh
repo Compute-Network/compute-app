@@ -3,6 +3,14 @@
 # Usage: curl -fsSL https://computenetwork.sh/install.sh | sh
 set -e
 
+# If a prior installer / brew run left the terminal in raw-ish mode
+# (cursor-down without carriage return, which makes the ASCII globe
+# cascade diagonally), restore sane TTY settings before drawing anything.
+# Under `curl ... | sh`, stdin is a pipe — not a TTY — so we redirect
+# stty's file descriptor to /dev/tty (the controlling terminal) and
+# swallow any failure for truly non-interactive contexts like CI.
+stty sane </dev/tty 2>/dev/null || true
+
 REPO="Compute-Network/compute-app"
 INSTALL_DIR="${COMPUTE_INSTALL_DIR:-$HOME/.compute/bin}"
 BINARY_NAME="compute"
@@ -242,28 +250,41 @@ if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
   fi
 fi
 
-# v0.4.2: on Apple Silicon, make sure oMLX (https://github.com/jundot/omlx)
-# is available. oMLX is a Python + FastAPI server that exposes MLX-format
-# models (e.g. `mlx-community/Qwen3.6-35B-A3B-4bit`) over an OpenAI-
-# compatible API on localhost. compute-daemon spawns it as a sidecar on
-# startup when it's installed, and routes MLX-preferred model requests
-# through it in preference to the GGUF/llama-server fallback. No install
-# here is non-fatal: the daemon falls through to llama-server and the
-# user just sees a GGUF-speed path instead of the much faster MLX one.
+# v0.4.3: on Apple Silicon, install oMLX (https://github.com/jundot/omlx)
+# — a Python + FastAPI MLX inference server compute-daemon uses to route
+# MLX-format models (e.g. `qwen-3.6` → `mlx-community/Qwen3.6-35B-A3B-4bit`)
+# through Apple's MLX framework instead of llama-server's GGUF path.
+#
+# This is synchronous and visible: brew has its own download / install
+# progress output (`==> Downloading ...`, percentage bars, etc), which
+# is more informative than a bash spinner we'd have to fight for line
+# control with. On a fresh Mac without Python this takes 2–5 minutes;
+# subsequent installs (brew already has the deps) are seconds.
+#
+# Non-fatal: if brew is missing or the install fails, compute-daemon
+# silently falls back to llama-server for MLX-preferred models.
 if [ "$OS" = "darwin" ] && [ "$ARCH" = "aarch64" ]; then
-  if ! command -v omlx >/dev/null 2>&1; then
-    if command -v brew >/dev/null 2>&1; then
-      (
-        brew tap jundot/omlx https://github.com/jundot/omlx >/dev/null 2>&1 || true
-        brew install jundot/omlx/omlx >/dev/null 2>&1 || true
-      ) &
-      spin "Installing oMLX (MLX inference server)" $!
+  if command -v omlx >/dev/null 2>&1; then
+    echo "  ${GREEN}✓${RESET} oMLX already installed ${DIM}($(command -v omlx))${RESET}"
+  elif command -v brew >/dev/null 2>&1; then
+    echo ""
+    echo "  ${BOLD}Installing oMLX${RESET} ${DIM}(Python + MLX + FastAPI; ~2–5 min on first run)${RESET}"
+    echo "  ${DIM}────────────────────────────────────────────────${RESET}"
+    # Let brew's own progress output through. Its stderr/stdout already
+    # include download percentages and per-formula status lines — that's
+    # the honest progress indicator the user asked for.
+    if brew tap jundot/omlx https://github.com/jundot/omlx && \
+       brew install jundot/omlx/omlx; then
+      echo "  ${DIM}────────────────────────────────────────────────${RESET}"
+      echo "  ${GREEN}✓${RESET} oMLX installed ${DIM}($(command -v omlx 2>/dev/null || echo "via brew"))${RESET}"
     else
-      echo "  ${DIM}Note: Homebrew not found — MLX models will use the GGUF path via llama-server.${RESET}"
-      echo "  ${DIM}      Install Homebrew (https://brew.sh) and re-run install.sh to enable MLX.${RESET}"
+      echo "  ${DIM}────────────────────────────────────────────────${RESET}"
+      echo "  ${RED}✗${RESET} oMLX install failed — MLX models will use the GGUF path via llama-server"
+      echo "     ${DIM}Retry: brew install jundot/omlx/omlx${RESET}"
     fi
   else
-    echo "  ${GREEN}✓${RESET} oMLX already installed ${DIM}($(command -v omlx))${RESET}"
+    echo "  ${DIM}Note: Homebrew not found — MLX models will use the GGUF path via llama-server.${RESET}"
+    echo "  ${DIM}      Install Homebrew (https://brew.sh) and re-run install.sh to enable MLX.${RESET}"
   fi
 fi
 
