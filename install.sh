@@ -145,6 +145,54 @@ if [ ! -f "${TMPDIR}/compute" ]; then
   exit 1
 fi
 
+# Stop any running daemon and sidecars BEFORE swapping binaries on disk.
+# Replacing the file alone is not enough: the kernel keeps the old inode
+# alive for any process that already opened it, so the running gateway
+# would keep serving the previous version's spec config (low max_k,
+# missing instrumentation) until killed. The Compute TUI's "restart"
+# button used to leak the gateway sidecar past daemon exit; install.sh
+# now does the cleanup inline so a fresh `compute` run always picks up
+# the binary it just unpacked.
+PID_FILE="$HOME/.compute/compute.pid"
+DAEMON_PID=""
+if [ -f "$PID_FILE" ]; then
+  DAEMON_PID=$(tr -d '[:space:]' < "$PID_FILE" 2>/dev/null || true)
+fi
+
+(
+  # SIGTERM the daemon first so its drop handlers run (graceful sidecar
+  # cleanup, model unload).
+  if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    kill -TERM "$DAEMON_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      kill -0 "$DAEMON_PID" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -KILL "$DAEMON_PID" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE" 2>/dev/null || true
+
+  # Belt-and-suspenders: kill any orphaned sidecars by name. Match the
+  # exact basename so we don't accidentally hit unrelated processes.
+  for proc in llama_stage_gateway_tcp_node llama_stage_tcp_node; do
+    if command -v pkill >/dev/null 2>&1; then
+      pkill -TERM -x "$proc" 2>/dev/null || true
+    else
+      # macOS pkill is always present, but fall back to ps + kill for portability
+      ps -A -o pid=,comm= 2>/dev/null | awk -v want="$proc" '$2 ~ want { print $1 }' | xargs -I {} kill -TERM {} 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  for proc in llama_stage_gateway_tcp_node llama_stage_tcp_node; do
+    if command -v pkill >/dev/null 2>&1; then
+      pkill -KILL -x "$proc" 2>/dev/null || true
+    else
+      ps -A -o pid=,comm= 2>/dev/null | awk -v want="$proc" '$2 ~ want { print $1 }' | xargs -I {} kill -KILL {} 2>/dev/null || true
+    fi
+  done
+) &
+spin "Stopping running daemon and sidecars" $!
+
 chmod +x "${TMPDIR}/compute"
 mv "${TMPDIR}/compute" "${INSTALL_DIR}/${BINARY_NAME}"
 echo "  ${GREEN}✓${RESET} Installed ${DIM}${BINARY_NAME}${RESET} to ${DIM}${INSTALL_DIR}${RESET}"
@@ -192,6 +240,18 @@ if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
     echo "$EXPORT_LINE" >> "$RC_FILE"
     echo "  ${GREEN}✓${RESET} Added to PATH ${DIM}(${RC_FILE})${RESET}"
   fi
+fi
+
+# Verify the binary we just unpacked is actually executable and matches
+# the release we intended to install. Confirms install.sh wrote real
+# files (no silent permission errors) and surfaces the version so the
+# user can see at a glance whether they're on the latest tag.
+INSTALLED_VERSION=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null || true)
+if [ -n "$INSTALLED_VERSION" ]; then
+  echo "  ${GREEN}✓${RESET} Verified ${DIM}${INSTALLED_VERSION}${RESET}"
+else
+  echo "  ${RED}✗${RESET} Could not run installed binary (--version failed)"
+  echo "  ${DIM}Path: ${INSTALL_DIR}/${BINARY_NAME}${RESET}"
 fi
 
 echo ""
