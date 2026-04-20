@@ -665,7 +665,12 @@ impl DaemonRuntime {
         }
 
         if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway) {
-            inference_mgr.shutdown_server();
+            // v0.4.1 keep-warm: don't kill llama-server, just park it. When
+            // the orchestrator flips a node back to solo, set_externally_managed(false)
+            // + check_assignment() resumes the already-loaded model instantly
+            // instead of eating a ~5s model reload. Memory cost: llama-server
+            // holds its model (~3GB for Gemma-4-E4B-Q4) while the gateway also
+            // runs. On Macs w/ <16GB this doubles up; prod Macs are 16GB+.
             inference_mgr.set_externally_managed(true);
             if let Err(err) = attempt_gateway_client_once(
                 &self.config,
@@ -749,7 +754,8 @@ impl DaemonRuntime {
                             handle.stop().await;
                         }
                         *stage_runtime_client.lock().await = None;
-                        inference_mgr.shutdown_server();
+                        // v0.4.1 keep-warm: park llama-server instead of killing it. See
+                        // the startup branch above for the tradeoff.
                         inference_mgr.set_externally_managed(true);
 
                         let mode = assignment.assignment_mode.as_deref().unwrap_or("solo");
@@ -1065,7 +1071,8 @@ impl DaemonRuntime {
                                 continue;
                             }
 
-                            inference_mgr.shutdown_server();
+                            // v0.4.1 keep-warm: park llama-server on stage-runtime takeover
+                            // so flip-back to solo reuses the already-loaded model.
                             inference_mgr.set_externally_managed(true);
 
                             let Some(shard_id) = assignment.shard_id.clone() else {
@@ -1501,7 +1508,8 @@ impl DaemonRuntime {
                         handle.stop().await;
                     }
                     *stage_runtime_client.lock().await = None;
-                    inference_mgr.shutdown_server();
+                    // v0.4.1 keep-warm: fallback-poll path also parks llama-server on
+                    // gateway takeover instead of killing it.
                     inference_mgr.set_externally_managed(true);
 
                     let supported = if has_pipeline {

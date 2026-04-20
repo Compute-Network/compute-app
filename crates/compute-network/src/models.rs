@@ -44,6 +44,32 @@ pub struct ModelDefinition {
     /// Only set for direct-download models (drafts, single-file targets).
     #[serde(default)]
     pub gguf_filename: Option<String>,
+    /// MLX-format variant for Apple Silicon nodes. When set and the node
+    /// reports a Metal GPU backend, the daemon prefers this over the GGUF
+    /// path — MLX inference on M-series silicon is materially faster than
+    /// llama.cpp GGUF for the same model size. Non-Mac nodes ignore this
+    /// field and fall back to the GGUF path.
+    #[serde(default)]
+    pub mlx: Option<MlxVariant>,
+}
+
+/// MLX (Apple's ML framework) variant of a model. Served by the oMLX
+/// backend on Macs; non-Mac nodes ignore this and use the GGUF path.
+///
+/// The canonical mlx-community layout is a HuggingFace repo containing
+/// `config.json`, `tokenizer.json`, and one or more `.safetensors` shards.
+/// We snapshot the whole folder into `<models.cache_dir>/mlx/<folder>/`
+/// and pass the folder path to oMLX's `--model-dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MlxVariant {
+    /// HuggingFace repo id — e.g. `mlx-community/Qwen3.6-35B-A3B-4bit`.
+    pub repo_id: String,
+    /// Local folder name (under `<models.cache_dir>/mlx/`) to snapshot into.
+    /// Usually just the last segment of `repo_id`.
+    pub folder: String,
+    /// Approximate total size in MB (for disk-space pre-checks).
+    #[serde(default)]
+    pub total_size_mb: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +141,7 @@ impl ModelCatalog {
                     draft_model_id: None,
                     gguf_download_url: None,
                     gguf_filename: None,
+                    mlx: None,
                 },
                 ModelDefinition {
                     id: "gemma-4-e4b-q4".into(),
@@ -130,6 +157,7 @@ impl ModelCatalog {
                     draft_model_id: Some("gemma-3-270m-q4-draft".into()),
                     gguf_download_url: None,
                     gguf_filename: None,
+                    mlx: None,
                 },
                 ModelDefinition {
                     id: "gemma-3-270m-q4-draft".into(),
@@ -148,6 +176,7 @@ impl ModelCatalog {
                             .into(),
                     ),
                     gguf_filename: Some("gemma-3-270m-it-Q4_K_M.gguf".into()),
+                    mlx: None,
                 },
                 ModelDefinition {
                     id: "qwen3.5-27b-q4".into(),
@@ -163,6 +192,35 @@ impl ModelCatalog {
                     draft_model_id: None,
                     gguf_download_url: None,
                     gguf_filename: None,
+                    mlx: None,
+                },
+                // Qwen 3.6 (Preview) 35B-A3B MoE. Single-node only — A3B's
+                // active-3B routing doesn't shard cleanly across the split
+                // pipeline yet. On Apple Silicon the MLX variant wins by a
+                // large margin vs GGUF; on Linux/Windows the daemon falls
+                // back to the unsloth UD-Q4_K_M GGUF via llama.cpp.
+                ModelDefinition {
+                    id: "qwen-3.6".into(),
+                    name: "Qwen 3.6 35B-A3B (Q4)".into(),
+                    family: ModelFamily::Qwen,
+                    total_layers: 48,
+                    vram_per_layer_mb: 460,
+                    total_size_mb: 22_100,
+                    quantization: Quantization::Q4,
+                    min_total_vram_mb: 24_000,
+                    recommended_stages: 1,
+                    source: "unsloth/Qwen3.6-35B-A3B-GGUF".into(),
+                    draft_model_id: None,
+                    gguf_download_url: Some(
+                        "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+                            .into(),
+                    ),
+                    gguf_filename: Some("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf".into()),
+                    mlx: Some(MlxVariant {
+                        repo_id: "mlx-community/Qwen3.6-35B-A3B-4bit".into(),
+                        folder: "Qwen3.6-35B-A3B-4bit".into(),
+                        total_size_mb: 20_400,
+                    }),
                 },
                 ModelDefinition {
                     id: "llama-3.1-8b-q4".into(),
@@ -178,6 +236,7 @@ impl ModelCatalog {
                     draft_model_id: None,
                     gguf_download_url: None,
                     gguf_filename: None,
+                    mlx: None,
                 },
                 ModelDefinition {
                     id: "llama-3.1-70b-q4".into(),
@@ -193,6 +252,7 @@ impl ModelCatalog {
                     draft_model_id: None,
                     gguf_download_url: None,
                     gguf_filename: None,
+                    mlx: None,
                 },
                 ModelDefinition {
                     id: "llama-3.1-70b-fp16".into(),
@@ -208,6 +268,7 @@ impl ModelCatalog {
                     draft_model_id: None,
                     gguf_download_url: None,
                     gguf_filename: None,
+                    mlx: None,
                 },
                 ModelDefinition {
                     id: "deepseek-r1-q4".into(),
@@ -223,6 +284,7 @@ impl ModelCatalog {
                     draft_model_id: None,
                     gguf_download_url: None,
                     gguf_filename: None,
+                    mlx: None,
                 },
                 ModelDefinition {
                     id: "qwen-2.5-72b-q4".into(),
@@ -238,6 +300,7 @@ impl ModelCatalog {
                     draft_model_id: None,
                     gguf_download_url: None,
                     gguf_filename: None,
+                    mlx: None,
                 },
                 ModelDefinition {
                     id: "mistral-7b-q4".into(),
@@ -253,6 +316,7 @@ impl ModelCatalog {
                     draft_model_id: None,
                     gguf_download_url: None,
                     gguf_filename: None,
+                    mlx: None,
                 },
             ],
         }
@@ -345,6 +409,55 @@ impl ModelDefinition {
             .collect();
 
         Some(ModelShardManifest { model_id: self.id.clone(), revision: "lan-v1".into(), shards })
+    }
+
+    /// Does this model have an MLX variant the caller could use?
+    pub fn has_mlx(&self) -> bool {
+        self.mlx.is_some()
+    }
+
+    /// Does this model have a direct-download GGUF variant?
+    pub fn has_gguf_direct(&self) -> bool {
+        self.gguf_download_url.is_some() && self.gguf_filename.is_some()
+    }
+
+    /// Decide which backend format the current node should use for this
+    /// model. Mac ARM64 nodes prefer MLX when available (materially faster
+    /// than GGUF via oMLX/mlx-lm); everything else takes GGUF. When neither
+    /// is directly downloadable, returns `None` and the caller should
+    /// route through the shard manifest / stage-gateway path.
+    pub fn preferred_format_here(&self) -> Option<BackendFormat> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let prefer_mlx = self.has_mlx();
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let prefer_mlx = false;
+
+        if prefer_mlx {
+            Some(BackendFormat::Mlx)
+        } else if self.has_gguf_direct() {
+            Some(BackendFormat::Gguf)
+        } else {
+            None
+        }
+    }
+}
+
+/// Which backend format a caller should use for a model on the current
+/// node. Returned by `ModelDefinition::preferred_format_here()`; routed
+/// by the daemon to either the oMLX sidecar (Mac) or llama-server (GGUF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendFormat {
+    Mlx,
+    Gguf,
+}
+
+impl std::fmt::Display for BackendFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendFormat::Mlx => write!(f, "mlx"),
+            BackendFormat::Gguf => write!(f, "gguf"),
+        }
     }
 }
 
