@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -71,11 +72,57 @@ pub fn mlx_model_path(models_cache_dir: &Path, folder: &str) -> PathBuf {
 }
 
 /// Is an MLX model folder already snapshotted and usable by oMLX?
-/// Check for `config.json` as a proxy — every mlx-community snapshot
-/// has it, and its presence means `hf download` finished at least one
-/// complete pass (HF CLI writes files atomically to `.tmp/` then renames).
+/// A usable snapshot needs `config.json` plus actual weights, not just the
+/// metadata files Hugging Face writes first. For indexed checkpoints we read
+/// `model.safetensors.index.json` and require every referenced shard to exist.
 pub fn mlx_model_cached(models_cache_dir: &Path, folder: &str) -> bool {
-    mlx_model_path(models_cache_dir, folder).join("config.json").exists()
+    mlx_snapshot_complete(&mlx_model_path(models_cache_dir, folder))
+}
+
+pub fn mlx_snapshot_complete(path: &Path) -> bool {
+    if !path.join("config.json").exists() {
+        return false;
+    }
+
+    let index_path = path.join("model.safetensors.index.json");
+    if index_path.exists() {
+        let Ok(index_bytes) = std::fs::read(&index_path) else {
+            return false;
+        };
+        let Ok(index_json) = serde_json::from_slice::<serde_json::Value>(&index_bytes) else {
+            return false;
+        };
+        let Some(weight_map) = index_json.get("weight_map").and_then(|value| value.as_object())
+        else {
+            return false;
+        };
+
+        let shards: BTreeSet<String> =
+            weight_map.values().filter_map(|value| value.as_str()).map(ToOwned::to_owned).collect();
+        if shards.is_empty() {
+            return false;
+        }
+        return shards.iter().all(|name| mlx_weight_file_ready(&path.join(name)));
+    }
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    let mut saw_weights = false;
+    for entry in entries.flatten() {
+        let weight_path = entry.path();
+        if weight_path.extension().and_then(|ext| ext.to_str()) == Some("safetensors") {
+            saw_weights = true;
+            if !mlx_weight_file_ready(&weight_path) {
+                return false;
+            }
+        }
+    }
+    saw_weights
+}
+
+fn mlx_weight_file_ready(path: &Path) -> bool {
+    std::fs::metadata(path).map(|meta| meta.is_file() && meta.len() > 1024 * 1024).unwrap_or(false)
 }
 
 /// Download a HuggingFace MLX snapshot via the `hf` CLI (bundled with the
@@ -94,11 +141,7 @@ pub async fn ensure_mlx_snapshot(
 ) -> Result<PathBuf> {
     let dest = mlx_model_path(models_cache_dir, folder);
     if mlx_model_cached(models_cache_dir, folder) {
-        info!(
-            "MLX snapshot {} already cached at {}",
-            repo_id,
-            dest.display()
-        );
+        info!("MLX snapshot {} already cached at {}", repo_id, dest.display());
         return Ok(dest);
     }
 
@@ -113,11 +156,7 @@ pub async fn ensure_mlx_snapshot(
             "huggingface CLI (`hf` or `huggingface-cli`) not found — install via `pip install huggingface-hub` or rely on the oMLX brew formula which pulls it in"
         ))?;
 
-    info!(
-        "Downloading MLX snapshot {} -> {}",
-        repo_id,
-        dest.display()
-    );
+    info!("Downloading MLX snapshot {} -> {}", repo_id, dest.display());
     let output = tokio::process::Command::new(&hf_bin)
         .arg("download")
         .arg(repo_id)

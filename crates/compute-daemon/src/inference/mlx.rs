@@ -2,7 +2,7 @@
 //!
 //! Wraps [`omlx serve`](https://github.com/jundot/omlx) as a child process
 //! so the daemon can route chat completions for MLX-format models (e.g.
-//! `mlx-community/Qwen3.6-35B-A3B-4bit`) through Apple's MLX framework on
+//! `unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit`) through Apple's MLX framework on
 //! Apple Silicon. Parallel to `InferenceManager` which owns llama-server;
 //! both can run simultaneously per the v0.4.1 keep-warm pattern.
 //!
@@ -176,8 +176,7 @@ impl OmlxManager {
             })?;
 
         self.child = Some(child);
-        self.status =
-            OmlxStatus::Running { port: self.port, model_dir: self.model_dir.clone() };
+        self.status = OmlxStatus::Running { port: self.port, model_dir: self.model_dir.clone() };
         Ok(())
     }
 
@@ -229,10 +228,7 @@ impl OmlxManager {
     /// bootstrap).
     pub async fn wait_until_ready(&self, timeout: Duration) -> bool {
         let url = format!("http://127.0.0.1:{}/v1/models", self.port);
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_millis(500))
-            .build()
-        {
+        let client = match reqwest::Client::builder().timeout(Duration::from_millis(500)).build() {
             Ok(c) => c,
             Err(_) => return false,
         };

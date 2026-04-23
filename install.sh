@@ -296,7 +296,7 @@ fi
 
 # v0.4.3: on Apple Silicon, install oMLX (https://github.com/jundot/omlx)
 # — a Python + FastAPI MLX inference server compute-daemon uses to route
-# MLX-format models (e.g. `qwen-3.6` → `mlx-community/Qwen3.6-35B-A3B-4bit`)
+# MLX-format models (e.g. `qwen-3.6` → `unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit`)
 # through Apple's MLX framework instead of llama-server's GGUF path.
 #
 # This is synchronous and visible: brew has its own download / install

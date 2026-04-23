@@ -101,6 +101,111 @@ fn spawn_ready_probe(
     });
 }
 
+fn local_mlx_variant_for_model(
+    _config: &Config,
+    model_name: &str,
+) -> Option<compute_network::models::MlxVariant> {
+    let catalog = compute_network::models::ModelCatalog::default_catalog();
+    let model = catalog.find(model_name)?;
+    if model.preferred_format_here() != Some(compute_network::models::BackendFormat::Mlx) {
+        return None;
+    }
+    model.mlx.clone()
+}
+
+fn spawn_omlx_ready_probe(
+    mlx_port: Arc<AtomicU16>,
+    model_name: String,
+    ws_tx: tokio::sync::mpsc::Sender<String>,
+) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        for attempt in 0..120u32 {
+            let port = mlx_port.load(Ordering::Relaxed);
+            if port != 0 {
+                match client
+                    .get(format!("http://127.0.0.1:{port}/v1/models"))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => {
+                        info!("[health] oMLX ready after {:.1}s", attempt as f64 * 0.5);
+                        let msg = serde_json::json!({
+                            "type": "node_ready",
+                            "model_name": model_name,
+                        })
+                        .to_string();
+                        let _ = ws_tx.send(msg).await;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        tracing::error!("[health] oMLX did not become ready after 60s");
+    });
+}
+
+async fn handle_single_node_mlx_assignment(
+    config: &Config,
+    inference_mgr: &mut InferenceManager,
+    stage_runtime: &mut Option<StagePrototypeHandle>,
+    stage_runtime_client: &Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
+    model_name: &str,
+    ws_outbound_tx: &tokio::sync::mpsc::Sender<String>,
+    mlx_port: &Arc<AtomicU16>,
+) -> bool {
+    let Some(mlx) = local_mlx_variant_for_model(config, model_name) else {
+        return false;
+    };
+
+    if let Some(handle) = stage_runtime.take() {
+        handle.stop().await;
+    }
+    *stage_runtime_client.lock().await = None;
+    inference_mgr.shutdown_server();
+    inference_mgr.set_externally_managed(true);
+
+    if !crate::inference::stage_artifacts::mlx_model_cached(
+        std::path::Path::new(&config.models.cache_dir),
+        &mlx.folder,
+    ) {
+        let msg = serde_json::json!({
+            "type": "node_error",
+            "model_name": model_name,
+            "error": format!("MLX model not downloaded: {}", mlx.repo_id),
+        })
+        .to_string();
+        let _ = ws_outbound_tx.send(msg).await;
+        return true;
+    }
+
+    info!(
+        "[omlx] Handling single-node assignment for {} via cached MLX snapshot {}",
+        model_name, mlx.folder
+    );
+    spawn_omlx_ready_probe(mlx_port.clone(), model_name.to_string(), ws_outbound_tx.clone());
+    true
+}
+
+fn mlx_status_label(config: &Config, model_name: &str, mlx_port: &Arc<AtomicU16>) -> String {
+    let Some(mlx) = local_mlx_variant_for_model(config, model_name) else {
+        return "idle".into();
+    };
+    if !crate::inference::stage_artifacts::mlx_model_cached(
+        std::path::Path::new(&config.models.cache_dir),
+        &mlx.folder,
+    ) {
+        "omlx (model missing)".into()
+    } else if mlx_port.load(Ordering::Relaxed) != 0 {
+        "omlx".into()
+    } else {
+        "omlx (starting)".into()
+    }
+}
+
 async fn send_gateway_ready_or_error(
     gateway_result: anyhow::Result<LlamaStageGatewayRelayClient>,
     expected_model: &str,
@@ -238,11 +343,8 @@ async fn ensure_draft_model_path(config: &Config) -> Option<PathBuf> {
 
     let catalog = compute_network::models::ModelCatalog::default_catalog();
     let active_id = config.models.active_model.trim();
-    let target_id = if active_id.is_empty() || active_id == "auto" {
-        "gemma-4-e4b-q4"
-    } else {
-        active_id
-    };
+    let target_id =
+        if active_id.is_empty() || active_id == "auto" { "gemma-4-e4b-q4" } else { active_id };
 
     let target = catalog.find(target_id)?;
     let draft_id = target.draft_model_id.as_deref()?;
@@ -250,11 +352,7 @@ async fn ensure_draft_model_path(config: &Config) -> Option<PathBuf> {
     let filename = draft.gguf_filename.as_deref()?;
     let cached = PathBuf::from(&config.models.cache_dir).join(filename);
     if cached.exists() {
-        info!(
-            "[gateway] auto-paired draft model: {} -> {}",
-            draft_id,
-            cached.display()
-        );
+        info!("[gateway] auto-paired draft model: {} -> {}", draft_id, cached.display());
         return Some(cached);
     }
 
@@ -270,10 +368,7 @@ async fn ensure_draft_model_path(config: &Config) -> Option<PathBuf> {
 
     if let Some(parent) = cached.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            warn!(
-                "[gateway] draft auto-download: failed to create {}: {e}",
-                parent.display()
-            );
+            warn!("[gateway] draft auto-download: failed to create {}: {e}", parent.display());
             return None;
         }
     }
@@ -286,10 +381,7 @@ async fn ensure_draft_model_path(config: &Config) -> Option<PathBuf> {
     );
     match crate::inference::stage_artifacts::download_file(url, &cached).await {
         Ok(()) => {
-            info!(
-                "[gateway] draft model auto-download complete: {}",
-                cached.display()
-            );
+            info!("[gateway] draft model auto-download complete: {}", cached.display());
             Some(cached)
         }
         Err(e) => {
@@ -610,8 +702,10 @@ impl DaemonRuntime {
                     | StageBackendKind::RealForward
             );
 
-        // Pre-warm: start llama-server during splash so the model is ready for the first request.
-        // Skip entirely for prototype stage mode, which does not use local llama-server.
+        // Pre-warm: start llama-server during splash so the model is ready for
+        // the first request. Skip entirely for prototype stage mode, which
+        // does not use local llama-server, and for MLX-backed single-node
+        // models on Apple Silicon (`qwen-3.6`), which route through oMLX.
         if !prototype_stage_mode {
             let active = &self.config.models.active_model;
             let model_name = if active == "auto" {
@@ -630,8 +724,12 @@ impl DaemonRuntime {
                 active.clone()
             };
             if !model_name.is_empty() {
-                info!("Pre-warming llama-server with model: {model_name}");
-                inference_mgr.check_assignment(Some("pre-warm"), Some(&model_name));
+                if local_mlx_variant_for_model(&self.config, &model_name).is_some() {
+                    info!("Skipping llama-server pre-warm for MLX-backed model: {model_name}");
+                } else {
+                    info!("Pre-warming llama-server with model: {model_name}");
+                    inference_mgr.check_assignment(Some("pre-warm"), Some(&model_name));
+                }
             }
         } else {
             info!("[stage] Prototype backend enabled — skipping local llama-server pre-warm");
@@ -699,7 +797,7 @@ impl DaemonRuntime {
         }
 
         // v0.4.2: start the oMLX sidecar on Apple Silicon so MLX-format
-        // models (e.g. `qwen-3.6` → `mlx-community/Qwen3.6-35B-A3B-4bit`)
+        // models (e.g. `qwen-3.6` → `unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit`)
         // can be served through Apple's MLX framework. Non-Mac hosts and
         // Macs without the `omlx` binary (install.sh on v0.4.2+ runs the
         // brew tap) skip this entirely and fall back to llama-server.
@@ -712,7 +810,7 @@ impl DaemonRuntime {
         // fails over to the existing ladder.
         let mlx_port = Arc::new(AtomicU16::new(0));
         let mlx_model_dir = PathBuf::from(&self.config.models.cache_dir).join("mlx");
-        let mut omlx_manager: Option<OmlxManager> = None;
+        let mut _omlx_manager: Option<OmlxManager> = None;
         if OmlxManager::platform_supported() {
             let mut mgr = OmlxManager::new(mlx_model_dir.clone());
             if mgr.is_installed() {
@@ -734,8 +832,7 @@ impl DaemonRuntime {
                                 Ok(c) => c,
                                 Err(_) => return,
                             };
-                            let deadline =
-                                tokio::time::Instant::now() + Duration::from_secs(120);
+                            let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
                             while tokio::time::Instant::now() < deadline {
                                 if let Ok(resp) = client.get(&url).send().await {
                                     if resp.status().is_success() {
@@ -750,7 +847,7 @@ impl DaemonRuntime {
                                 "[omlx] sidecar failed readiness probe on port {port} — MLX routing disabled"
                             );
                         });
-                        omlx_manager = Some(mgr);
+                        _omlx_manager = Some(mgr);
                     }
                     Err(err) => {
                         warn!("[omlx] sidecar failed to start: {err}");
@@ -810,7 +907,13 @@ impl DaemonRuntime {
                         assignment.stage, assignment.total_stages,
                         assignment.shard_id.as_ref().map(|s| format!(" shard={s}")).unwrap_or_default());
 
+                    let prefers_local_mlx = assignment.total_stages == 1
+                        && assignment.assignment_mode.as_deref().unwrap_or("solo") == "solo"
+                        && local_mlx_variant_for_model(&self.config, &assignment.model_name)
+                            .is_some();
+
                     if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway)
+                        && !prefers_local_mlx
                         && gateway_assignment_supported(
                             assignment.stage,
                             assignment.total_stages,
@@ -1267,6 +1370,50 @@ impl DaemonRuntime {
                         }
                     }
 
+                    if assignment_mode == "solo"
+                        && handle_single_node_mlx_assignment(
+                            &self.config,
+                            &mut inference_mgr,
+                            &mut stage_runtime,
+                            &stage_runtime_client,
+                            &assignment.model_name,
+                            &ws_outbound_tx,
+                            &mlx_port,
+                        )
+                        .await
+                    {
+                        self.update_state(|state| {
+                            state.pipeline.active = true;
+                            state.pipeline.stage = Some(assignment.stage as u32);
+                            state.pipeline.total_stages =
+                                Some(assignment.total_stages as u32);
+                            state.pipeline.model = Some(assignment.model_name.clone());
+                            state.inference_status =
+                                mlx_status_label(&self.config, &assignment.model_name, &mlx_port);
+                        });
+                        continue;
+                    }
+
+                    if assignment_mode == "solo"
+                        && local_mlx_variant_for_model(&self.config, &assignment.model_name)
+                            .as_ref()
+                            .is_some_and(|mlx| {
+                                crate::inference::stage_artifacts::mlx_model_cached(
+                                    std::path::Path::new(&self.config.models.cache_dir),
+                                    &mlx.folder,
+                                )
+                            })
+                    {
+                        // Keep the ready signal flowing for MLX-backed solo models even if the
+                        // dedicated MLX assignment handler falls through. Relay request routing
+                        // still prefers oMLX whenever the sidecar is up and the snapshot is cached.
+                        spawn_omlx_ready_probe(
+                            mlx_port.clone(),
+                            assignment.model_name.clone(),
+                            ws_outbound_tx.clone(),
+                        );
+                    }
+
                     inference_mgr.check_assignment(
                         Some(&assignment.pipeline_id),
                         Some(&assignment.model_name),
@@ -1297,6 +1444,7 @@ impl DaemonRuntime {
                             &stage_runtime_client,
                             &gateway_client,
                             &mut managed_gateway_stack,
+                            &mlx_port,
                             stage_backend_kind,
                             &ws_outbound_tx,
                             &mut baseline_tps,
@@ -1340,12 +1488,23 @@ impl DaemonRuntime {
 
                     let metrics = hardware::collect_live_metrics(&mut sys);
                     let uptime = start_time.elapsed().as_secs();
+                    let pipeline_model = self.state_rx.borrow().pipeline.model.clone();
                     let inf_status = if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway) {
                         if gateway_client.lock().await.is_some() {
                             "llama-stage-gateway".to_string()
                         } else {
                             "llama-stage-gateway (disconnected)".to_string()
                         }
+                    } else if pipeline_model
+                        .as_deref()
+                        .and_then(|model| local_mlx_variant_for_model(&self.config, model))
+                        .is_some()
+                    {
+                        mlx_status_label(
+                            &self.config,
+                            pipeline_model.as_deref().unwrap_or_default(),
+                            &mlx_port,
+                        )
                     } else {
                         stage_runtime
                             .as_ref()
@@ -1480,6 +1639,7 @@ impl DaemonRuntime {
         stage_runtime_client: &Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
         gateway_client: &Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
         managed_gateway_stack: &mut Option<ManagedGatewayStack>,
+        mlx_port: &Arc<AtomicU16>,
         stage_backend_kind: StageBackendKind,
         ws_outbound_tx: &tokio::sync::mpsc::Sender<String>,
         baseline_tps: &mut f64,
@@ -1681,6 +1841,36 @@ impl DaemonRuntime {
                         inference_mgr.set_externally_managed(false);
                     }
 
+                    if let (Some(_pipeline_id), Some(model_name)) =
+                        (node.pipeline_id.as_deref(), node.model_name.as_deref())
+                    {
+                        let pipeline_changed =
+                            previous_pipeline_id.as_deref() != node.pipeline_id.as_deref();
+                        let model_changed =
+                            previous_model_name.as_deref() != node.model_name.as_deref();
+                        if handle_single_node_mlx_assignment(
+                            &self.config,
+                            inference_mgr,
+                            stage_runtime,
+                            stage_runtime_client,
+                            model_name,
+                            ws_outbound_tx,
+                            &mlx_port,
+                        )
+                        .await
+                        {
+                            if pipeline_changed || model_changed {
+                                self.update_state(|state| {
+                                    state.inference_status =
+                                        mlx_status_label(&self.config, model_name, &mlx_port);
+                                });
+                            }
+                            return;
+                        }
+                    } else {
+                        inference_mgr.set_externally_managed(false);
+                    }
+
                     inference_mgr
                         .check_assignment(node.pipeline_id.as_deref(), node.model_name.as_deref());
                 }
@@ -1695,6 +1885,25 @@ impl DaemonRuntime {
                     // Poll-based assignment detection runs before the WS push path on startup/reconnect.
                     // Emit the same ready probe here so the orchestrator doesn't wait 120s for a
                     // node_ready message that only the push path would have produced.
+                    if let Some(model_name) = node.model_name.as_deref() {
+                        if local_mlx_variant_for_model(&self.config, model_name)
+                            .as_ref()
+                            .is_some_and(|mlx| {
+                                crate::inference::stage_artifacts::mlx_model_cached(
+                                    std::path::Path::new(&self.config.models.cache_dir),
+                                    &mlx.folder,
+                                )
+                            })
+                        {
+                            spawn_omlx_ready_probe(
+                                mlx_port.clone(),
+                                model_name.to_string(),
+                                ws_outbound_tx.clone(),
+                            );
+                            return;
+                        }
+                    }
+
                     let active_model = match inference_mgr.status() {
                         InferenceStatus::Running { model_name, .. } => Some(model_name.clone()),
                         InferenceStatus::RunningRpcWorker { model_name, .. } => {
@@ -1868,17 +2077,11 @@ fn advertised_host(config: &Config) -> Option<String> {
 /// run so they don't keep their bind ports held (otherwise the next spawn
 /// gets "Address already in use" on e.g. 9182).
 fn sweep_orphan_stage_children() {
-    const TARGETS: &[&str] = &[
-        "llama_stage_tcp_node",
-        "llama_stage_gateway_tcp_node",
-    ];
+    const TARGETS: &[&str] = &["llama_stage_tcp_node", "llama_stage_gateway_tcp_node"];
     #[cfg(unix)]
     {
         for target in TARGETS {
-            let _ = std::process::Command::new("pkill")
-                .arg("-f")
-                .arg(target)
-                .output();
+            let _ = std::process::Command::new("pkill").arg("-f").arg(target).output();
         }
     }
     let _ = TARGETS;
@@ -1982,12 +2185,12 @@ fn detect_downloaded_models() -> String {
             if !path.is_dir() {
                 continue;
             }
-            if !path.join("config.json").exists() {
+            let folder = entry.file_name().to_string_lossy().to_string();
+            if !crate::inference::stage_artifacts::mlx_model_cached(&cache_dir, &folder) {
                 continue;
             }
-            let folder = entry.file_name().to_string_lossy().to_string();
             let id = match folder.as_str() {
-                "Qwen3.6-35B-A3B-4bit" => Some("qwen-3.6"),
+                "Qwen3.6-35B-A3B-UD-MLX-4bit" => Some("qwen-3.6"),
                 _ => None,
             };
             if let Some(id) = id {

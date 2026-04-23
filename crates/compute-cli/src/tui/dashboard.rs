@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -32,6 +34,9 @@ struct ModelEntry {
     desc: &'static str,
     gguf_filename: &'static str,
     hf_url: &'static str,
+    mlx_repo_id: Option<&'static str>,
+    mlx_folder: Option<&'static str>,
+    mlx_total_size_mb: Option<u64>,
 }
 
 fn model_entries() -> Vec<ModelEntry> {
@@ -42,6 +47,9 @@ fn model_entries() -> Vec<ModelEntry> {
             desc: "Orchestrator selects the best model",
             gguf_filename: "",
             hf_url: "",
+            mlx_repo_id: None,
+            mlx_folder: None,
+            mlx_total_size_mb: None,
         },
         ModelEntry {
             id: "gemma-4-26b-a4b-q4",
@@ -49,6 +57,9 @@ fn model_entries() -> Vec<ModelEntry> {
             desc: "MoE · 26B total, 4B active",
             gguf_filename: "gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
             hf_url: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
+            mlx_repo_id: None,
+            mlx_folder: None,
+            mlx_total_size_mb: None,
         },
         ModelEntry {
             id: "gemma-4-e4b-q4",
@@ -56,6 +67,9 @@ fn model_entries() -> Vec<ModelEntry> {
             desc: "Fast · 4B params, multimodal",
             gguf_filename: "gemma-4-E4B-it-Q4_K_M.gguf",
             hf_url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
+            mlx_repo_id: None,
+            mlx_folder: None,
+            mlx_total_size_mb: None,
         },
         ModelEntry {
             id: "qwen3.5-27b-q4",
@@ -63,20 +77,26 @@ fn model_entries() -> Vec<ModelEntry> {
             desc: "SWE-bench 72.4% · 27B dense, 256K ctx",
             gguf_filename: "Qwen3.5-27B-UD-Q4_K_XL.gguf",
             hf_url: "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-UD-Q4_K_XL.gguf",
+            mlx_repo_id: None,
+            mlx_folder: None,
+            mlx_total_size_mb: None,
         },
         // v0.4.4: qwen-3.6 unified id — daemon picks the format per host.
         // The TUI picker needs a single user-facing entry; compute-network's
         // ModelDefinition carries both the GGUF (Linux/Windows) and MLX
-        // (Apple Silicon via oMLX) sources. The filename here is the GGUF
-        // for download-tracking purposes on non-Mac hosts; on Mac ARM the
-        // oMLX snapshot lives under <cache>/mlx/Qwen3.6-35B-A3B-4bit/ and
-        // is tracked separately.
+        // (Apple Silicon via oMLX) sources. Linux / Windows still download
+        // the single GGUF file; Apple Silicon snapshots the full MLX repo
+        // (`unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit`) into
+        // `<cache>/mlx/Qwen3.6-35B-A3B-UD-MLX-4bit/`.
         ModelEntry {
             id: "qwen-3.6",
             label: "Qwen3.6 — 22GB (MoE)",
             desc: "35B-A3B MoE · auto MLX on Mac / GGUF elsewhere",
             gguf_filename: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
             hf_url: "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            mlx_repo_id: Some("unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit"),
+            mlx_folder: Some("Qwen3.6-35B-A3B-UD-MLX-4bit"),
+            mlx_total_size_mb: Some(20_400),
         },
         ModelEntry {
             id: "gemma-4-e4b-q4-stage-head",
@@ -84,6 +104,9 @@ fn model_entries() -> Vec<ModelEntry> {
             desc: "Pipeline head · layers 0-20",
             gguf_filename: "head-0-20.gguf",
             hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-gguf-stages/resolve/main/gemma-4-e4b-q4-head-0-20.gguf",
+            mlx_repo_id: None,
+            mlx_folder: None,
+            mlx_total_size_mb: None,
         },
         ModelEntry {
             id: "gemma-4-e4b-q4-stage-tail",
@@ -91,6 +114,9 @@ fn model_entries() -> Vec<ModelEntry> {
             desc: "Pipeline tail · layers 21-41",
             gguf_filename: "tail-21-41.gguf",
             hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-gguf-stages/resolve/main/gemma-4-e4b-q4-tail-21-41.gguf",
+            mlx_repo_id: None,
+            mlx_folder: None,
+            mlx_total_size_mb: None,
         },
         ModelEntry {
             id: "gemma-3-270m-q4-draft",
@@ -98,6 +124,9 @@ fn model_entries() -> Vec<ModelEntry> {
             desc: "Speculative-decode helper for Gemma4 E4B",
             gguf_filename: "gemma-3-270m-it-Q4_K_M.gguf",
             hf_url: "https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q4_K_M.gguf",
+            mlx_repo_id: None,
+            mlx_folder: None,
+            mlx_total_size_mb: None,
         },
     ]
 }
@@ -116,6 +145,44 @@ fn stage_shard_path(filename: &str) -> std::path::PathBuf {
         .join("stages")
         .join("gemma-4-e4b-q4")
         .join(filename)
+}
+
+fn models_cache_dir() -> std::path::PathBuf {
+    let config = compute_daemon::config::Config::load().unwrap_or_default();
+    std::path::PathBuf::from(config.models.cache_dir)
+}
+
+fn is_apple_silicon() -> bool {
+    cfg!(all(target_os = "macos", target_arch = "aarch64"))
+}
+
+fn uses_mlx_snapshot(entry: &ModelEntry) -> bool {
+    is_apple_silicon() && entry.mlx_repo_id.is_some() && entry.mlx_folder.is_some()
+}
+
+fn mlx_snapshot_path(entry: &ModelEntry) -> Option<std::path::PathBuf> {
+    entry.mlx_folder.map(|folder| models_cache_dir().join("mlx").join(folder))
+}
+
+fn dir_size_bytes(root: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if let Ok(file_type) = entry.file_type() {
+                if file_type.is_dir() {
+                    stack.push(entry_path);
+                } else if file_type.is_file() {
+                    total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+                }
+            }
+        }
+    }
+    total
 }
 
 fn is_model_downloaded(model_id: &str) -> bool {
@@ -146,9 +213,18 @@ fn is_model_downloaded(model_id: &str) -> bool {
         }
         return false;
     }
-    let cache_dir = dirs::home_dir().unwrap_or_default().join(".compute").join("models");
     for entry in model_entries() {
+        if entry.id == model_id && uses_mlx_snapshot(&entry) {
+            let Some(folder) = entry.mlx_folder else {
+                return false;
+            };
+            return compute_daemon::inference::stage_artifacts::mlx_model_cached(
+                models_cache_dir().as_path(),
+                folder,
+            );
+        }
         if entry.id == model_id && !entry.gguf_filename.is_empty() {
+            let cache_dir = models_cache_dir();
             let path = cache_dir.join(entry.gguf_filename);
             if !path.exists() {
                 return false;
@@ -1354,8 +1430,87 @@ impl Dashboard {
         let filename = entry.gguf_filename.to_string();
         let model_id = entry.id.to_string();
         let is_stage = is_stage_entry(entry.id);
+        let mlx_repo_id = entry.mlx_repo_id.map(str::to_string);
+        let mlx_folder = entry.mlx_folder.map(str::to_string);
+        let mlx_total_size_mb = entry.mlx_total_size_mb;
+        let download_mlx = uses_mlx_snapshot(entry);
 
         std::thread::spawn(move || {
+            if download_mlx {
+                let Some(repo_id) = mlx_repo_id else {
+                    let _ = tx.send((model_id, -1.0));
+                    return;
+                };
+                let Some(folder) = mlx_folder else {
+                    let _ = tx.send((model_id, -1.0));
+                    return;
+                };
+                let cache_dir = models_cache_dir();
+                let dest = cache_dir.join("mlx").join(&folder);
+                let total_bytes =
+                    mlx_total_size_mb.unwrap_or(0).saturating_mul(1024).saturating_mul(1024);
+                let stop_progress = Arc::new(AtomicBool::new(false));
+                let progress_handle = if total_bytes > 0 {
+                    let stop = stop_progress.clone();
+                    let tx_progress = tx.clone();
+                    let model_id_progress = model_id.clone();
+                    let dest_progress = dest.clone();
+                    Some(std::thread::spawn(move || {
+                        let mut last_bucket = -1i32;
+                        while !stop.load(Ordering::Relaxed) {
+                            let bytes = dir_size_bytes(&dest_progress);
+                            if bytes > 0 {
+                                let pct = (bytes as f64 / total_bytes as f64).clamp(0.01, 0.99);
+                                let bucket = (pct * 100.0).floor() as i32;
+                                if bucket != last_bucket {
+                                    let _ = tx_progress.send((model_id_progress.clone(), pct));
+                                    last_bucket = bucket;
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(750));
+                        }
+                    }))
+                } else {
+                    None
+                };
+                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(rt) => rt,
+                    Err(_) => {
+                        stop_progress.store(true, Ordering::Relaxed);
+                        if let Some(handle) = progress_handle {
+                            let _ = handle.join();
+                        }
+                        let _ = tx.send((model_id, -1.0));
+                        return;
+                    }
+                };
+
+                let result =
+                    rt.block_on(compute_daemon::inference::stage_artifacts::ensure_mlx_snapshot(
+                        cache_dir.as_path(),
+                        &repo_id,
+                        &folder,
+                    ));
+                stop_progress.store(true, Ordering::Relaxed);
+                if let Some(handle) = progress_handle {
+                    let _ = handle.join();
+                }
+
+                match result {
+                    Ok(_) => {
+                        let _ = tx.send((model_id.clone(), 1.0));
+                        let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+                        config.models.active_model = model_id;
+                        let _ = config.save();
+                    }
+                    Err(err) => {
+                        tracing::warn!("[download] MLX snapshot failed: {err}");
+                        let _ = tx.send((model_id, -1.0));
+                    }
+                }
+                return;
+            }
+
             let (_cache_dir, dest, tmp) = if is_stage {
                 let dest = stage_shard_path(&filename);
                 let parent = dest.parent().unwrap_or(std::path::Path::new("")).to_path_buf();
@@ -1363,7 +1518,7 @@ impl Dashboard {
                 let tmp = dest.with_extension("tmp");
                 (parent, dest, tmp)
             } else {
-                let dir = dirs::home_dir().unwrap_or_default().join(".compute").join("models");
+                let dir = models_cache_dir();
                 let _ = std::fs::create_dir_all(&dir);
                 let dest = dir.join(&filename);
                 let tmp = dest.with_extension("tmp");
@@ -1572,14 +1727,22 @@ impl Dashboard {
             return;
         }
 
+        if uses_mlx_snapshot(entry) {
+            if let Some(path) = mlx_snapshot_path(entry) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            let mut config = compute_daemon::config::Config::load().unwrap_or_default();
+            if config.models.active_model == entry.id {
+                config.models.active_model = "auto".into();
+                let _ = config.save();
+            }
+            return;
+        }
+
         let path = if is_stage_entry(entry.id) {
             stage_shard_path(entry.gguf_filename)
         } else {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".compute")
-                .join("models")
-                .join(entry.gguf_filename)
+            models_cache_dir().join(entry.gguf_filename)
         };
 
         let tmp = path.with_extension("tmp");

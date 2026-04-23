@@ -684,10 +684,7 @@ async fn handle_streaming_request(
             );
             let mut body = request.body.clone();
             if let Some(obj) = body.as_object_mut() {
-                obj.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(mlx_folder.clone()),
-                );
+                obj.insert("model".to_string(), serde_json::Value::String(mlx_folder.clone()));
             }
             let url = format!("http://127.0.0.1:{mlx_port_value}/v1/chat/completions");
             return proxy_openai_stream(
@@ -1157,38 +1154,32 @@ async fn wait_for_stage_head_client(
 /// fall through to the regular (llama-server / gateway) ladder.
 ///
 /// Runs inside the async inference path, so keep it cheap: one catalog
-/// lookup + one filesystem stat. Everything lives in `~/.compute/models/`.
+/// lookup + one filesystem stat. Everything lives under the daemon's
+/// configured models cache dir.
 fn resolve_mlx_folder_for_request(body: &serde_json::Value) -> Option<String> {
     let requested = body.get("model").and_then(|v| v.as_str())?;
     let catalog = compute_network::models::ModelCatalog::default_catalog();
     let model = catalog.find(requested)?;
     let mlx = model.mlx.as_ref()?;
 
-    // Local cache dir. Mirrors the daemon's models.cache_dir default
-    // (`~/.compute/models`). We don't have access to `Config` here — the
-    // relay is a child task of the runtime loop — but since oMLX is
-    // started with `--model-dir <models.cache_dir>/mlx`, the folder name
-    // on the wire is always the same as `MlxVariant::folder`.
+    // Local cache dir. Load the daemon config directly so relay routing
+    // follows the same models cache dir the runtime uses for oMLX.
     let cache_root = dirs_like_models_cache_dir();
-    let cached = cache_root.join("mlx").join(&mlx.folder).join("config.json");
-    if !cached.exists() {
+    if !crate::inference::stage_artifacts::mlx_model_cached(&cache_root, &mlx.folder) {
         tracing::debug!(
             "[omlx] model `{requested}` has MLX variant {} but snapshot is not cached at {} — falling through",
             mlx.repo_id,
-            cached.parent().map(|p| p.display().to_string()).unwrap_or_default()
+            cache_root.join("mlx").join(&mlx.folder).display()
         );
         return None;
     }
     Some(mlx.folder.clone())
 }
 
-/// `~/.compute/models` — matches `default_models_cache_dir()` in config.rs
-/// without re-plumbing the full Config object into relay tasks.
+/// Resolve the daemon's configured models cache dir without re-plumbing the
+/// full Config object into relay tasks.
 fn dirs_like_models_cache_dir() -> std::path::PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        return std::path::PathBuf::from(home).join(".compute").join("models");
-    }
-    std::path::PathBuf::from("/tmp/.compute/models")
+    std::path::PathBuf::from(crate::config::Config::load().unwrap_or_default().models.cache_dir)
 }
 
 /// Forward a chat-completion request to the local oMLX sidecar. oMLX speaks
@@ -1204,10 +1195,7 @@ async fn handle_omlx_request(
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let mut body = request.body.clone();
     if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(mlx_folder.to_string()),
-        );
+        obj.insert("model".to_string(), serde_json::Value::String(mlx_folder.to_string()));
     }
 
     match client.post(&url).json(&body).timeout(Duration::from_secs(600)).send().await {

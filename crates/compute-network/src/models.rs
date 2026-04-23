@@ -56,13 +56,13 @@ pub struct ModelDefinition {
 /// MLX (Apple's ML framework) variant of a model. Served by the oMLX
 /// backend on Macs; non-Mac nodes ignore this and use the GGUF path.
 ///
-/// The canonical mlx-community layout is a HuggingFace repo containing
-/// `config.json`, `tokenizer.json`, and one or more `.safetensors` shards.
-/// We snapshot the whole folder into `<models.cache_dir>/mlx/<folder>/`
-/// and pass the folder path to oMLX's `--model-dir`.
+/// The canonical MLX layout is a HuggingFace repo containing `config.json`,
+/// `tokenizer.json`, and one or more `.safetensors` shards. We snapshot the
+/// whole folder into `<models.cache_dir>/mlx/<folder>/` and pass the folder
+/// path to oMLX's `--model-dir`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MlxVariant {
-    /// HuggingFace repo id — e.g. `mlx-community/Qwen3.6-35B-A3B-4bit`.
+    /// HuggingFace repo id — e.g. `unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit`.
     pub repo_id: String,
     /// Local folder name (under `<models.cache_dir>/mlx/`) to snapshot into.
     /// Usually just the last segment of `repo_id`.
@@ -217,8 +217,8 @@ impl ModelCatalog {
                     ),
                     gguf_filename: Some("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf".into()),
                     mlx: Some(MlxVariant {
-                        repo_id: "mlx-community/Qwen3.6-35B-A3B-4bit".into(),
-                        folder: "Qwen3.6-35B-A3B-4bit".into(),
+                        repo_id: "unsloth/Qwen3.6-35B-A3B-UD-MLX-4bit".into(),
+                        folder: "Qwen3.6-35B-A3B-UD-MLX-4bit".into(),
                         total_size_mb: 20_400,
                     }),
                 },
