@@ -19,6 +19,7 @@ use stage_forward_lab::{PayloadKind, StageForwardBackend, StageSample, StageTens
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageBackendKind {
+    Auto,
     Prototype,
     TailLlama,
     LlamaCpp,
@@ -29,6 +30,7 @@ pub enum StageBackendKind {
 impl StageBackendKind {
     pub fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "automatic" | "" => Self::Auto,
             "tail-llama" | "tailllama" | "tail_llama" | "hybrid" => Self::TailLlama,
             "llamacpp" | "llama.cpp" | "llama" => Self::LlamaCpp,
             "llama-stage-gateway" | "llama_stage_gateway" | "gateway" => Self::LlamaStageGateway,
@@ -40,12 +42,13 @@ impl StageBackendKind {
             // installs that typo the backend name. Defaulting to the gateway
             // matches `default_stage_backend()` in config.rs and means the
             // user never has to faff with this setting.
-            _ => Self::LlamaStageGateway,
+            _ => Self::Auto,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Prototype => "prototype",
             Self::TailLlama => "tail-llama",
             Self::LlamaCpp => "llamacpp",
@@ -76,6 +79,7 @@ impl StageExecutionBackend {
         stage_acceleration_provider: &str,
     ) -> Self {
         match kind {
+            StageBackendKind::Auto => Self::LlamaStage(LlamaStageEngine::default()),
             StageBackendKind::Prototype => Self::Prototype(PrototypeStageEngine::default()),
             StageBackendKind::TailLlama => Self::TailLlama(TailLlamaStageEngine::new(hw)),
             StageBackendKind::LlamaCpp => Self::LlamaCpp(LlamaCppEngine::new(detect_backend(hw))),

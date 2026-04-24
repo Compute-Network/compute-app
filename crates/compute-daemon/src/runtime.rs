@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::Duration;
+use std::process::{Child, Command, Stdio};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -15,7 +16,7 @@ use crate::inference::manager::{InferenceManager, InferenceStatus};
 use crate::inference::mlx::OmlxManager;
 use crate::inference::stage_backend::StageBackendKind;
 use crate::metrics::{Earnings, NetworkStats, PipelineStatus};
-use crate::relay::{AssignmentPush, RelayClient};
+use crate::relay::{AssignmentPush, DownloadPush, RelayClient};
 use crate::stage_runtime::{
     StagePrototypeClient, StagePrototypeHandle, StagePrototypeSpec, start_stage_prototype,
 };
@@ -27,6 +28,56 @@ use llama_stage_backend::{
 /// Default bind for the gateway-tail worker on a 2-machine split.
 /// The orchestrator can override via `gateway_tail_bind` on the assignment.
 const DEFAULT_GATEWAY_TAIL_BIND: &str = "0.0.0.0:9182";
+
+fn gateway_backend_active(kind: StageBackendKind) -> bool {
+    matches!(kind, StageBackendKind::Auto | StageBackendKind::LlamaStageGateway)
+}
+
+struct CaffeinateGuard {
+    child: Option<Child>,
+}
+
+impl CaffeinateGuard {
+    fn start(enabled: bool) -> Self {
+        if !enabled {
+            return Self { child: None };
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            match Command::new("caffeinate")
+                .args(["-dimsu"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    info!("[power] caffeinate enabled while compute is running");
+                    Self { child: Some(child) }
+                }
+                Err(err) => {
+                    warn!("[power] failed to start caffeinate: {err}");
+                    Self { child: None }
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self { child: None }
+        }
+    }
+}
+
+impl Drop for CaffeinateGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 
 /// Captures whether the currently-running split-gateway role/topology already
 /// matches a fresh assignment so we don't re-spawn workers on benign repeats.
@@ -188,6 +239,55 @@ async fn handle_single_node_mlx_assignment(
     );
     spawn_omlx_ready_probe(mlx_port.clone(), model_name.to_string(), ws_outbound_tx.clone());
     true
+}
+
+async fn handle_download_push(
+    config: &Config,
+    download: DownloadPush,
+    ws_outbound_tx: &tokio::sync::mpsc::Sender<String>,
+) {
+    if !config.models.auto_download {
+        info!("[storage] Ignoring download push for {} because auto-downloads are disabled", download.model_id);
+        return;
+    }
+
+    let cache_dir = PathBuf::from(&config.models.cache_dir);
+    let result = if let (Some(repo_id), Some(folder)) =
+        (download.mlx_repo_id.as_deref(), download.mlx_folder.as_deref())
+    {
+        info!("[storage] Preparing MLX snapshot {} for {}", repo_id, download.model_id);
+        crate::inference::stage_artifacts::ensure_mlx_snapshot(&cache_dir, repo_id, folder)
+            .await
+            .map(|_| ())
+    } else if let (Some(url), Some(filename)) =
+        (download.gguf_url.as_deref(), download.gguf_filename.as_deref())
+    {
+        let dest = cache_dir.join(filename);
+        if dest.exists() {
+            Ok(())
+        } else {
+            if let Some(parent) = dest.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            info!("[storage] Downloading {} to {}", download.model_id, dest.display());
+            crate::inference::stage_artifacts::download_file(url, &dest).await
+        }
+    } else {
+        Err(anyhow::anyhow!("download push missing supported source fields"))
+    };
+
+    let payload = match result {
+        Ok(()) => serde_json::json!({
+            "type": "download_complete",
+            "model_id": download.model_id,
+        }),
+        Err(err) => serde_json::json!({
+            "type": "download_error",
+            "model_id": download.model_id,
+            "error": err.to_string(),
+        }),
+    };
+    let _ = ws_outbound_tx.send(payload.to_string()).await;
 }
 
 fn mlx_status_label(config: &Config, model_name: &str, mlx_port: &Arc<AtomicU16>) -> String {
@@ -629,6 +729,7 @@ pub struct DaemonRuntime {
     shutdown: Arc<AtomicBool>,
     state_tx: watch::Sender<DaemonState>,
     state_rx: watch::Receiver<DaemonState>,
+    network_down_mbps: Arc<tokio::sync::RwLock<Option<f64>>>,
 }
 
 impl DaemonRuntime {
@@ -640,6 +741,7 @@ impl DaemonRuntime {
             shutdown: Arc::new(AtomicBool::new(false)),
             state_tx,
             state_rx,
+            network_down_mbps: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -652,6 +754,7 @@ impl DaemonRuntime {
             shutdown: Arc::new(AtomicBool::new(false)),
             state_tx,
             state_rx,
+            network_down_mbps: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -668,6 +771,20 @@ impl DaemonRuntime {
     /// Run the daemon event loop. Blocks until shutdown is signaled.
     pub async fn run(&self) -> Result<()> {
         info!("Daemon starting...");
+        let _caffeinate_guard =
+            CaffeinateGuard::start(self.config.node.caffeinate_when_running);
+        {
+            let network_down_mbps = self.network_down_mbps.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Some(mbps) = crate::benchmark::bench_network_download().await {
+                        info!("[network] measured download speed: {:.1} Mbps", mbps);
+                        *network_down_mbps.write().await = Some(mbps);
+                    }
+                    tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+                }
+            });
+        }
 
         // Sweep any orphaned stage-node / gateway children left behind by a
         // previous daemon crash. These processes only ever run as our children,
@@ -698,6 +815,7 @@ impl DaemonRuntime {
                 stage_backend_kind,
                 StageBackendKind::Prototype
                     | StageBackendKind::TailLlama
+                    | StageBackendKind::Auto
                     | StageBackendKind::LlamaStageGateway
                     | StageBackendKind::RealForward
             );
@@ -752,6 +870,7 @@ impl DaemonRuntime {
 
         // Channel for assignment pushes from orchestrator via WebSocket
         let (assignment_tx, mut assignment_rx) = tokio::sync::mpsc::channel::<AssignmentPush>(8);
+        let (download_tx, mut download_rx) = tokio::sync::mpsc::channel::<DownloadPush>(4);
         // Channel for sending messages back through the WS (e.g. node_ready)
         let (ws_outbound_tx, ws_outbound_rx) = tokio::sync::mpsc::channel::<String>(16);
 
@@ -763,7 +882,7 @@ impl DaemonRuntime {
             );
         }
 
-        if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway) {
+        if gateway_backend_active(stage_backend_kind) {
             // v0.4.1 keep-warm: don't kill llama-server, just park it. When
             // the orchestrator flips a node back to solo, set_externally_managed(false)
             // + check_assignment() resumes the already-loaded model instantly
@@ -865,6 +984,7 @@ impl DaemonRuntime {
             &self.config,
             self.shutdown.clone(),
             assignment_tx,
+            download_tx,
             ws_outbound_rx,
             stage_runtime_client.clone(),
             gateway_client.clone(),
@@ -912,7 +1032,7 @@ impl DaemonRuntime {
                         && local_mlx_variant_for_model(&self.config, &assignment.model_name)
                             .is_some();
 
-                    if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway)
+                    if gateway_backend_active(stage_backend_kind)
                         && !prefers_local_mlx
                         && gateway_assignment_supported(
                             assignment.stage,
@@ -1254,7 +1374,7 @@ impl DaemonRuntime {
                                 continue;
                             };
 
-                            if !matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway) {
+                            if !gateway_backend_active(stage_backend_kind) {
                                 if let Some(ref url) = assignment.artifact_url {
                                 if !crate::inference::stage_artifacts::is_stage_cached(
                                     &assignment.model_name,
@@ -1434,6 +1554,9 @@ impl DaemonRuntime {
                         ws_outbound_tx.clone(),
                     );
                 }
+                Some(download) = download_rx.recv() => {
+                    handle_download_push(&self.config, download, &ws_outbound_tx).await;
+                }
                 _ = assignment_interval.tick() => {
                     // Fallback: only poll orchestrator when WS relay is not actively connected
                     // When WS is connected, assignments come via push (no polling needed)
@@ -1489,7 +1612,7 @@ impl DaemonRuntime {
                     let metrics = hardware::collect_live_metrics(&mut sys);
                     let uptime = start_time.elapsed().as_secs();
                     let pipeline_model = self.state_rx.borrow().pipeline.model.clone();
-                    let inf_status = if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway) {
+                    let inf_status = if gateway_backend_active(stage_backend_kind) {
                         if gateway_client.lock().await.is_some() {
                             "llama-stage-gateway".to_string()
                         } else {
@@ -1552,6 +1675,7 @@ impl DaemonRuntime {
                         state.live_metrics = metrics;
                         state.uptime_secs = uptime;
                         state.inference_status = inf_status;
+                        state.pipeline.backend = state.inference_status.clone();
                         if latency > 0 {
                             state.pipeline.avg_latency_ms = latency as f64;
                         }
@@ -1726,7 +1850,7 @@ impl DaemonRuntime {
                     }
                 });
 
-                if matches!(stage_backend_kind, StageBackendKind::LlamaStageGateway)
+                if gateway_backend_active(stage_backend_kind)
                     && has_pipeline
                     && node.pipeline_stage.unwrap_or(0) == 0
                     && node.pipeline_total_stages.unwrap_or(1) == 1
@@ -1971,7 +2095,7 @@ impl DaemonRuntime {
                 None => {
                     let gateway_mode = matches!(
                         StageBackendKind::parse(&self.config.experimental.stage_backend),
-                        StageBackendKind::LlamaStageGateway
+                        StageBackendKind::Auto | StageBackendKind::LlamaStageGateway
                     );
                     let total = if stage_runtime.is_some() {
                         Some(1)
@@ -2012,6 +2136,7 @@ impl DaemonRuntime {
                 requests_served: None,
                 tokens_per_second: None,
                 downloaded_models: Some(detect_downloaded_models()),
+                auto_download_enabled: Some(self.config.models.auto_download),
                 inference_slots_total: slots_total,
                 inference_slots_busy: slots_busy,
                 gpu_vram_free_mb: vram_free,
@@ -2020,14 +2145,21 @@ impl DaemonRuntime {
                 memory_bandwidth_gbps: None,
                 last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
                 stage_backend_kind: if self.config.experimental.stage_mode_enabled {
+                    let kind = StageBackendKind::parse(&self.config.experimental.stage_backend);
                     Some(
-                        StageBackendKind::parse(&self.config.experimental.stage_backend)
-                            .as_str()
-                            .to_string(),
+                        if matches!(kind, StageBackendKind::Auto) {
+                            StageBackendKind::LlamaStageGateway.as_str()
+                        } else {
+                            kind.as_str()
+                        }
+                        .to_string(),
                     )
                 } else {
                     None
                 },
+                current_backend: Some(state.pipeline.backend.clone()),
+                network_down_mbps: *self.network_down_mbps.read().await,
+                caffeinated: Some(self.config.node.caffeinate_when_running),
                 app_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             };
 

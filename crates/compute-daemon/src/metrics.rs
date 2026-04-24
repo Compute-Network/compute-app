@@ -19,6 +19,7 @@ pub struct PipelineStatus {
     pub stage: Option<u32>,
     pub total_stages: Option<u32>,
     pub model: Option<String>,
+    pub backend: String,
     pub requests_served: u64,
     pub avg_latency_ms: f64,
     pub tokens_per_sec: f64,

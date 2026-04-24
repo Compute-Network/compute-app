@@ -25,6 +25,8 @@ pub struct NodeConfig {
     pub idle_threshold_minutes: u32,
     pub pause_on_battery: bool,
     pub pause_on_fullscreen: bool,
+    #[serde(default = "default_true")]
+    pub caffeinate_when_running: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +71,8 @@ pub struct ModelsConfig {
     pub cache_dir: String,
     #[serde(default = "default_active_model")]
     pub active_model: String,
+    #[serde(default = "default_true")]
+    pub auto_download: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,13 +129,21 @@ fn default_active_model() -> String {
     "auto".into()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_theme() -> String {
     "system".into()
 }
 
 impl Default for ModelsConfig {
     fn default() -> Self {
-        Self { cache_dir: default_models_cache_dir(), active_model: default_active_model() }
+        Self {
+            cache_dir: default_models_cache_dir(),
+            active_model: default_active_model(),
+            auto_download: default_true(),
+        }
     }
 }
 
@@ -163,7 +175,7 @@ impl Default for ExperimentalConfig {
 }
 
 fn default_stage_backend() -> String {
-    "llama-stage-gateway".into()
+    "auto".into()
 }
 
 fn default_stage_gateway_connect_timeout_ms() -> u64 {
@@ -208,6 +220,7 @@ impl Default for Config {
                 idle_threshold_minutes: 5,
                 pause_on_battery: true,
                 pause_on_fullscreen: true,
+                caffeinate_when_running: true,
             },
             wallet: WalletConfig {
                 public_address: String::new(),
@@ -232,6 +245,7 @@ impl Default for Config {
             models: ModelsConfig {
                 cache_dir: compute_dir.join("models").to_string_lossy().into_owned(),
                 active_model: "auto".into(),
+                auto_download: true,
             },
             experimental: ExperimentalConfig::default(),
         }
@@ -281,6 +295,7 @@ impl Config {
             "node.idle_threshold_minutes" => Some(self.node.idle_threshold_minutes.to_string()),
             "node.pause_on_battery" => Some(self.node.pause_on_battery.to_string()),
             "node.pause_on_fullscreen" => Some(self.node.pause_on_fullscreen.to_string()),
+            "node.caffeinate_when_running" => Some(self.node.caffeinate_when_running.to_string()),
             "wallet.public_address" => Some(self.wallet.public_address.clone()),
             "wallet.node_id" => Some(self.wallet.node_id.clone()),
             "wallet.node_token" => Some(self.wallet.node_token.clone()),
@@ -290,6 +305,7 @@ impl Config {
             "logging.level" => Some(self.logging.level.clone()),
             "appearance.theme" => Some(self.appearance.theme.clone()),
             "models.active_model" => Some(self.models.active_model.clone()),
+            "models.auto_download" => Some(self.models.auto_download.to_string()),
             "experimental.stage_mode_enabled" => {
                 Some(self.experimental.stage_mode_enabled.to_string())
             }
@@ -338,6 +354,9 @@ impl Config {
             "node.idle_threshold_minutes" => self.node.idle_threshold_minutes = value.parse()?,
             "node.pause_on_battery" => self.node.pause_on_battery = value.parse()?,
             "node.pause_on_fullscreen" => self.node.pause_on_fullscreen = value.parse()?,
+            "node.caffeinate_when_running" => {
+                self.node.caffeinate_when_running = value.parse()?
+            }
             "wallet.public_address" => self.wallet.public_address = value.to_string(),
             "wallet.node_id" => self.wallet.node_id = value.to_string(),
             "wallet.node_token" => self.wallet.node_token = value.to_string(),
@@ -347,6 +366,7 @@ impl Config {
             "logging.level" => self.logging.level = value.to_string(),
             "appearance.theme" => self.appearance.theme = value.to_string(),
             "models.active_model" => self.models.active_model = value.to_string(),
+            "models.auto_download" => self.models.auto_download = value.parse()?,
             "experimental.stage_mode_enabled" => {
                 self.experimental.stage_mode_enabled = value.parse()?
             }
@@ -468,10 +488,12 @@ mod tests {
         assert_eq!(config.node.idle_threshold_minutes, 5);
         assert!(config.node.pause_on_battery);
         assert!(config.node.pause_on_fullscreen);
+        assert!(config.node.caffeinate_when_running);
         assert!(config.wallet.public_address.is_empty());
         assert_eq!(config.network.orchestrator_url, "https://api.computenetwork.sh");
         assert_eq!(config.network.region, "auto");
         assert_eq!(config.logging.level, "info");
+        assert!(config.models.auto_download);
         assert_eq!(config.experimental.stage_acceleration, "auto");
         assert_eq!(config.experimental.stage_acceleration_provider, "auto");
     }
@@ -494,6 +516,8 @@ mod tests {
         assert_eq!(config.get("node.name").unwrap(), config.node.name);
         assert_eq!(config.get("node.max_gpu_usage").unwrap(), "90");
         assert_eq!(config.get("wallet.public_address").unwrap(), "");
+        assert_eq!(config.get("node.caffeinate_when_running").unwrap(), "true");
+        assert_eq!(config.get("models.auto_download").unwrap(), "true");
         assert_eq!(config.get("experimental.stage_acceleration").unwrap(), "auto");
         assert_eq!(config.get("experimental.stage_acceleration_provider").unwrap(), "auto");
         assert_eq!(config.get("experimental.stage_gateway_autostart").unwrap(), "true");
@@ -513,6 +537,12 @@ mod tests {
 
         config.set("wallet.public_address", "So1anaAddress123").unwrap();
         assert_eq!(config.wallet.public_address, "So1anaAddress123");
+
+        config.set("node.caffeinate_when_running", "false").unwrap();
+        assert!(!config.node.caffeinate_when_running);
+
+        config.set("models.auto_download", "false").unwrap();
+        assert!(!config.models.auto_download);
 
         config.set("experimental.stage_acceleration", "metal").unwrap();
         assert_eq!(config.experimental.stage_acceleration, "metal");

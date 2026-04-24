@@ -149,13 +149,16 @@ fn cmd_start() -> Result<()> {
 async fn register_node_orchestrator(config: &Config) {
     let hw = hardware::detect();
     match tui::app::register_node_orchestrator(config, &hw).await {
-        Ok(id) => {
-            let Some(id) = id else {
+        Ok(result) => {
+            let Some(result) = result else {
                 return;
             };
-            println!("  Registered with network (node: {id})");
+            println!("  Registered with network (node: {})", result.node_id);
             let mut updated_config = config.clone();
-            updated_config.wallet.node_id = id;
+            updated_config.wallet.node_id = result.node_id;
+            if let Some(node_token) = result.node_token {
+                updated_config.wallet.node_token = node_token;
+            }
             if let Err(e) = updated_config.save() {
                 eprintln!("  Warning: Could not save node_id to config: {e}");
             }

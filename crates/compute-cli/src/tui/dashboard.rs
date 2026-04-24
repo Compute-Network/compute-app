@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Sparkline},
+    widgets::{Block, Borders, Clear, Paragraph, Sparkline},
 };
 
 use compute_daemon::hardware::{self, HardwareInfo, LiveMetrics};
@@ -25,7 +25,7 @@ enum Tab {
     Overview,
     Logs,
     Config,
-    Models,
+    Storage,
 }
 
 struct ModelEntry {
@@ -276,6 +276,16 @@ const CONFIG_ITEMS: &[ConfigItem] = &[
         kind: ConfigItemKind::Toggle,
     },
     ConfigItem {
+        label: "Caffeinate While Running",
+        key: "node.caffeinate_when_running",
+        kind: ConfigItemKind::Toggle,
+    },
+    ConfigItem {
+        label: "Storage Auto-Downloads",
+        key: "models.auto_download",
+        kind: ConfigItemKind::Toggle,
+    },
+    ConfigItem {
         label: "Auto-start on Login",
         key: "service.autostart",
         kind: ConfigItemKind::Toggle,
@@ -285,11 +295,6 @@ const CONFIG_ITEMS: &[ConfigItem] = &[
         label: "Experimental Stage Mode",
         key: "experimental.stage_mode_enabled",
         kind: ConfigItemKind::Toggle,
-    },
-    ConfigItem {
-        label: "Experimental Backend",
-        key: "experimental.stage_backend",
-        kind: ConfigItemKind::Choice,
     },
     ConfigItem { label: "Log Level", key: "logging.level", kind: ConfigItemKind::Choice },
 ];
@@ -317,8 +322,8 @@ pub struct Dashboard {
     config_edit_buffer: String,
     config_confirm: Option<String>, // "Are you sure?" for wallet changes
     daemon_state_rx: Option<tokio::sync::watch::Receiver<compute_daemon::runtime::DaemonState>>,
-    models_selected: usize,
-    models_downloading: Option<(String, f64)>, // (model_id, progress 0.0-1.0)
+    storage_selected: usize,
+    storage_downloading: Option<(String, f64)>, // (model_id, progress 0.0-1.0)
     download_progress_rx: Option<std::sync::mpsc::Receiver<(String, f64)>>,
 }
 
@@ -371,8 +376,8 @@ impl Dashboard {
             config_edit_buffer: String::new(),
             config_confirm: None,
             daemon_state_rx: None,
-            models_selected: 0,
-            models_downloading: None,
+            storage_selected: 0,
+            storage_downloading: None,
             download_progress_rx: None,
         }
     }
@@ -421,7 +426,7 @@ impl Dashboard {
                         self.log_lines = load_recent_logs(100);
                     }
                     KeyCode::Char('3') => self.active_tab = Tab::Config,
-                    KeyCode::Char('4') => self.active_tab = Tab::Models,
+                    KeyCode::Char('4') => self.active_tab = Tab::Storage,
                     KeyCode::Char('c') => {
                         open_claim_page();
                     }
@@ -449,29 +454,29 @@ impl Dashboard {
                     KeyCode::Enter if self.active_tab == Tab::Config => {
                         self.start_config_edit();
                     }
-                    KeyCode::Up if self.active_tab == Tab::Models => {
-                        if self.models_selected > 0 {
-                            self.models_selected -= 1;
+                    KeyCode::Up if self.active_tab == Tab::Storage => {
+                        if self.storage_selected > 0 {
+                            self.storage_selected -= 1;
                         }
                     }
-                    KeyCode::Down if self.active_tab == Tab::Models => {
+                    KeyCode::Down if self.active_tab == Tab::Storage => {
                         let max = model_entries().len().saturating_sub(1);
-                        if self.models_selected < max {
-                            self.models_selected += 1;
+                        if self.storage_selected < max {
+                            self.storage_selected += 1;
                         }
                     }
-                    KeyCode::Enter if self.active_tab == Tab::Models => {
+                    KeyCode::Enter if self.active_tab == Tab::Storage => {
                         self.select_model();
                     }
-                    KeyCode::Char('d') if self.active_tab == Tab::Models => {
+                    KeyCode::Char('d') if self.active_tab == Tab::Storage => {
                         self.delete_model();
                     }
                     KeyCode::Tab => {
                         self.active_tab = match self.active_tab {
                             Tab::Overview => Tab::Logs,
                             Tab::Logs => Tab::Config,
-                            Tab::Config => Tab::Models,
-                            Tab::Models => Tab::Overview,
+                            Tab::Config => Tab::Storage,
+                            Tab::Storage => Tab::Overview,
                         };
                         if self.active_tab == Tab::Logs {
                             self.log_lines = load_recent_logs(500);
@@ -494,12 +499,12 @@ impl Dashboard {
             while let Ok((model_id, progress)) = rx.try_recv() {
                 if progress >= 1.0 || progress < 0.0 {
                     // Done or failed
-                    self.models_downloading =
+                    self.storage_downloading =
                         if progress < 0.0 { Some((model_id, -1.0)) } else { None };
                     self.download_progress_rx = None;
                     break;
                 }
-                self.models_downloading = Some((model_id, progress));
+                self.storage_downloading = Some((model_id, progress));
             }
         }
 
@@ -567,6 +572,7 @@ impl Dashboard {
 
     fn draw(&self, frame: &mut Frame) {
         let full_area = frame.area();
+        frame.render_widget(Clear, full_area);
 
         // Cap dimensions, align top-left
         let max_w: u16 = 160;
@@ -656,7 +662,7 @@ impl Dashboard {
             Tab::Overview => self.draw_overview_panel(frame, area),
             Tab::Logs => self.draw_logs_panel(frame, area),
             Tab::Config => self.draw_config_panel(frame, area),
-            Tab::Models => self.draw_models_panel(frame, area),
+            Tab::Storage => self.draw_storage_panel(frame, area),
         }
     }
 
@@ -741,7 +747,7 @@ impl Dashboard {
                 Span::raw("  "),
                 Span::styled("[3] CONFIG", tab_style(Tab::Config)),
                 Span::raw("  "),
-                Span::styled("[4] MODELS", tab_style(Tab::Models)),
+                Span::styled("[4] STORAGE", tab_style(Tab::Storage)),
             ]));
         } else {
             lines.push(Line::from(vec![
@@ -752,7 +758,7 @@ impl Dashboard {
                 Span::raw(" "),
                 Span::styled("[3]CFG", tab_style(Tab::Config)),
                 Span::raw(" "),
-                Span::styled("[4]MDL", tab_style(Tab::Models)),
+                Span::styled("[4]STR", tab_style(Tab::Storage)),
             ]));
         }
 
@@ -862,6 +868,7 @@ impl Dashboard {
         let p = &self.pipeline;
         let theme = theme::palette();
         let model = p.model.as_deref().unwrap_or("None");
+        let backend = if p.backend.trim().is_empty() { "auto" } else { p.backend.as_str() };
 
         let vram_line = if let (Some(used), Some(total)) =
             (self.live_metrics.gpu_vram_used_mb, self.live_metrics.gpu_vram_total_mb)
@@ -915,6 +922,10 @@ impl Dashboard {
                     format!("{:.0}ms avg", p.avg_latency_ms),
                     Style::default().fg(theme.text),
                 ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Backend   ", Style::default().fg(theme.dim)),
+                Span::styled(backend, Style::default().fg(theme.text)),
             ]),
             Line::from(vec![
                 Span::styled("  VRAM      ", Style::default().fg(theme.dim)),
@@ -1140,6 +1151,12 @@ impl Dashboard {
             "node.pause_on_fullscreen" => {
                 if config.node.pause_on_fullscreen { "On" } else { "Off" }.into()
             }
+            "node.caffeinate_when_running" => {
+                if config.node.caffeinate_when_running { "On" } else { "Off" }.into()
+            }
+            "models.auto_download" => {
+                if config.models.auto_download { "On" } else { "Off" }.into()
+            }
             "service.autostart" => {
                 if compute_daemon::service::is_service_installed() { "On" } else { "Off" }.into()
             }
@@ -1152,15 +1169,6 @@ impl Dashboard {
             "experimental.stage_mode_enabled" => {
                 if config.experimental.stage_mode_enabled { "On" } else { "Off" }.into()
             }
-            "experimental.stage_backend" => match config.experimental.stage_backend.as_str() {
-                "llama-stage-gateway" | "llama_stage_gateway" | "gateway" => {
-                    "LlamaStageGateway".into()
-                }
-                "llamacpp" => "LlamaCpp".into(),
-                "tail-llama" => "TailLlama".into(),
-                "real_forward" | "real-forward" => "RealForward".into(),
-                _ => "Prototype".into(),
-            },
             "logging.level" => config.logging.level.clone(),
             _ => "?".into(),
         }
@@ -1178,6 +1186,12 @@ impl Dashboard {
                     }
                     "node.pause_on_fullscreen" => {
                         config.node.pause_on_fullscreen = !config.node.pause_on_fullscreen
+                    }
+                    "node.caffeinate_when_running" => {
+                        config.node.caffeinate_when_running = !config.node.caffeinate_when_running
+                    }
+                    "models.auto_download" => {
+                        config.models.auto_download = !config.models.auto_download
                     }
                     "service.autostart" => {
                         if compute_daemon::service::is_service_installed() {
@@ -1227,18 +1241,6 @@ impl Dashboard {
                             "dark" => "light".into(),
                             _ => "system".into(),
                         };
-                    }
-                    "experimental.stage_backend" => {
-                        config.experimental.stage_backend =
-                            match config.experimental.stage_backend.as_str() {
-                                "llama-stage-gateway" | "llama_stage_gateway" | "gateway" => {
-                                    "llamacpp".into()
-                                }
-                                "llamacpp" => "tail-llama".into(),
-                                "tail-llama" => "real_forward".into(),
-                                "real_forward" | "real-forward" => "prototype".into(),
-                                _ => "llama-stage-gateway".into(),
-                            };
                     }
                     _ => {}
                 }
@@ -1396,7 +1398,7 @@ impl Dashboard {
 
     fn select_model(&mut self) {
         let models = model_entries();
-        let entry = match models.get(self.models_selected) {
+        let entry = match models.get(self.storage_selected) {
             Some(e) => e,
             None => return,
         };
@@ -1418,13 +1420,13 @@ impl Dashboard {
         }
 
         // Not downloaded → start download in background
-        if self.models_downloading.is_some() {
+        if self.storage_downloading.is_some() {
             return; // already downloading
         }
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.download_progress_rx = Some(rx);
-        self.models_downloading = Some((entry.id.into(), 0.0));
+        self.storage_downloading = Some((entry.id.into(), 0.0));
 
         let url = entry.hf_url.to_string();
         let filename = entry.gguf_filename.to_string();
@@ -1714,7 +1716,7 @@ impl Dashboard {
 
     fn delete_model(&mut self) {
         let models = model_entries();
-        let entry = match models.get(self.models_selected) {
+        let entry = match models.get(self.storage_selected) {
             Some(e) => e,
             None => return,
         };
@@ -1723,7 +1725,7 @@ impl Dashboard {
             return;
         }
 
-        if self.models_downloading.is_some() {
+        if self.storage_downloading.is_some() {
             return;
         }
 
@@ -1759,7 +1761,7 @@ impl Dashboard {
         }
     }
 
-    fn draw_models_panel(&self, frame: &mut Frame, area: Rect) {
+    fn draw_storage_panel(&self, frame: &mut Frame, area: Rect) {
         let p = theme::palette();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1779,13 +1781,13 @@ impl Dashboard {
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
-            "  MODELS",
+            "  STORAGE",
             Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
         for (i, entry) in models.iter().enumerate() {
-            let is_selected = i == self.models_selected;
+            let is_selected = i == self.storage_selected;
             let is_active = entry.id == active.as_str();
             let downloaded = is_model_downloaded(entry.id);
 
@@ -1840,7 +1842,7 @@ impl Dashboard {
         }
 
         // Download progress
-        if let Some((ref model_id, progress)) = self.models_downloading {
+        if let Some((ref model_id, progress)) = self.storage_downloading {
             let bar_width = 30;
             if progress < 0.0 {
                 lines.push(Line::from(Span::styled(
@@ -1872,7 +1874,7 @@ impl Dashboard {
             Span::styled("↑↓", Style::default().fg(p.dim)),
             Span::styled(" navigate  ", Style::default().fg(p.dim)),
             Span::styled("↵", Style::default().fg(p.dim)),
-            Span::styled(" select  ", Style::default().fg(p.dim)),
+            Span::styled(" select/download  ", Style::default().fg(p.dim)),
             Span::styled("d", Style::default().fg(p.dim)),
             Span::styled(" delete", Style::default().fg(p.dim)),
         ]));

@@ -118,6 +118,21 @@ pub struct AssignmentPush {
     pub gateway_shard_url: Option<String>,
 }
 
+#[derive(Deserialize, Debug, Clone)]
+pub struct DownloadPush {
+    pub model_id: String,
+    #[serde(default)]
+    pub gguf_url: Option<String>,
+    #[serde(default)]
+    pub gguf_filename: Option<String>,
+    #[serde(default)]
+    pub mlx_repo_id: Option<String>,
+    #[serde(default)]
+    pub mlx_folder: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 /// Channel for sending messages back through the WebSocket from other tasks
 pub type WsSender = tokio::sync::mpsc::Sender<String>;
 
@@ -204,6 +219,8 @@ pub struct RelayClient {
     active_requests: Arc<AtomicU32>,
     /// Channel to send assignment pushes to the runtime
     assignment_tx: tokio::sync::mpsc::Sender<AssignmentPush>,
+    /// Channel to send orchestrator-requested model downloads to the runtime.
+    download_tx: tokio::sync::mpsc::Sender<DownloadPush>,
     /// Channel for runtime to send messages through the WS (e.g. node_ready)
     outbound_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>,
     /// Experimental stage runtime client for stage-based prototype requests.
@@ -249,6 +266,7 @@ impl RelayClient {
         config: &Config,
         shutdown: Arc<AtomicBool>,
         assignment_tx: tokio::sync::mpsc::Sender<AssignmentPush>,
+        download_tx: tokio::sync::mpsc::Sender<DownloadPush>,
         outbound_rx: tokio::sync::mpsc::Receiver<String>,
         stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
         gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
@@ -277,6 +295,7 @@ impl RelayClient {
             is_connected: Arc::new(AtomicBool::new(false)),
             active_requests: Arc::new(AtomicU32::new(0)),
             assignment_tx,
+            download_tx,
             outbound_rx: Arc::new(tokio::sync::Mutex::new(outbound_rx)),
             stage_client,
             gateway_client,
@@ -422,6 +441,19 @@ impl RelayClient {
                                     let _ = self.assignment_tx.try_send(assignment);
                                 }
                                 Err(e) => warn!("[relay] Failed to parse assignment: {e}"),
+                            }
+                        }
+                        Some("download_model") => {
+                            match serde_json::from_str::<DownloadPush>(&text) {
+                                Ok(download) => {
+                                    info!(
+                                        "[relay] Download push: model={} reason={}",
+                                        download.model_id,
+                                        download.reason.as_deref().unwrap_or("orchestrator demand")
+                                    );
+                                    let _ = self.download_tx.try_send(download);
+                                }
+                                Err(e) => warn!("[relay] Failed to parse download push: {e}"),
                             }
                         }
                         Some("inference_request") => {
@@ -753,6 +785,7 @@ async fn proxy_openai_stream(
     cancel_rx: &mut oneshot::Receiver<()>,
     backend_label: &'static str,
 ) -> RelayResponse {
+    let started_at = std::time::Instant::now();
     let resp = match tokio::select! {
         _ = &mut *cancel_rx => {
             return RelayResponse {
@@ -875,6 +908,8 @@ async fn proxy_openai_stream(
         status: 200,
         body: serde_json::json!({
             "stream_complete": true,
+            "backend": backend_label,
+            "gateway_timings": { "total_ms": started_at.elapsed().as_millis() as u64 },
             "usage": last_usage.unwrap_or(serde_json::json!({
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -1193,6 +1228,7 @@ async fn handle_omlx_request(
     request: &RelayRequest,
 ) -> RelayResponse {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let started_at = std::time::Instant::now();
     let mut body = request.body.clone();
     if let Some(obj) = body.as_object_mut() {
         obj.insert("model".to_string(), serde_json::Value::String(mlx_folder.to_string()));
@@ -1202,8 +1238,15 @@ async fn handle_omlx_request(
         Ok(resp) => {
             let status = resp.status().as_u16();
             let body_text = resp.text().await.unwrap_or_default();
-            let parsed: serde_json::Value = serde_json::from_str(&body_text)
+            let mut parsed: serde_json::Value = serde_json::from_str(&body_text)
                 .unwrap_or_else(|_| serde_json::json!({"raw": body_text}));
+            if let Some(obj) = parsed.as_object_mut() {
+                obj.insert("backend".into(), serde_json::json!("omlx"));
+                obj.insert(
+                    "gateway_timings".into(),
+                    serde_json::json!({ "total_ms": started_at.elapsed().as_millis() as u64 }),
+                );
+            }
             RelayResponse {
                 id: request.id.clone(),
                 r#type: "inference_response".into(),

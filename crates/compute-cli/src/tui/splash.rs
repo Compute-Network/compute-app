@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Clear, Paragraph},
 };
 
 use super::globe::Globe;
@@ -121,7 +121,7 @@ impl SplashScreen {
         let first_model_path = find_first_model();
         let has_local_model = first_model_path.is_some();
         let model_label = if stage_mode_enabled {
-            format!("stage backend ({})", config.experimental.stage_backend)
+            "automatic split inference".into()
         } else if config.models.active_model != "auto" {
             config.models.active_model.clone()
         } else if !has_local_model {
@@ -270,7 +270,7 @@ impl SplashScreen {
                         // Step 4: wait for daemon's llama-server to be ready
                         if self.current_step == 4 && self.stage_mode_enabled {
                             self.model_loaded.store(true, Ordering::Relaxed);
-                            self.steps[self.current_step].label = "Stage backend ready".into();
+                            self.steps[self.current_step].label = "Split inference ready".into();
                             self.steps[self.current_step].done = true;
                             self.current_step += 1;
                             self.step_timer = Instant::now();
@@ -436,6 +436,7 @@ impl SplashScreen {
 
     fn draw(&self, frame: &mut Frame) {
         let full_area = frame.area();
+        frame.render_widget(Clear, full_area);
         let palette = theme::palette();
 
         // Cap dimensions, align top-left
@@ -579,7 +580,7 @@ impl SplashScreen {
         } else if !self.has_local_model && !self.stage_mode_enabled {
             let msg = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "  No model cached yet. Download one from Models after startup.",
+                    "  No model cached yet. Download one from Storage after startup.",
                     Style::default().fg(p.warning),
                 )),
                 Line::from(Span::styled("  [i] What is llama-server?", Style::default().fg(p.dim))),

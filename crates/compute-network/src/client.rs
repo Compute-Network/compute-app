@@ -61,6 +61,8 @@ pub struct HeartbeatPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub downloaded_models: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_download_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_slots_total: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_slots_busy: Option<i32>,
@@ -77,12 +79,20 @@ pub struct HeartbeatPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage_backend_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_down_mbps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caffeinated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegistrationResponse {
     pub node_id: String,
+    #[serde(default)]
+    pub node_token: Option<String>,
     pub status: String,
 }
 
@@ -200,6 +210,12 @@ impl OrchestratorClient {
         self.node_id.as_deref()
     }
 
+    /// Get the current node session token. Registration may rotate this to a
+    /// node-bound token that should be persisted by the caller.
+    pub fn node_token(&self) -> Option<&str> {
+        self.node_token.as_deref()
+    }
+
     /// Register this node with the orchestrator.
     pub async fn register(&mut self, registration: &NodeRegistration) -> Result<String> {
         debug!("Registering node with orchestrator at {}", self.base_url);
@@ -223,6 +239,9 @@ impl OrchestratorClient {
         let body: RegistrationResponse = resp.json().await?;
         self.node_id = Some(body.node_id.clone());
         self.wallet_address = Some(registration.wallet_address.clone());
+        if let Some(node_token) = body.node_token {
+            self.node_token = Some(node_token);
+        }
         Ok(body.node_id)
     }
 
@@ -267,11 +286,13 @@ impl OrchestratorClient {
 
     /// Fetch the latest pipeline assignment for this node.
     pub async fn get_assignment(&self, node_id: &str) -> Result<Option<PipelineAssignment>> {
-        let resp = self
+        let mut request = self
             .client
-            .get(format!("{}/v1/pipelines/assignment/{}", self.base_url, node_id))
-            .send()
-            .await?;
+            .get(format!("{}/v1/pipelines/assignment/{}", self.base_url, node_id));
+        if let Some(token) = self.node_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send().await?;
 
         if resp.status().is_success() {
             let body: Option<PipelineAssignment> = resp.json().await?;
@@ -285,11 +306,13 @@ impl OrchestratorClient {
 
     /// Get pending rewards for a wallet.
     pub async fn get_rewards(&self, wallet_address: &str) -> Result<RewardInfo> {
-        let resp = self
+        let mut request = self
             .client
-            .get(format!("{}/v1/rewards/{}", self.base_url, wallet_address))
-            .send()
-            .await?;
+            .get(format!("{}/v1/rewards/{}", self.base_url, wallet_address));
+        if let Some(token) = self.node_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send().await?;
 
         if !resp.status().is_success() {
             anyhow::bail!("Failed to get rewards: {}", resp.status());
@@ -300,11 +323,13 @@ impl OrchestratorClient {
     }
 
     pub async fn get_node_by_wallet(&self, wallet_address: &str) -> Result<Option<OwnNodeInfo>> {
-        let resp = self
+        let mut request = self
             .client
-            .get(format!("{}/v1/nodes/{}", self.base_url, wallet_address))
-            .send()
-            .await?;
+            .get(format!("{}/v1/nodes/{}", self.base_url, wallet_address));
+        if let Some(token) = self.node_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send().await?;
 
         if resp.status().is_success() {
             let body: OwnNodeInfo = resp.json().await?;
@@ -360,11 +385,13 @@ impl OrchestratorClient {
     }
 
     pub async fn get_earnings(&self, wallet_address: &str) -> Result<EarningsData> {
-        let resp = self
+        let mut request = self
             .client
-            .get(format!("{}/v1/rewards/{}/summary", self.base_url, wallet_address))
-            .send()
-            .await?;
+            .get(format!("{}/v1/rewards/{}/summary", self.base_url, wallet_address));
+        if let Some(token) = self.node_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let resp = request.send().await?;
 
         if !resp.status().is_success() {
             anyhow::bail!("Failed to fetch earnings summary: {}", resp.status());

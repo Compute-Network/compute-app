@@ -14,6 +14,11 @@ use super::dashboard::Dashboard;
 use super::onboarding::{OnboardingResult, OnboardingScreen};
 use super::splash::SplashScreen;
 
+pub struct NodeRegistrationResult {
+    pub node_id: String,
+    pub node_token: Option<String>,
+}
+
 /// Initialize the terminal and run the TUI application.
 /// Flow: check config → onboarding (if needed) → splash → dashboard
 pub fn run_splash_then_dashboard() -> Result<()> {
@@ -121,7 +126,7 @@ fn kill_llama_server() {
 pub async fn register_node_orchestrator(
     config: &Config,
     hw: &hardware::HardwareInfo,
-) -> Result<Option<String>> {
+) -> Result<Option<NodeRegistrationResult>> {
     if config.wallet.public_address.is_empty() || config.wallet.node_token.is_empty() {
         return Ok(None);
     }
@@ -165,7 +170,10 @@ pub async fn register_node_orchestrator(
     };
 
     let node_id = client.register(&node).await?;
-    Ok(Some(node_id))
+    Ok(Some(NodeRegistrationResult {
+        node_id,
+        node_token: client.node_token().map(str::to_owned),
+    }))
 }
 
 fn detect_advertise_ip() -> Option<String> {
@@ -227,11 +235,13 @@ fn register_node_async(config: &Config, hw: &hardware::HardwareInfo) {
         if let Ok(rt) = rt {
             rt.block_on(async {
                 match register_node_orchestrator(&config, &hw).await {
-                    Ok(Some(id)) => {
-                        tracing::info!("Node registered with orchestrator: {id}");
-                        // Save node_id to config
+                    Ok(Some(result)) => {
+                        tracing::info!("Node registered with orchestrator: {}", result.node_id);
                         if let Ok(mut cfg) = Config::load() {
-                            cfg.wallet.node_id = id;
+                            cfg.wallet.node_id = result.node_id;
+                            if let Some(node_token) = result.node_token {
+                                cfg.wallet.node_token = node_token;
+                            }
                             let _ = cfg.save();
                         }
                     }

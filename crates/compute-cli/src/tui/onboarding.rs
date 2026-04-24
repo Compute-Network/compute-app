@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -70,6 +70,7 @@ pub struct OnboardingScreen {
     auth_rx: Option<mpsc::Receiver<Result<WalletAuthResult, String>>>,
     auth_status: Option<String>,
     theme_mode: ThemeMode,
+    caffeinate_when_running: bool,
 }
 
 #[derive(PartialEq)]
@@ -98,6 +99,10 @@ impl OnboardingScreen {
             auth_rx: None,
             auth_status: None,
             theme_mode: theme::current_mode(),
+            caffeinate_when_running: Config::load()
+                .unwrap_or_default()
+                .node
+                .caffeinate_when_running,
         }
     }
 
@@ -142,6 +147,10 @@ impl OnboardingScreen {
                     KeyCode::Left | KeyCode::Right | KeyCode::Char('t') | KeyCode::Char('T') => {
                         self.theme_mode = self.theme_mode.toggle();
                         self.persist_theme();
+                    }
+                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                        self.caffeinate_when_running = !self.caffeinate_when_running;
+                        self.persist_caffeinate_preference();
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => {
                         return Some(OnboardingResult::Skipped);
@@ -251,6 +260,13 @@ impl OnboardingScreen {
         let _ = config.save();
     }
 
+    fn persist_caffeinate_preference(&self) {
+        let mut config = Config::load().unwrap_or_default();
+        config.node.caffeinate_when_running = self.caffeinate_when_running;
+        let _ = config::ensure_dirs();
+        let _ = config.save();
+    }
+
     fn start_wallet_auth(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.auth_rx = Some(rx);
@@ -324,6 +340,7 @@ impl OnboardingScreen {
 
     fn draw(&self, frame: &mut Frame) {
         let full_area = frame.area();
+        frame.render_widget(Clear, full_area);
         let palette = theme::palette_for(self.theme_mode);
 
         let max_w: u16 = 160;
@@ -415,7 +432,7 @@ impl OnboardingScreen {
 
         // Bottom help
         let help_text = match self.step {
-            OnboardingStep::Welcome => "  [←/→] Theme  [Enter] Continue  [S] Skip  [Esc] Quit",
+            OnboardingStep::Welcome => "  [←/→] Theme  [C] Caffeinate  [Enter] Continue  [S] Skip",
             OnboardingStep::WalletInput => "  [Enter] Open wallet login  [S] Skip  [Esc] Quit",
             OnboardingStep::DependencyCheck => "  [Enter] Retry  [Esc] Quit",
             OnboardingStep::Installing => "  Installing...",
@@ -441,6 +458,13 @@ impl OnboardingScreen {
             Line::from(""),
             Line::from(Span::styled(
                 format!("  Theme: {}  [←/→ or T to switch]", self.theme_mode.label()),
+                Style::default().fg(p.warning),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "  Keep awake while Compute runs: {}  [C to toggle]",
+                    if self.caffeinate_when_running { "On" } else { "Off" }
+                ),
                 Style::default().fg(p.warning),
             )),
             Line::from(""),

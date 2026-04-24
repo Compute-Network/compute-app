@@ -185,6 +185,7 @@ async fn main() -> Result<()> {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let (assignment_tx, _assignment_rx) = mpsc::channel::<AssignmentPush>(8);
+    let (download_tx, _download_rx) = mpsc::channel(8);
     let (_ws_outbound_tx, ws_outbound_rx) = mpsc::channel::<String>(16);
     let stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>> =
         Arc::new(tokio::sync::Mutex::new(None));
@@ -198,6 +199,7 @@ async fn main() -> Result<()> {
         &config,
         shutdown.clone(),
         assignment_tx,
+        download_tx,
         ws_outbound_rx,
         stage_client,
         gateway_client,
