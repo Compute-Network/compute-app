@@ -32,21 +32,19 @@ const K: usize = 4;
 const GROUND_TRUTH_LEN: usize = K + 2;
 
 fn main() -> Result<()> {
-    let model_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_gemma_model_path);
+    let model_path =
+        std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(default_gemma_model_path);
     if !model_path.exists() {
         bail!("model not found: {}", model_path.display());
     }
     eprintln!("[probe] model = {}", model_path.display());
 
     let head_end: u32 = std::env::var("HEAD_END").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
-    let tail_start: u32 = std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(21);
+    let tail_start: u32 =
+        std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(21);
     let tail_end: u32 = std::env::var("TAIL_END").ok().and_then(|s| s.parse().ok()).unwrap_or(41);
 
-    let prompt = std::env::var("PROMPT")
-        .unwrap_or_else(|_| "The capital of France is".to_string());
+    let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
 
     let head = build_stage_backend(&StageNodeConfig {
         model_path: model_path.clone(),
@@ -66,10 +64,7 @@ fn main() -> Result<()> {
     })?;
 
     let prompt_tokens = head.tokenize(&prompt)?;
-    eprintln!(
-        "[probe] prompt tokens = {} ({prompt_tokens:?})",
-        prompt_tokens.len()
-    );
+    eprintln!("[probe] prompt tokens = {} ({prompt_tokens:?})", prompt_tokens.len());
 
     let request_id = "probe-truth".to_string();
 
@@ -96,21 +91,15 @@ fn main() -> Result<()> {
     prefill(&head, &tail, &request_id, &prompt_tokens)?;
     let n_pos_tail_before = tail.session_n_pos(&request_id);
     let n_pos_head_before = head.session_n_pos(&request_id);
-    eprintln!(
-        "[probe] post-prefill n_pos: head={n_pos_head_before} tail={n_pos_tail_before}"
-    );
+    eprintln!("[probe] post-prefill n_pos: head={n_pos_head_before} tail={n_pos_tail_before}");
     if n_pos_tail_before != prompt_tokens.len() as i32 {
-        bail!(
-            "tail n_pos after prefill expected {}, got {n_pos_tail_before}",
-            prompt_tokens.len()
-        );
+        bail!("tail n_pos after prefill expected {}, got {n_pos_tail_before}", prompt_tokens.len());
     }
 
     let last_token = ground_truth[0];
     let drafts_full: Vec<i32> = ground_truth[1..=K].to_vec();
-    let batch_tokens: Vec<i32> = std::iter::once(last_token)
-        .chain(drafts_full.iter().copied())
-        .collect();
+    let batch_tokens: Vec<i32> =
+        std::iter::once(last_token).chain(drafts_full.iter().copied()).collect();
     eprintln!("[probe] full-accept batch tokens: {batch_tokens:?}");
 
     let head_batch_hidden =
@@ -141,10 +130,7 @@ fn main() -> Result<()> {
     }
     for (i, want) in drafts_full.iter().enumerate() {
         if outcome.accepted_token_ids[i] != *want {
-            bail!(
-                "full-accept: position {i} got {} want {want}",
-                outcome.accepted_token_ids[i]
-            );
+            bail!("full-accept: position {i} got {} want {want}", outcome.accepted_token_ids[i]);
         }
     }
     let bonus_full = outcome.accepted_token_ids[K];
@@ -159,9 +145,7 @@ fn main() -> Result<()> {
     let n_pos_tail_after_full = tail.session_n_pos(&request_id);
     let expected_full = n_pos_tail_before + K as i32 + 1;
     if n_pos_tail_after_full != expected_full {
-        bail!(
-            "full-accept tail n_pos: got {n_pos_tail_after_full} want {expected_full}"
-        );
+        bail!("full-accept tail n_pos: got {n_pos_tail_after_full} want {expected_full}");
     }
     eprintln!("[probe] full-accept PASSED");
 
@@ -175,12 +159,9 @@ fn main() -> Result<()> {
     // / specials). We don't care about the exact ids — only that they
     // mismatch the target's greedy pick at that position.
     let drafts_partial: Vec<i32> = vec![ground_truth[1], 99_999, 99_998, 99_997];
-    let batch_tokens_p: Vec<i32> = std::iter::once(ground_truth[0])
-        .chain(drafts_partial.iter().copied())
-        .collect();
-    eprintln!(
-        "[probe] partial-accept batch tokens: {batch_tokens_p:?} drafts: {drafts_partial:?}"
-    );
+    let batch_tokens_p: Vec<i32> =
+        std::iter::once(ground_truth[0]).chain(drafts_partial.iter().copied()).collect();
+    eprintln!("[probe] partial-accept batch tokens: {batch_tokens_p:?} drafts: {drafts_partial:?}");
 
     let head_batch_hidden_p =
         head.continue_head_tokens(&request_id, batch_tokens_p.clone(), Some(64))?;
@@ -199,10 +180,7 @@ fn main() -> Result<()> {
     );
 
     if outcome_p.accepted_count != 1 {
-        bail!(
-            "partial-accept: expected accepted_count=1, got {}",
-            outcome_p.accepted_count
-        );
+        bail!("partial-accept: expected accepted_count=1, got {}", outcome_p.accepted_count);
     }
     if outcome_p.accepted_token_ids.len() != 2 {
         bail!(
@@ -228,9 +206,7 @@ fn main() -> Result<()> {
     let n_pos_tail_after_partial = tail.session_n_pos(&request_id);
     let expected_partial = n_pos_tail_pre_partial + 1 + 1; // last_token + 1 accepted
     if n_pos_tail_after_partial != expected_partial {
-        bail!(
-            "partial-accept tail n_pos: got {n_pos_tail_after_partial} want {expected_partial}"
-        );
+        bail!("partial-accept tail n_pos: got {n_pos_tail_after_partial} want {expected_partial}");
     }
     eprintln!("[probe] partial-accept PASSED");
 

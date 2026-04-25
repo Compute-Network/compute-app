@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 pub fn stages_cache_dir() -> PathBuf {
@@ -139,9 +141,24 @@ pub async fn ensure_mlx_snapshot(
     repo_id: &str,
     folder: &str,
 ) -> Result<PathBuf> {
+    ensure_mlx_snapshot_with_progress(models_cache_dir, repo_id, folder, 0, |_, _| {}).await
+}
+
+pub async fn ensure_mlx_snapshot_with_progress<F>(
+    models_cache_dir: &Path,
+    repo_id: &str,
+    folder: &str,
+    total_size_mb: u64,
+    mut on_progress: F,
+) -> Result<PathBuf>
+where
+    F: FnMut(u64, Option<u64>) + Send,
+{
     let dest = mlx_model_path(models_cache_dir, folder);
     if mlx_model_cached(models_cache_dir, folder) {
         info!("MLX snapshot {} already cached at {}", repo_id, dest.display());
+        let total_bytes = total_size_mb.checked_mul(1024 * 1024).filter(|value| *value > 0);
+        on_progress(total_bytes.unwrap_or(0), total_bytes);
         return Ok(dest);
     }
 
@@ -156,21 +173,36 @@ pub async fn ensure_mlx_snapshot(
             "huggingface CLI (`hf` or `huggingface-cli`) not found — install via `pip install huggingface-hub` or rely on the oMLX brew formula which pulls it in"
         ))?;
 
-    info!("Downloading MLX snapshot {} -> {}", repo_id, dest.display());
-    let output = tokio::process::Command::new(&hf_bin)
+    debug!("Downloading MLX snapshot {} -> {}", repo_id, dest.display());
+    let total_bytes = total_size_mb.checked_mul(1024 * 1024).filter(|value| *value > 0);
+    let mut child = tokio::process::Command::new(&hf_bin)
         .arg("download")
         .arg(repo_id)
         .arg("--local-dir")
         .arg(&dest)
-        .output()
-        .await
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .with_context(|| format!("invoking {}", hf_bin.display()))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("hf download {repo_id} failed: {}", stderr.trim());
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.with_context(|| format!("waiting for {}", hf_bin.display()))?;
+                if !status.success() {
+                    anyhow::bail!("hf download {repo_id} failed with status {status}");
+                }
+                break;
+            }
+            _ = interval.tick() => {
+                let downloaded = dir_size_bytes(&dest);
+                if downloaded > 0 {
+                    on_progress(downloaded, total_bytes);
+                }
+            }
+        }
     }
-
     if !mlx_model_cached(models_cache_dir, folder) {
         anyhow::bail!(
             "hf download {repo_id} returned success but config.json is missing at {}",
@@ -178,6 +210,8 @@ pub async fn ensure_mlx_snapshot(
         );
     }
 
+    let downloaded = dir_size_bytes(&dest);
+    on_progress(downloaded, total_bytes);
     info!("MLX snapshot ready at {}", dest.display());
     Ok(dest)
 }
@@ -335,49 +369,146 @@ fn extract_tar(archive: &Path, dest: &Path) -> Result<()> {
 }
 
 pub async fn download_file(url: &str, dest: &Path) -> Result<()> {
+    download_file_with_progress(url, dest, |_, _| {}).await
+}
+
+pub async fn download_file_with_progress<F>(
+    url: &str,
+    dest: &Path,
+    mut on_progress: F,
+) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>) + Send,
+{
     let client =
         reqwest::Client::builder().timeout(std::time::Duration::from_secs(7200)).build()?;
 
-    let resp = client.get(url).send().await.context("Download request failed")?;
-
-    if !resp.status().is_success() {
-        anyhow::bail!("Download failed: HTTP {}", resp.status());
-    }
-
-    let total_size = resp.content_length().unwrap_or(0);
-    let mut downloaded: u64 = 0;
-
     let tmp_path = dest.with_extension("tmp");
-    let mut file =
-        tokio::fs::File::create(&tmp_path).await.context("Failed to create temp file")?;
+    let mut downloaded: u64 = tokio::fs::metadata(&tmp_path).await.map(|m| m.len()).unwrap_or(0);
+    let mut total_size: Option<u64> = None;
+    let max_retries = 10u32;
 
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
-    let mut stream = resp.bytes_stream();
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("Error reading download stream")?;
-        file.write_all(&chunk).await?;
-        downloaded += chunk.len() as u64;
-
-        if total_size > 0 && downloaded % (100 * 1024 * 1024) < chunk.len() as u64 {
-            let pct = (downloaded as f64 / total_size as f64) * 100.0;
+    for attempt in 0..=max_retries {
+        let mut req = client.get(url);
+        if downloaded > 0 {
+            req = req.header(reqwest::header::RANGE, format!("bytes={downloaded}-"));
             info!(
-                "Stage download: {:.0}% ({:.1} GB / {:.1} GB)",
-                pct,
-                downloaded as f64 / 1_073_741_824.0,
-                total_size as f64 / 1_073_741_824.0
+                "Resuming download {} from {:.1} GB",
+                dest.display(),
+                downloaded as f64 / 1_073_741_824.0
             );
+        }
+
+        let resp = match req.send().await {
+            Ok(resp) => resp,
+            Err(err) if attempt < max_retries => {
+                warn!("Download request failed: {err}; retrying");
+                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt.min(5)))).await;
+                continue;
+            }
+            Err(err) => return Err(err).context("Download request failed"),
+        };
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            downloaded = 0;
+            total_size = None;
+            continue;
+        }
+        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            if attempt < max_retries {
+                warn!("Download failed with HTTP {status}; retrying");
+                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt.min(5)))).await;
+                continue;
+            }
+            anyhow::bail!("Download failed: HTTP {}", status);
+        }
+
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            total_size = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.rsplit('/').next())
+                .and_then(|value| value.parse::<u64>().ok());
+        } else {
+            total_size = resp.content_length();
+            if downloaded > 0 {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                downloaded = 0;
+            }
+        }
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(downloaded > 0)
+            .write(true)
+            .truncate(downloaded == 0)
+            .open(&tmp_path)
+            .await
+            .context("Failed to open temp file")?;
+
+        let mut stream = resp.bytes_stream();
+        let mut stream_complete = true;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(err) if attempt < max_retries => {
+                    warn!("Error reading download stream: {err}; retrying");
+                    stream_complete = false;
+                    break;
+                }
+                Err(err) => return Err(err).context("Error reading download stream"),
+            };
+            file.write_all(&chunk).await?;
+            downloaded += chunk.len() as u64;
+            on_progress(downloaded, total_size);
+        }
+
+        file.flush().await?;
+        drop(file);
+
+        if stream_complete && total_size.map(|total| downloaded >= total).unwrap_or(true) {
+            break;
+        }
+
+        if attempt < max_retries {
+            tokio::time::sleep(Duration::from_secs(2u64.pow(attempt.min(5)))).await;
+        } else if let Some(total) = total_size {
+            anyhow::bail!("Download incomplete: {} of {} bytes", downloaded, total);
         }
     }
 
-    file.flush().await?;
-    drop(file);
+    if let Some(total) = total_size {
+        if downloaded < total {
+            anyhow::bail!("Download incomplete: {} of {} bytes", downloaded, total);
+        }
+    }
 
     tokio::fs::rename(&tmp_path, dest).await.context("Failed to move downloaded artifact")?;
 
     info!("Downloaded {:.2} GB to {}", downloaded as f64 / 1_073_741_824.0, dest.display());
     Ok(())
+}
+
+fn dir_size_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
+
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+
+    entries.flatten().map(|entry| dir_size_bytes(&entry.path())).sum()
 }
 
 fn sha256_file(path: &Path) -> Result<String> {

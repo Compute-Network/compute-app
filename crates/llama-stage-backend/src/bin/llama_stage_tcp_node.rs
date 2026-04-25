@@ -144,7 +144,8 @@ fn handle_stream(
         let response_bytes = rmp_serde::to_vec_named(&response)?;
         prev_encode_us = encode_started.elapsed().as_micros() as u64;
 
-        let response_len = u32::try_from(response_bytes.len()).context("stage response too large")?;
+        let response_len =
+            u32::try_from(response_bytes.len()).context("stage response too large")?;
         let write_started = Instant::now();
         writer.write_all(&response_len.to_le_bytes())?;
         writer.write_all(&response_bytes)?;

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Sparkline},
+    widgets::{Block, Borders, Clear, Paragraph, Sparkline, Wrap},
 };
 
 use compute_daemon::hardware::{self, HardwareInfo, LiveMetrics};
@@ -25,7 +25,7 @@ enum Tab {
     Overview,
     Logs,
     Config,
-    Storage,
+    Models,
 }
 
 struct ModelEntry {
@@ -71,16 +71,6 @@ fn model_entries() -> Vec<ModelEntry> {
             mlx_folder: None,
             mlx_total_size_mb: None,
         },
-        ModelEntry {
-            id: "qwen3.5-27b-q4",
-            label: "Qwen3.5 — 17GB (coding)",
-            desc: "SWE-bench 72.4% · 27B dense, 256K ctx",
-            gguf_filename: "Qwen3.5-27B-UD-Q4_K_XL.gguf",
-            hf_url: "https://huggingface.co/unsloth/Qwen3.5-27B-GGUF/resolve/main/Qwen3.5-27B-UD-Q4_K_XL.gguf",
-            mlx_repo_id: None,
-            mlx_folder: None,
-            mlx_total_size_mb: None,
-        },
         // v0.4.4: qwen-3.6 unified id — daemon picks the format per host.
         // The TUI picker needs a single user-facing entry; compute-network's
         // ModelDefinition carries both the GGUF (Linux/Windows) and MLX
@@ -100,7 +90,7 @@ fn model_entries() -> Vec<ModelEntry> {
         },
         ModelEntry {
             id: "gemma-4-e4b-q4-stage-head",
-            label: "Gemma4 Stage 0-20 — 2.5GB (head)",
+            label: "Split-Model-Test (head)",
             desc: "Pipeline head · layers 0-20",
             gguf_filename: "head-0-20.gguf",
             hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-gguf-stages/resolve/main/gemma-4-e4b-q4-head-0-20.gguf",
@@ -110,7 +100,7 @@ fn model_entries() -> Vec<ModelEntry> {
         },
         ModelEntry {
             id: "gemma-4-e4b-q4-stage-tail",
-            label: "Gemma4 Stage 21-41 — 2.5GB (tail)",
+            label: "Split-Model-Test (tail)",
             desc: "Pipeline tail · layers 21-41",
             gguf_filename: "tail-21-41.gguf",
             hf_url: "https://huggingface.co/ComputeNet-sh/gemma-4-e4b-q4-gguf-stages/resolve/main/gemma-4-e4b-q4-tail-21-41.gguf",
@@ -276,12 +266,12 @@ const CONFIG_ITEMS: &[ConfigItem] = &[
         kind: ConfigItemKind::Toggle,
     },
     ConfigItem {
-        label: "Caffeinate While Running",
+        label: "Prevent Sleep",
         key: "node.caffeinate_when_running",
         kind: ConfigItemKind::Toggle,
     },
     ConfigItem {
-        label: "Storage Auto-Downloads",
+        label: "Model Auto-Downloads",
         key: "models.auto_download",
         kind: ConfigItemKind::Toggle,
     },
@@ -291,12 +281,6 @@ const CONFIG_ITEMS: &[ConfigItem] = &[
         kind: ConfigItemKind::Toggle,
     },
     ConfigItem { label: "Theme", key: "appearance.theme", kind: ConfigItemKind::Choice },
-    ConfigItem {
-        label: "Experimental Stage Mode",
-        key: "experimental.stage_mode_enabled",
-        kind: ConfigItemKind::Toggle,
-    },
-    ConfigItem { label: "Log Level", key: "logging.level", kind: ConfigItemKind::Choice },
 ];
 
 pub struct Dashboard {
@@ -316,15 +300,16 @@ pub struct Dashboard {
     active_tab: Tab,
     log_lines: Vec<String>,
     log_scroll: usize,
+    show_debug_logs: bool,
     last_log_update: Instant,
     config_selected: usize,
     config_editing: bool,
     config_edit_buffer: String,
     config_confirm: Option<String>, // "Are you sure?" for wallet changes
     daemon_state_rx: Option<tokio::sync::watch::Receiver<compute_daemon::runtime::DaemonState>>,
-    storage_selected: usize,
-    storage_downloading: Option<(String, f64)>, // (model_id, progress 0.0-1.0)
-    download_progress_rx: Option<std::sync::mpsc::Receiver<(String, f64)>>,
+    models_selected: usize,
+    model_downloads: BTreeMap<String, f64>, // model_id -> progress 0.0-1.0, negative = failed
+    download_progress_rxs: Vec<std::sync::mpsc::Receiver<(String, f64)>>,
 }
 
 impl Dashboard {
@@ -370,15 +355,16 @@ impl Dashboard {
             active_tab: Tab::Overview,
             log_lines,
             log_scroll: 0,
+            show_debug_logs: false,
             last_log_update: Instant::now(),
             config_selected: 0,
             config_editing: false,
             config_edit_buffer: String::new(),
             config_confirm: None,
             daemon_state_rx: None,
-            storage_selected: 0,
-            storage_downloading: None,
-            download_progress_rx: None,
+            models_selected: 0,
+            model_downloads: BTreeMap::new(),
+            download_progress_rxs: Vec::new(),
         }
     }
 
@@ -426,20 +412,22 @@ impl Dashboard {
                         self.log_lines = load_recent_logs(100);
                     }
                     KeyCode::Char('3') => self.active_tab = Tab::Config,
-                    KeyCode::Char('4') => self.active_tab = Tab::Storage,
+                    KeyCode::Char('4') => self.active_tab = Tab::Models,
                     KeyCode::Char('c') => {
                         open_claim_page();
                     }
                     KeyCode::Up if self.active_tab == Tab::Logs => {
-                        if self.log_scroll > 0 {
-                            self.log_scroll -= 1;
-                        }
+                        self.log_scroll = self.log_scroll.saturating_add(1);
                     }
                     KeyCode::Down if self.active_tab == Tab::Logs => {
-                        self.log_scroll += 1;
+                        self.log_scroll = self.log_scroll.saturating_sub(1);
                     }
                     KeyCode::End if self.active_tab == Tab::Logs => {
                         self.log_scroll = 0; // 0 = follow tail
+                    }
+                    KeyCode::Char('/') if self.active_tab == Tab::Logs => {
+                        self.show_debug_logs = !self.show_debug_logs;
+                        self.log_scroll = 0;
                     }
                     KeyCode::Up if self.active_tab == Tab::Config => {
                         if self.config_selected > 0 {
@@ -454,29 +442,29 @@ impl Dashboard {
                     KeyCode::Enter if self.active_tab == Tab::Config => {
                         self.start_config_edit();
                     }
-                    KeyCode::Up if self.active_tab == Tab::Storage => {
-                        if self.storage_selected > 0 {
-                            self.storage_selected -= 1;
+                    KeyCode::Up if self.active_tab == Tab::Models => {
+                        if self.models_selected > 0 {
+                            self.models_selected -= 1;
                         }
                     }
-                    KeyCode::Down if self.active_tab == Tab::Storage => {
+                    KeyCode::Down if self.active_tab == Tab::Models => {
                         let max = model_entries().len().saturating_sub(1);
-                        if self.storage_selected < max {
-                            self.storage_selected += 1;
+                        if self.models_selected < max {
+                            self.models_selected += 1;
                         }
                     }
-                    KeyCode::Enter if self.active_tab == Tab::Storage => {
+                    KeyCode::Enter if self.active_tab == Tab::Models => {
                         self.select_model();
                     }
-                    KeyCode::Char('d') if self.active_tab == Tab::Storage => {
+                    KeyCode::Char('d') if self.active_tab == Tab::Models => {
                         self.delete_model();
                     }
                     KeyCode::Tab => {
                         self.active_tab = match self.active_tab {
                             Tab::Overview => Tab::Logs,
                             Tab::Logs => Tab::Config,
-                            Tab::Config => Tab::Storage,
-                            Tab::Storage => Tab::Overview,
+                            Tab::Config => Tab::Models,
+                            Tab::Models => Tab::Overview,
                         };
                         if self.active_tab == Tab::Logs {
                             self.log_lines = load_recent_logs(500);
@@ -494,18 +482,23 @@ impl Dashboard {
     fn tick(&mut self) {
         self.globe.tick();
 
-        // Poll download progress
-        if let Some(ref rx) = self.download_progress_rx {
+        // Poll manual model download progress. Keep receivers independent so
+        // users can queue several model downloads from the Models tab.
+        let mut finished_receivers = Vec::new();
+        for (idx, rx) in self.download_progress_rxs.iter().enumerate() {
+            let mut finished = false;
             while let Ok((model_id, progress)) = rx.try_recv() {
+                self.model_downloads.insert(model_id, progress);
                 if progress >= 1.0 || progress < 0.0 {
-                    // Done or failed
-                    self.storage_downloading =
-                        if progress < 0.0 { Some((model_id, -1.0)) } else { None };
-                    self.download_progress_rx = None;
-                    break;
+                    finished = true;
                 }
-                self.storage_downloading = Some((model_id, progress));
             }
+            if finished {
+                finished_receivers.push(idx);
+            }
+        }
+        for idx in finished_receivers.into_iter().rev() {
+            self.download_progress_rxs.remove(idx);
         }
 
         // Read from daemon state if available
@@ -513,6 +506,19 @@ impl Dashboard {
             let state = rx.borrow().clone();
             self.live_metrics = state.live_metrics;
             self.earnings = state.earnings;
+            for download in state.downloads {
+                let progress = match download.phase {
+                    compute_daemon::runtime::DownloadPhase::Downloading => download
+                        .total_bytes
+                        .filter(|total| *total > 0)
+                        .map(|total| download.downloaded_bytes as f64 / total as f64)
+                        .unwrap_or(0.01)
+                        .clamp(0.01, 0.99),
+                    compute_daemon::runtime::DownloadPhase::Complete => 1.0,
+                    compute_daemon::runtime::DownloadPhase::Failed => -1.0,
+                };
+                self.model_downloads.insert(download.model_id, progress);
+            }
 
             // Smooth toward target
             let target = state.pipeline.tokens_per_sec;
@@ -662,7 +668,7 @@ impl Dashboard {
             Tab::Overview => self.draw_overview_panel(frame, area),
             Tab::Logs => self.draw_logs_panel(frame, area),
             Tab::Config => self.draw_config_panel(frame, area),
-            Tab::Storage => self.draw_storage_panel(frame, area),
+            Tab::Models => self.draw_models_panel(frame, area),
         }
     }
 
@@ -747,7 +753,7 @@ impl Dashboard {
                 Span::raw("  "),
                 Span::styled("[3] CONFIG", tab_style(Tab::Config)),
                 Span::raw("  "),
-                Span::styled("[4] STORAGE", tab_style(Tab::Storage)),
+                Span::styled("[4] MODELS", tab_style(Tab::Models)),
             ]));
         } else {
             lines.push(Line::from(vec![
@@ -758,7 +764,7 @@ impl Dashboard {
                 Span::raw(" "),
                 Span::styled("[3]CFG", tab_style(Tab::Config)),
                 Span::raw(" "),
-                Span::styled("[4]STR", tab_style(Tab::Storage)),
+                Span::styled("[4]MOD", tab_style(Tab::Models)),
             ]));
         }
 
@@ -1016,6 +1022,13 @@ impl Dashboard {
             ]);
         }
 
+        if self.active_tab == Tab::Logs && w >= 58 {
+            spans.extend([
+                Span::styled(" [/]", dim),
+                Span::styled(if self.show_debug_logs { "hide debug" } else { "show debug" }, dim),
+            ]);
+        }
+
         let shortcuts = Paragraph::new(Line::from(spans));
         frame.render_widget(shortcuts, area);
     }
@@ -1087,42 +1100,56 @@ impl Dashboard {
                 )));
             }
 
-            let widget = Paragraph::new(lines).block(Block::default().borders(Borders::NONE));
+            let widget = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().borders(Borders::NONE));
             frame.render_widget(widget, chunks[1]);
         } else {
             // Show log file content with scrolling
-            let total = self.log_lines.len();
-            let end =
-                if self.log_scroll == 0 { total } else { total.saturating_sub(self.log_scroll) };
+            let wrap_width = chunks[1].width.saturating_sub(2).max(1) as usize;
+            let mut visual_lines: Vec<Line> = Vec::new();
+            for line in &self.log_lines {
+                let lower = line.to_ascii_lowercase();
+                if !self.show_debug_logs && is_debug_log_line(&lower) {
+                    continue;
+                }
+                let color = if is_error_log_line(&lower) {
+                    p.danger
+                } else if is_warn_log_line(&lower) {
+                    p.warning
+                } else if is_debug_log_line(&lower) {
+                    p.dim
+                } else if is_info_log_line(&lower) {
+                    p.muted
+                } else {
+                    p.dim
+                };
+                for wrapped in wrap_plain_line(&format!("  {line}"), wrap_width) {
+                    visual_lines
+                        .push(Line::from(Span::styled(wrapped, Style::default().fg(color))));
+                }
+            }
+
+            let total = visual_lines.len();
+            let max_scroll = total.saturating_sub(visible_height);
+            let scroll = self.log_scroll.min(max_scroll);
+            let end = if scroll == 0 { total } else { total.saturating_sub(scroll) };
             let start = end.saturating_sub(visible_height);
 
-            let visible_lines: Vec<Line> = self.log_lines[start..end]
-                .iter()
-                .map(|line| {
-                    let color = if line.contains("ERROR") || line.contains("error") {
-                        p.danger
-                    } else if line.contains("WARN") || line.contains("warn") {
-                        p.warning
-                    } else if line.contains("INFO") || line.contains("info") {
-                        p.muted
-                    } else {
-                        p.dim
-                    };
-                    Line::from(Span::styled(format!("  {line}"), Style::default().fg(color)))
-                })
-                .collect();
+            let visible_lines: Vec<Line> = visual_lines[start..end].to_vec();
 
-            let scroll_indicator = if self.log_scroll > 0 {
-                format!(" (scrolled +{})", self.log_scroll)
-            } else {
-                " (following)".into()
-            };
+            let follow_label =
+                if scroll > 0 { format!("scrolled +{}", scroll) } else { "following".into() };
+            let debug_label = if self.show_debug_logs { "debug shown" } else { "debug hidden" };
+            let scroll_indicator = format!(" ({follow_label} | {debug_label})");
 
-            let logs = Paragraph::new(visible_lines).block(
-                Block::default()
-                    .borders(Borders::NONE)
-                    .title(Span::styled(scroll_indicator, Style::default().fg(p.dim))),
-            );
+            let logs = Paragraph::new(visible_lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::NONE)
+                        .title(Span::styled(scroll_indicator, Style::default().fg(p.dim))),
+                )
+                .wrap(Wrap { trim: false });
             frame.render_widget(logs, chunks[1]);
         }
 
@@ -1154,9 +1181,7 @@ impl Dashboard {
             "node.caffeinate_when_running" => {
                 if config.node.caffeinate_when_running { "On" } else { "Off" }.into()
             }
-            "models.auto_download" => {
-                if config.models.auto_download { "On" } else { "Off" }.into()
-            }
+            "models.auto_download" => if config.models.auto_download { "On" } else { "Off" }.into(),
             "service.autostart" => {
                 if compute_daemon::service::is_service_installed() { "On" } else { "Off" }.into()
             }
@@ -1166,10 +1191,6 @@ impl Dashboard {
                 "light" => "Light".into(),
                 _ => "Dark".into(),
             },
-            "experimental.stage_mode_enabled" => {
-                if config.experimental.stage_mode_enabled { "On" } else { "Off" }.into()
-            }
-            "logging.level" => config.logging.level.clone(),
             _ => "?".into(),
         }
     }
@@ -1201,10 +1222,6 @@ impl Dashboard {
                         }
                         return; // Don't save config for service
                     }
-                    "experimental.stage_mode_enabled" => {
-                        config.experimental.stage_mode_enabled =
-                            !config.experimental.stage_mode_enabled
-                    }
                     _ => {}
                 }
                 let _ = config.save();
@@ -1224,14 +1241,6 @@ impl Dashboard {
                             0..=40 => 25,
                             41..=70 => 50,
                             _ => 80,
-                        };
-                    }
-                    "logging.level" => {
-                        config.logging.level = match config.logging.level.as_str() {
-                            "info" => "debug".into(),
-                            "debug" => "warn".into(),
-                            "warn" => "error".into(),
-                            _ => "info".into(),
                         };
                     }
                     "appearance.theme" => {
@@ -1398,7 +1407,7 @@ impl Dashboard {
 
     fn select_model(&mut self) {
         let models = model_entries();
-        let entry = match models.get(self.storage_selected) {
+        let entry = match models.get(self.models_selected) {
             Some(e) => e,
             None => return,
         };
@@ -1420,13 +1429,14 @@ impl Dashboard {
         }
 
         // Not downloaded → start download in background
-        if self.storage_downloading.is_some() {
-            return; // already downloading
+        if matches!(self.model_downloads.get(entry.id), Some(progress) if *progress >= 0.0 && *progress < 1.0)
+        {
+            return; // this model is already downloading
         }
 
         let (tx, rx) = std::sync::mpsc::channel();
-        self.download_progress_rx = Some(rx);
-        self.storage_downloading = Some((entry.id.into(), 0.0));
+        self.download_progress_rxs.push(rx);
+        self.model_downloads.insert(entry.id.into(), 0.0);
 
         let url = entry.hf_url.to_string();
         let filename = entry.gguf_filename.to_string();
@@ -1716,7 +1726,7 @@ impl Dashboard {
 
     fn delete_model(&mut self) {
         let models = model_entries();
-        let entry = match models.get(self.storage_selected) {
+        let entry = match models.get(self.models_selected) {
             Some(e) => e,
             None => return,
         };
@@ -1725,7 +1735,8 @@ impl Dashboard {
             return;
         }
 
-        if self.storage_downloading.is_some() {
+        if matches!(self.model_downloads.get(entry.id), Some(progress) if *progress >= 0.0 && *progress < 1.0)
+        {
             return;
         }
 
@@ -1761,7 +1772,7 @@ impl Dashboard {
         }
     }
 
-    fn draw_storage_panel(&self, frame: &mut Frame, area: Rect) {
+    fn draw_models_panel(&self, frame: &mut Frame, area: Rect) {
         let p = theme::palette();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1781,13 +1792,13 @@ impl Dashboard {
 
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
-            "  STORAGE",
+            "  MODELS",
             Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
         for (i, entry) in models.iter().enumerate() {
-            let is_selected = i == self.storage_selected;
+            let is_selected = i == self.models_selected;
             let is_active = entry.id == active.as_str();
             let downloaded = is_model_downloaded(entry.id);
 
@@ -1842,20 +1853,21 @@ impl Dashboard {
         }
 
         // Download progress
-        if let Some((ref model_id, progress)) = self.storage_downloading {
+        for (model_id, progress) in &self.model_downloads {
             let bar_width = 30;
-            if progress < 0.0 {
+            if *progress < 0.0 {
                 lines.push(Line::from(Span::styled(
                     format!("  Download failed: {}", model_id),
                     Style::default().fg(p.danger),
                 )));
             } else {
-                let filled = (progress * bar_width as f64) as usize;
+                let filled = (*progress * bar_width as f64).clamp(0.0, bar_width as f64) as usize;
                 let empty = bar_width - filled;
-                let pct = progress * 100.0;
+                let pct = *progress * 100.0;
                 lines.push(Line::from(vec![Span::styled(
                     format!(
-                        "  Downloading  [{}{}] {:.0}%",
+                        "  Downloading {}  [{}{}] {:.0}%",
+                        model_id,
                         "█".repeat(filled),
                         "░".repeat(empty),
                         pct
@@ -1865,7 +1877,7 @@ impl Dashboard {
             }
         }
 
-        let list = Paragraph::new(lines);
+        let list = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(list, chunks[1]);
 
         // Footer
@@ -1894,6 +1906,47 @@ fn load_recent_logs(n: usize) -> Vec<String> {
         }
         _ => Vec::new(), // Empty = show live daemon status instead
     }
+}
+
+fn wrap_plain_line(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in line.chars() {
+        if current_width >= width {
+            wrapped.push(current);
+            current = String::new();
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += 1;
+    }
+
+    if current.is_empty() {
+        wrapped.push(String::new());
+    } else {
+        wrapped.push(current);
+    }
+
+    wrapped
+}
+
+fn is_error_log_line(lower: &str) -> bool {
+    lower.contains(" error ") || lower.contains(" error:")
+}
+
+fn is_warn_log_line(lower: &str) -> bool {
+    lower.contains(" warn ") || lower.contains(" warn:")
+}
+
+fn is_debug_log_line(lower: &str) -> bool {
+    lower.contains(" debug ") || lower.contains(" debug:")
+}
+
+fn is_info_log_line(lower: &str) -> bool {
+    lower.contains(" info ") || lower.contains(" info:")
 }
 
 // --- Helpers ---

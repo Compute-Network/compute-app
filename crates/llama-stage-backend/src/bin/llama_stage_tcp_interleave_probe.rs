@@ -132,7 +132,7 @@ fn expect_tensor(response: StageNodeResponse) -> Result<StageTensor> {
     match response {
         StageNodeResponse::Tensor { tensor, .. } => {
             tensor.context("interleave probe expected tensor in response")
-        },
+        }
         other => bail!("expected tensor response, got {other:?}"),
     }
 }

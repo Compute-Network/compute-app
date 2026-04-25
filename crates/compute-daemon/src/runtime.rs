@@ -1,10 +1,11 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::Duration;
-use std::process::{Child, Command, Stdio};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -241,69 +242,277 @@ async fn handle_single_node_mlx_assignment(
     true
 }
 
+fn download_push_for_model(config: &Config, model_id: &str, reason: &str) -> Option<DownloadPush> {
+    let catalog = compute_network::models::ModelCatalog::default_catalog();
+    let model = catalog.find(model_id)?;
+
+    match model.preferred_format_here()? {
+        compute_network::models::BackendFormat::Mlx => {
+            let mlx = model.mlx.as_ref()?;
+            if mlx_model_cached(config, &mlx.folder) {
+                return None;
+            }
+            Some(DownloadPush {
+                model_id: model.id.clone(),
+                gguf_url: None,
+                gguf_filename: None,
+                mlx_repo_id: Some(mlx.repo_id.clone()),
+                mlx_folder: Some(mlx.folder.clone()),
+                reason: Some(reason.to_string()),
+            })
+        }
+        compute_network::models::BackendFormat::Gguf => {
+            let filename = model.gguf_filename.as_ref()?;
+            let dest = PathBuf::from(&config.models.cache_dir).join(filename);
+            if dest.exists() {
+                return None;
+            }
+            Some(DownloadPush {
+                model_id: model.id.clone(),
+                gguf_url: model.gguf_download_url.clone(),
+                gguf_filename: model.gguf_filename.clone(),
+                mlx_repo_id: None,
+                mlx_folder: None,
+                reason: Some(reason.to_string()),
+            })
+        }
+    }
+}
+
+fn spawn_download_task(
+    config: Config,
+    download: DownloadPush,
+    ws_outbound_tx: tokio::sync::mpsc::Sender<String>,
+    state_tx: watch::Sender<DaemonState>,
+    active_downloads: Arc<tokio::sync::Mutex<HashSet<String>>>,
+) {
+    let key = download.model_id.clone();
+    tokio::spawn(async move {
+        {
+            let mut active = active_downloads.lock().await;
+            if !active.insert(key.clone()) {
+                info!("[models] Download already in progress for {key}; skipping duplicate push");
+                return;
+            }
+        }
+
+        handle_download_push(&config, download, &ws_outbound_tx, &state_tx).await;
+
+        let mut active = active_downloads.lock().await;
+        active.remove(&key);
+    });
+}
+
 async fn handle_download_push(
     config: &Config,
     download: DownloadPush,
     ws_outbound_tx: &tokio::sync::mpsc::Sender<String>,
+    state_tx: &watch::Sender<DaemonState>,
 ) {
     if !config.models.auto_download {
-        info!("[storage] Ignoring download push for {} because auto-downloads are disabled", download.model_id);
+        info!(
+            "[models] Ignoring download push for {} because auto-downloads are disabled",
+            download.model_id
+        );
         return;
     }
 
     let cache_dir = PathBuf::from(&config.models.cache_dir);
+    let model_id = download.model_id.clone();
+    let mut final_path: Option<PathBuf> = None;
     let result = if let (Some(repo_id), Some(folder)) =
         (download.mlx_repo_id.as_deref(), download.mlx_folder.as_deref())
     {
-        info!("[storage] Preparing MLX snapshot {} for {}", repo_id, download.model_id);
-        crate::inference::stage_artifacts::ensure_mlx_snapshot(&cache_dir, repo_id, folder)
-            .await
-            .map(|_| ())
+        let source = format!("MLX {}", repo_id);
+        let total_size_mb = catalog_mlx_total_size_mb(&download.model_id, folder);
+        let total_bytes = mb_to_bytes(total_size_mb);
+        let dest = crate::inference::stage_artifacts::mlx_model_path(&cache_dir, folder);
+        final_path = Some(dest);
+        info!(
+            "[models] Starting {} download from orchestrator; check Models tab for progress",
+            download.model_id
+        );
+        set_download_status(
+            state_tx,
+            DownloadStatus::downloading(&model_id, &source, 0, total_bytes),
+        );
+        crate::inference::stage_artifacts::ensure_mlx_snapshot_with_progress(
+            &cache_dir,
+            repo_id,
+            folder,
+            total_size_mb,
+            {
+                let state_tx = state_tx.clone();
+                let model_id = model_id.clone();
+                let source = source.clone();
+                move |downloaded, total| {
+                    set_download_status(
+                        &state_tx,
+                        DownloadStatus::downloading(&model_id, &source, downloaded, total),
+                    );
+                }
+            },
+        )
+        .await
+        .map(|_| ())
     } else if let (Some(url), Some(filename)) =
         (download.gguf_url.as_deref(), download.gguf_filename.as_deref())
     {
+        let source = "GGUF".to_string();
         let dest = cache_dir.join(filename);
+        final_path = Some(dest.clone());
         if dest.exists() {
             Ok(())
         } else {
             if let Some(parent) = dest.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
-            info!("[storage] Downloading {} to {}", download.model_id, dest.display());
-            crate::inference::stage_artifacts::download_file(url, &dest).await
+            let total_bytes = mb_to_bytes(catalog_total_size_mb(&download.model_id));
+            info!(
+                "[models] Starting {} download from orchestrator; check Models tab for progress",
+                download.model_id
+            );
+            set_download_status(
+                state_tx,
+                DownloadStatus::downloading(&model_id, &source, 0, total_bytes),
+            );
+            crate::inference::stage_artifacts::download_file_with_progress(url, &dest, {
+                let state_tx = state_tx.clone();
+                let model_id = model_id.clone();
+                let source = source.clone();
+                move |downloaded, total| {
+                    set_download_status(
+                        &state_tx,
+                        DownloadStatus::downloading(&model_id, &source, downloaded, total),
+                    );
+                }
+            })
+            .await
         }
     } else {
         Err(anyhow::anyhow!("download push missing supported source fields"))
     };
 
+    let downloaded_bytes = final_path.as_ref().map(|path| path_size_bytes(path)).unwrap_or(0);
     let payload = match result {
-        Ok(()) => serde_json::json!({
-            "type": "download_complete",
-            "model_id": download.model_id,
-        }),
-        Err(err) => serde_json::json!({
-            "type": "download_error",
-            "model_id": download.model_id,
-            "error": err.to_string(),
-        }),
+        Ok(()) => {
+            info!("[models] Download complete: {}", model_id);
+            set_download_status(
+                state_tx,
+                DownloadStatus {
+                    model_id: model_id.clone(),
+                    source: "orchestrator".into(),
+                    phase: DownloadPhase::Complete,
+                    downloaded_bytes,
+                    total_bytes: Some(downloaded_bytes).filter(|value| *value > 0),
+                    error: None,
+                },
+            );
+            serde_json::json!({
+                "type": "download_complete",
+                "model_id": download.model_id,
+            })
+        }
+        Err(err) => {
+            let error = err.to_string();
+            warn!("[models] Download failed for {}: {}", model_id, error);
+            set_download_status(
+                state_tx,
+                DownloadStatus {
+                    model_id: model_id.clone(),
+                    source: "orchestrator".into(),
+                    phase: DownloadPhase::Failed,
+                    downloaded_bytes,
+                    total_bytes: None,
+                    error: Some(error.clone()),
+                },
+            );
+            serde_json::json!({
+                "type": "download_error",
+                "model_id": download.model_id,
+                "error": error,
+            })
+        }
     };
     let _ = ws_outbound_tx.send(payload.to_string()).await;
+}
+
+fn catalog_total_size_mb(model_id: &str) -> u64 {
+    compute_network::models::ModelCatalog::default_catalog()
+        .find(model_id)
+        .map(|model| model.total_size_mb)
+        .unwrap_or(0)
+}
+
+fn catalog_mlx_total_size_mb(model_id: &str, folder: &str) -> u64 {
+    compute_network::models::ModelCatalog::default_catalog()
+        .find(model_id)
+        .and_then(|model| model.mlx.as_ref())
+        .filter(|mlx| mlx.folder == folder)
+        .map(|mlx| mlx.total_size_mb)
+        .unwrap_or_else(|| catalog_total_size_mb(model_id))
+}
+
+fn mb_to_bytes(mb: u64) -> Option<u64> {
+    mb.checked_mul(1024 * 1024).filter(|value| *value > 0)
+}
+
+fn path_size_bytes(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if meta.is_file() {
+        return meta.len();
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries.flatten().map(|entry| path_size_bytes(&entry.path())).sum()
+}
+
+fn set_download_status(state_tx: &watch::Sender<DaemonState>, status: DownloadStatus) {
+    state_tx.send_modify(|state| {
+        if let Some(existing) = state.downloads.iter_mut().find(|d| d.model_id == status.model_id) {
+            *existing = status;
+        } else {
+            state.downloads.push(status);
+        }
+    });
 }
 
 fn mlx_status_label(config: &Config, model_name: &str, mlx_port: &Arc<AtomicU16>) -> String {
     let Some(mlx) = local_mlx_variant_for_model(config, model_name) else {
         return "idle".into();
     };
-    if !crate::inference::stage_artifacts::mlx_model_cached(
-        std::path::Path::new(&config.models.cache_dir),
-        &mlx.folder,
-    ) {
+    if !mlx_model_cached(config, &mlx.folder) {
         "omlx (model missing)".into()
     } else if mlx_port.load(Ordering::Relaxed) != 0 {
         "omlx".into()
     } else {
         "omlx (starting)".into()
     }
+}
+
+fn mlx_model_cached(config: &Config, folder: &str) -> bool {
+    crate::inference::stage_artifacts::mlx_model_cached(
+        std::path::Path::new(&config.models.cache_dir),
+        folder,
+    )
+}
+
+fn preferred_idle_mlx_model(
+    config: &Config,
+    hw: &hardware::HardwareInfo,
+) -> Option<String> {
+    let configured = config.models.active_model.trim();
+    let model_id = if configured.is_empty() || configured == "auto" {
+        crate::benchmark::assess_node_startup(hw).assigned_model_id
+    } else {
+        configured.to_string()
+    };
+
+    let mlx = local_mlx_variant_for_model(config, &model_id)?;
+    mlx_model_cached(config, &mlx.folder).then_some(model_id)
 }
 
 async fn send_gateway_ready_or_error(
@@ -704,6 +913,42 @@ pub struct DaemonState {
     pub network: NetworkStats,
     pub uptime_secs: u64,
     pub inference_status: String,
+    pub downloads: Vec<DownloadStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadPhase {
+    Downloading,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadStatus {
+    pub model_id: String,
+    pub source: String,
+    pub phase: DownloadPhase,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl DownloadStatus {
+    fn downloading(
+        model_id: &str,
+        source: &str,
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            model_id: model_id.to_string(),
+            source: source.to_string(),
+            phase: DownloadPhase::Downloading,
+            downloaded_bytes,
+            total_bytes,
+            error: None,
+        }
+    }
 }
 
 impl Default for DaemonState {
@@ -718,6 +963,7 @@ impl Default for DaemonState {
             network: NetworkStats::default(),
             uptime_secs: 0,
             inference_status: "idle".into(),
+            downloads: Vec::new(),
         }
     }
 }
@@ -771,8 +1017,7 @@ impl DaemonRuntime {
     /// Run the daemon event loop. Blocks until shutdown is signaled.
     pub async fn run(&self) -> Result<()> {
         info!("Daemon starting...");
-        let _caffeinate_guard =
-            CaffeinateGuard::start(self.config.node.caffeinate_when_running);
+        let _caffeinate_guard = CaffeinateGuard::start(self.config.node.caffeinate_when_running);
         {
             let network_down_mbps = self.network_down_mbps.clone();
             tokio::spawn(async move {
@@ -810,15 +1055,14 @@ impl DaemonRuntime {
         let mut held_tps_until: Option<std::time::Instant> = None;
 
         let stage_backend_kind = StageBackendKind::parse(&self.config.experimental.stage_backend);
-        let prototype_stage_mode = self.config.experimental.stage_mode_enabled
-            && matches!(
-                stage_backend_kind,
-                StageBackendKind::Prototype
-                    | StageBackendKind::TailLlama
-                    | StageBackendKind::Auto
-                    | StageBackendKind::LlamaStageGateway
-                    | StageBackendKind::RealForward
-            );
+        let prototype_stage_mode = matches!(
+            stage_backend_kind,
+            StageBackendKind::Prototype
+                | StageBackendKind::TailLlama
+                | StageBackendKind::Auto
+                | StageBackendKind::LlamaStageGateway
+                | StageBackendKind::RealForward
+        );
 
         // Pre-warm: start llama-server during splash so the model is ready for
         // the first request. Skip entirely for prototype stage mode, which
@@ -871,8 +1115,35 @@ impl DaemonRuntime {
         // Channel for assignment pushes from orchestrator via WebSocket
         let (assignment_tx, mut assignment_rx) = tokio::sync::mpsc::channel::<AssignmentPush>(8);
         let (download_tx, mut download_rx) = tokio::sync::mpsc::channel::<DownloadPush>(4);
+        let active_downloads = Arc::new(tokio::sync::Mutex::new(HashSet::<String>::new()));
         // Channel for sending messages back through the WS (e.g. node_ready)
         let (ws_outbound_tx, ws_outbound_rx) = tokio::sync::mpsc::channel::<String>(16);
+
+        if self.config.models.auto_download && detect_downloaded_models().trim().is_empty() {
+            let assessment = crate::benchmark::assess_node_startup(&hw);
+            if let Some(download) = download_push_for_model(
+                &self.config,
+                &assessment.assigned_model_id,
+                "startup: no cached models",
+            ) {
+                info!(
+                    "[models] No cached models found; auto-downloading startup target {}",
+                    download.model_id
+                );
+                spawn_download_task(
+                    self.config.clone(),
+                    download,
+                    ws_outbound_tx.clone(),
+                    self.state_tx.clone(),
+                    active_downloads.clone(),
+                );
+            } else {
+                info!(
+                    "[models] No cached models found; startup target {} is not directly downloadable",
+                    assessment.assigned_model_id
+                );
+            }
+        }
 
         if let InferenceStatus::Running { model_name, .. } = inference_mgr.status() {
             spawn_ready_probe(
@@ -1353,14 +1624,6 @@ impl DaemonRuntime {
                     use crate::inference::manager::PipelineRole;
                     match assignment_mode {
                         "stage" => {
-                            if !self.config.experimental.stage_mode_enabled {
-                                warn!(
-                                    "[stage] Ignoring stage-based assignment for shard {:?} because experimental.stage_mode_enabled=false",
-                                    assignment.shard_id
-                                );
-                                continue;
-                            }
-
                             // v0.4.1 keep-warm: park llama-server on stage-runtime takeover
                             // so flip-back to solo reuses the already-loaded model.
                             inference_mgr.set_externally_managed(true);
@@ -1555,7 +1818,13 @@ impl DaemonRuntime {
                     );
                 }
                 Some(download) = download_rx.recv() => {
-                    handle_download_push(&self.config, download, &ws_outbound_tx).await;
+                    spawn_download_task(
+                        self.config.clone(),
+                        download,
+                        ws_outbound_tx.clone(),
+                        self.state_tx.clone(),
+                        active_downloads.clone(),
+                    );
                 }
                 _ = assignment_interval.tick() => {
                     // Fallback: only poll orchestrator when WS relay is not actively connected
@@ -1611,23 +1880,32 @@ impl DaemonRuntime {
 
                     let metrics = hardware::collect_live_metrics(&mut sys);
                     let uptime = start_time.elapsed().as_secs();
-                    let pipeline_model = self.state_rx.borrow().pipeline.model.clone();
-                    let inf_status = if gateway_backend_active(stage_backend_kind) {
+                    let state_snapshot = self.state_rx.borrow().clone();
+                    let pipeline_model = state_snapshot.pipeline.model.clone();
+                    let idle_mlx_model = if state_snapshot.pipeline.active {
+                        None
+                    } else {
+                        pipeline_model.clone().or_else(|| {
+                            preferred_idle_mlx_model(&self.config, &state_snapshot.hardware)
+                        })
+                    };
+                    let display_model = pipeline_model.clone().or_else(|| idle_mlx_model.clone());
+                    let model_prefers_mlx = display_model
+                        .as_deref()
+                        .and_then(|model| local_mlx_variant_for_model(&self.config, model))
+                        .is_some();
+                    let inf_status = if model_prefers_mlx {
+                        mlx_status_label(
+                            &self.config,
+                            display_model.as_deref().unwrap_or_default(),
+                            &mlx_port,
+                        )
+                    } else if gateway_backend_active(stage_backend_kind) {
                         if gateway_client.lock().await.is_some() {
                             "llama-stage-gateway".to_string()
                         } else {
                             "llama-stage-gateway (disconnected)".to_string()
                         }
-                    } else if pipeline_model
-                        .as_deref()
-                        .and_then(|model| local_mlx_variant_for_model(&self.config, model))
-                        .is_some()
-                    {
-                        mlx_status_label(
-                            &self.config,
-                            pipeline_model.as_deref().unwrap_or_default(),
-                            &mlx_port,
-                        )
                     } else {
                         stage_runtime
                             .as_ref()
@@ -1676,6 +1954,9 @@ impl DaemonRuntime {
                         state.uptime_secs = uptime;
                         state.inference_status = inf_status;
                         state.pipeline.backend = state.inference_status.clone();
+                        if !state.pipeline.active {
+                            state.pipeline.model = display_model.clone();
+                        }
                         if latency > 0 {
                             state.pipeline.avg_latency_ms = latency as f64;
                         }
@@ -1921,8 +2202,8 @@ impl DaemonRuntime {
                     })
                     .unwrap_or(false);
 
-                let looks_like_stage_assignment = self.config.experimental.stage_mode_enabled
-                    && node.model_name.as_deref() == Some("gemma-4-e4b-q4")
+                let looks_like_stage_assignment = node.model_name.as_deref()
+                    == Some("gemma-4-e4b-q4")
                     && node.pipeline_id.is_some()
                     && node.pipeline_stage.is_some()
                     && node.pipeline_total_stages == Some(2);
@@ -2122,6 +2403,7 @@ impl DaemonRuntime {
                 (Some(total), Some(used)) => Some((total - used).max(0)),
                 _ => None,
             };
+            let startup_assessment = crate::benchmark::assess_node_startup(&state.hardware);
 
             let update = compute_network::client::HeartbeatPayload {
                 status: "online".into(),
@@ -2141,10 +2423,10 @@ impl DaemonRuntime {
                 inference_slots_busy: slots_busy,
                 gpu_vram_free_mb: vram_free,
                 ip_address: advertised_host(&self.config),
-                pipeline_capable: Some(self.config.experimental.stage_mode_enabled),
-                memory_bandwidth_gbps: None,
+                pipeline_capable: Some(startup_assessment.split_capable),
+                memory_bandwidth_gbps: Some(startup_assessment.estimated_memory_bandwidth_gbps),
                 last_heartbeat: Some(chrono::Utc::now().to_rfc3339()),
-                stage_backend_kind: if self.config.experimental.stage_mode_enabled {
+                stage_backend_kind: {
                     let kind = StageBackendKind::parse(&self.config.experimental.stage_backend);
                     Some(
                         if matches!(kind, StageBackendKind::Auto) {
@@ -2154,8 +2436,6 @@ impl DaemonRuntime {
                         }
                         .to_string(),
                     )
-                } else {
-                    None
                 },
                 current_backend: Some(state.pipeline.backend.clone()),
                 network_down_mbps: *self.network_down_mbps.read().await,

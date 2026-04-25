@@ -11,6 +11,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Clear, Paragraph},
 };
+use tokio::sync::watch;
+
+use compute_daemon::benchmark::StartupAssessment;
+use compute_daemon::runtime::{DaemonState, DownloadPhase, DownloadStatus};
 
 use super::globe::Globe;
 use super::theme;
@@ -36,7 +40,6 @@ const SPINNER_CHARS: &[char] = &['/', '-', '\\', '|'];
 struct StartupStep {
     label: String,
     done: bool,
-    #[allow(dead_code)]
     result: Option<String>,
 }
 
@@ -64,6 +67,12 @@ pub struct SplashScreen {
     stage_mode_enabled: bool,
     /// Whether a local model is present and worth waiting on.
     has_local_model: bool,
+    /// Step index that may start the llama-server install.
+    llama_status_step: usize,
+    /// Step index that may wait for model/runtime readiness.
+    model_step: usize,
+    /// Live daemon state, used to show startup model download progress.
+    daemon_state_rx: Option<watch::Receiver<DaemonState>>,
 }
 
 #[derive(PartialEq)]
@@ -78,7 +87,10 @@ enum SplashPhase {
 }
 
 impl SplashScreen {
-    pub fn new(hardware_info: &compute_daemon::hardware::HardwareInfo) -> Self {
+    pub fn new(
+        hardware_info: &compute_daemon::hardware::HardwareInfo,
+        assessment: StartupAssessment,
+    ) -> Self {
         let mut globe = Globe::new();
         globe.set_mock_nodes();
 
@@ -94,13 +106,54 @@ impl SplashScreen {
         // Check if llama-server is available
         let llama_found = find_llama_server();
 
+        let hardware_result = format!(
+            "{} threads · {} RAM",
+            hardware_info.cpu.threads.max(hardware_info.cpu.cores),
+            format_gb(hardware_info.memory.total_gb)
+        );
+        let benchmark_result = format!(
+            "score {}/100 · {} · {:.1} TFLOPS",
+            assessment.score, assessment.tier, assessment.estimated_tflops_fp16
+        );
+        let split_result = if assessment.split_capable {
+            format!(
+                "yes · {} · {}",
+                assessment.split_role,
+                assessment.split_model_label.as_deref().unwrap_or("split model")
+            )
+        } else {
+            format!("no · {}", assessment.split_reason)
+        };
+
         let mut steps = vec![
-            StartupStep { label: "Detecting hardware...".into(), done: false, result: None },
+            StartupStep {
+                label: "Detecting hardware...".into(),
+                done: false,
+                result: Some(hardware_result),
+            },
             StartupStep { label: format!("GPU: {gpu_name}"), done: false, result: None },
+            StartupStep {
+                label: "Benchmarking node...".into(),
+                done: false,
+                result: Some(benchmark_result),
+            },
+            StartupStep {
+                label: "Assigning model...".into(),
+                done: false,
+                result: Some(format!(
+                    "{} · {}",
+                    assessment.assigned_model_id, assessment.assigned_model_label
+                )),
+            },
+            StartupStep {
+                label: "Checking split-node potential...".into(),
+                done: false,
+                result: Some(split_result),
+            },
             StartupStep { label: "Checking llama-server...".into(), done: false, result: None },
         ];
 
-        // Step 3 depends on whether llama-server was found
+        let llama_status_step = steps.len();
         if llama_found {
             steps.push(StartupStep {
                 label: "llama-server ready".into(),
@@ -121,7 +174,7 @@ impl SplashScreen {
         let first_model_path = find_first_model();
         let has_local_model = first_model_path.is_some();
         let model_label = if stage_mode_enabled {
-            "automatic split inference".into()
+            format!("orchestrator target {}", assessment.assigned_model_id)
         } else if config.models.active_model != "auto" {
             config.models.active_model.clone()
         } else if !has_local_model {
@@ -139,8 +192,13 @@ impl SplashScreen {
             downloaded
         };
 
+        let model_step = steps.len();
         steps.push(StartupStep {
-            label: format!("Loading model: {}...", model_label),
+            label: if stage_mode_enabled {
+                format!("Preparing inference runtime: {}...", model_label)
+            } else {
+                format!("Loading model: {}...", model_label)
+            },
             done: false,
             result: None,
         });
@@ -174,7 +232,15 @@ impl SplashScreen {
             model_loaded,
             stage_mode_enabled,
             has_local_model,
+            llama_status_step,
+            model_step,
+            daemon_state_rx: None,
         }
+    }
+
+    pub fn with_daemon_state(mut self, state_rx: watch::Receiver<DaemonState>) -> Self {
+        self.daemon_state_rx = Some(state_rx);
+        self
     }
 
     /// Run the splash screen animation. Returns true if user wants to continue to dashboard.
@@ -215,6 +281,7 @@ impl SplashScreen {
             // Auto-complete after all steps done + brief pause
             if self.phase == SplashPhase::Complete
                 && self.start_time.elapsed() > Duration::from_secs(4)
+                && !self.has_active_download()
             {
                 return Ok(true);
             }
@@ -249,35 +316,26 @@ impl SplashScreen {
             }
             SplashPhase::StepsRunning => {
                 if self.current_step < self.steps.len() {
-                    let step_delay = match self.current_step {
-                        0 => Duration::from_millis(200),
-                        1 => Duration::from_millis(150),
-                        2 => Duration::from_millis(300), // "Checking llama-server..."
-                        3 => Duration::from_millis(200), // llama status
-                        4 => Duration::from_millis(100), // model loading — start immediately
-                        5 => Duration::from_millis(400), // "Connecting to network..."
-                        _ => Duration::from_millis(200),
-                    };
+                    let step_delay = self.step_delay(self.current_step);
                     if self.step_timer.elapsed() > step_delay {
-                        // Step 3 (index 3): if llama not found, start install
-                        if self.current_step == 3 && !self.llama_ready {
+                        if self.current_step == self.llama_status_step && !self.llama_ready {
                             self.steps[self.current_step].done = false;
                             self.start_llama_install();
                             self.phase = SplashPhase::InstallingLlama;
                             return;
                         }
 
-                        // Step 4: wait for daemon's llama-server to be ready
-                        if self.current_step == 4 && self.stage_mode_enabled {
+                        if self.current_step == self.model_step && self.stage_mode_enabled {
                             self.model_loaded.store(true, Ordering::Relaxed);
-                            self.steps[self.current_step].label = "Split inference ready".into();
+                            self.steps[self.current_step].label =
+                                "Inference runtime ready".into();
                             self.steps[self.current_step].done = true;
                             self.current_step += 1;
                             self.step_timer = Instant::now();
                             return;
                         }
 
-                        if self.current_step == 4 && !self.has_local_model {
+                        if self.current_step == self.model_step && !self.has_local_model {
                             self.model_loaded.store(true, Ordering::Relaxed);
                             self.steps[self.current_step].label =
                                 "No local model cached yet".into();
@@ -287,7 +345,9 @@ impl SplashScreen {
                             return;
                         }
 
-                        if self.current_step == 4 && !self.model_loaded.load(Ordering::Relaxed) {
+                        if self.current_step == self.model_step
+                            && !self.model_loaded.load(Ordering::Relaxed)
+                        {
                             self.start_model_health_poll();
                             self.phase = SplashPhase::LoadingModel;
                             return;
@@ -351,6 +411,20 @@ impl SplashScreen {
                 }
             }
             SplashPhase::Complete => {}
+        }
+    }
+
+    fn step_delay(&self, step_index: usize) -> Duration {
+        if step_index == 0 {
+            Duration::from_millis(200)
+        } else if step_index == self.llama_status_step.saturating_sub(1) {
+            Duration::from_millis(300)
+        } else if step_index == self.model_step {
+            Duration::from_millis(100)
+        } else if step_index > self.model_step {
+            Duration::from_millis(350)
+        } else {
+            Duration::from_millis(180)
         }
     }
 
@@ -432,6 +506,26 @@ impl SplashScreen {
         let total_chars: usize = LOGO_MAIN.iter().map(|l| l.len()).sum();
         self.logo_visible_chars = total_chars;
         self.phase = SplashPhase::Complete;
+    }
+
+    fn visible_download(&self) -> Option<DownloadStatus> {
+        let state = self.daemon_state_rx.as_ref()?.borrow().clone();
+        state
+            .downloads
+            .iter()
+            .find(|download| download.phase == DownloadPhase::Downloading)
+            .cloned()
+            .or_else(|| {
+                state
+                    .downloads
+                    .iter()
+                    .find(|download| download.phase == DownloadPhase::Failed)
+                    .cloned()
+            })
+    }
+
+    fn has_active_download(&self) -> bool {
+        self.visible_download().is_some_and(|download| download.phase == DownloadPhase::Downloading)
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -549,17 +643,25 @@ impl SplashScreen {
             };
 
             if i <= self.current_step || step.done {
-                step_lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(icon, Style::default().fg(color)),
                     Span::styled(&step.label, Style::default().fg(p.muted)),
-                ]));
+                ];
+                if let Some(result) = step.result.as_deref() {
+                    spans.push(Span::styled(" ", Style::default().fg(p.dim)));
+                    spans.push(Span::styled(result, Style::default().fg(p.dim)));
+                }
+                step_lines.push(Line::from(spans));
             }
         }
         let steps_widget = Paragraph::new(step_lines);
         frame.render_widget(steps_widget, right_chunks[4]);
 
         // Bottom message
-        if self.phase == SplashPhase::Complete {
+        if let Some(download) = self.visible_download() {
+            let msg = Paragraph::new(download_lines(&download));
+            frame.render_widget(msg, right_chunks[5]);
+        } else if self.phase == SplashPhase::Complete {
             let msg = Paragraph::new(vec![
                 Line::from(Span::styled(
                     "  Daemon started. Earning $COMPUTE...",
@@ -580,7 +682,7 @@ impl SplashScreen {
         } else if !self.has_local_model && !self.stage_mode_enabled {
             let msg = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "  No model cached yet. Download one from Storage after startup.",
+                    "  No model cached yet. Download one from Models after startup.",
                     Style::default().fg(p.warning),
                 )),
                 Line::from(Span::styled("  [i] What is llama-server?", Style::default().fg(p.dim))),
@@ -592,6 +694,85 @@ impl SplashScreen {
 
 fn format_vram(vram_mb: u64) -> String {
     if vram_mb >= 1024 { format!("{}GB", vram_mb / 1024) } else { format!("{vram_mb}MB") }
+}
+
+fn format_gb(value: f64) -> String {
+    if value >= 10.0 { format!("{value:.0}GB") } else { format!("{value:.1}GB") }
+}
+
+fn download_lines(download: &DownloadStatus) -> Vec<Line<'static>> {
+    let p = theme::palette();
+    match download.phase {
+        DownloadPhase::Downloading => {
+            let progress = download
+                .total_bytes
+                .filter(|total| *total > 0)
+                .map(|total| download.downloaded_bytes as f64 / total as f64)
+                .unwrap_or(0.0)
+                .clamp(0.0, 0.995);
+            vec![
+                Line::from(Span::styled(
+                    format!("  Downloading model: {}", download.model_id),
+                    Style::default().fg(p.warning),
+                )),
+                Line::from(Span::styled(
+                    format!(
+                        "  {} {:>3.0}% {}",
+                        progress_bar(progress, 18),
+                        progress * 100.0,
+                        format_download_size(download)
+                    ),
+                    Style::default().fg(p.muted),
+                )),
+                Line::from(Span::styled(
+                    "  Enter opens dashboard; download continues.",
+                    Style::default().fg(p.dim),
+                )),
+            ]
+        }
+        DownloadPhase::Failed => vec![
+            Line::from(Span::styled(
+                format!("  Model download failed: {}", download.model_id),
+                Style::default().fg(p.danger),
+            )),
+            Line::from(Span::styled(
+                format!("  {}", download.error.as_deref().unwrap_or("unknown error")),
+                Style::default().fg(p.dim),
+            )),
+            Line::from(Span::styled(
+                "  Open Models after startup to retry.",
+                Style::default().fg(p.dim),
+            )),
+        ],
+        DownloadPhase::Complete => vec![Line::from(Span::styled(
+            format!("  Model downloaded: {}", download.model_id),
+            Style::default().fg(p.success),
+        ))],
+    }
+}
+
+fn progress_bar(progress: f64, width: usize) -> String {
+    let filled = (progress * width as f64).round() as usize;
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "#".repeat(filled), "-".repeat(empty))
+}
+
+fn format_download_size(download: &DownloadStatus) -> String {
+    let downloaded = format_bytes(download.downloaded_bytes);
+    match download.total_bytes {
+        Some(total) if total > 0 => format!("{downloaded}/{}", format_bytes(total)),
+        _ => downloaded,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GB: f64 = 1_073_741_824.0;
+    const MB: f64 = 1_048_576.0;
+    if bytes >= 1_073_741_824 {
+        format!("{:.1}GB", bytes as f64 / GB)
+    } else {
+        format!("{:.0}MB", bytes as f64 / MB)
+    }
 }
 
 /// Fetch the total node count from the orchestrator. Returns 0 on failure.

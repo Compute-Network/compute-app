@@ -104,10 +104,10 @@ fn print_timings(label: &str, timings: &RemoteStageTimings) {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let draft_path = PathBuf::from(
-        args.next()
-            .context("usage: spec_gateway_probe <draft.gguf> [target.gguf] [prompt] [max_tokens]")?,
-    );
+    let draft_path =
+        PathBuf::from(args.next().context(
+            "usage: spec_gateway_probe <draft.gguf> [target.gguf] [prompt] [max_tokens]",
+        )?);
     let target_path = args.next().map(PathBuf::from).unwrap_or_else(default_gemma_model_path);
     let prompt = args.next().unwrap_or_else(|| "The capital of France is".to_string());
     let max_tokens: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(48);
@@ -115,12 +115,10 @@ fn main() -> Result<()> {
     // Per-stage overrides (for testing with reindexed shard GGUFs, where each
     // shard has its own layer range 0..N-1). Fall back to target_path so the
     // single-file path still works.
-    let head_model_path = std::env::var("HEAD_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| target_path.clone());
-    let tail_model_path = std::env::var("TAIL_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| target_path.clone());
+    let head_model_path =
+        std::env::var("HEAD_MODEL").map(PathBuf::from).unwrap_or_else(|_| target_path.clone());
+    let tail_model_path =
+        std::env::var("TAIL_MODEL").map(PathBuf::from).unwrap_or_else(|_| target_path.clone());
 
     if !draft_path.exists() {
         bail!("draft model not found: {}", draft_path.display());
@@ -144,7 +142,8 @@ fn main() -> Result<()> {
     let head_start: u32 =
         std::env::var("HEAD_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let head_end: u32 = std::env::var("HEAD_END").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
-    let tail_start: u32 = std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(21);
+    let tail_start: u32 =
+        std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(21);
     let tail_end: u32 = std::env::var("TAIL_END").ok().and_then(|s| s.parse().ok()).unwrap_or(41);
 
     let stage_node_bin = current_profile_bin("llama_stage_tcp_node")?;
@@ -184,9 +183,8 @@ fn main() -> Result<()> {
     let mut baseline_gw = RemoteStageGateway::connect(head.addr(), tail.addr(), false)
         .context("connect baseline gateway")?;
     let t0 = Instant::now();
-    let baseline = baseline_gw
-        .complete("baseline-1", &prompt, max_tokens)
-        .context("baseline complete")?;
+    let baseline =
+        baseline_gw.complete("baseline-1", &prompt, max_tokens).context("baseline complete")?;
     let baseline_elapsed = t0.elapsed().as_secs_f64();
     let baseline_tps = baseline.completion_tokens as f64 / baseline_elapsed;
     eprintln!(
@@ -230,9 +228,7 @@ fn main() -> Result<()> {
         );
     }
     let t1 = Instant::now();
-    let spec = spec_gw
-        .complete("spec-1", &prompt, max_tokens)
-        .context("spec complete")?;
+    let spec = spec_gw.complete("spec-1", &prompt, max_tokens).context("spec complete")?;
     let spec_elapsed = t1.elapsed().as_secs_f64();
     let spec_tps = spec.completion_tokens as f64 / spec_elapsed;
     eprintln!(
@@ -250,9 +246,7 @@ fn main() -> Result<()> {
     // near-tied logit positions, so we tolerate occasional divergence and
     // measure how closely the two paths track instead of demanding identity.
     let n = baseline.token_ids.len().min(spec.token_ids.len());
-    let agree = (0..n)
-        .take_while(|&i| baseline.token_ids[i] == spec.token_ids[i])
-        .count();
+    let agree = (0..n).take_while(|&i| baseline.token_ids[i] == spec.token_ids[i]).count();
     let agree_pct = if n > 0 { agree * 100 / n } else { 0 };
     eprintln!(
         "[probe] prefix agreement: {agree}/{n} ({agree_pct}%) tokens identical before divergence"

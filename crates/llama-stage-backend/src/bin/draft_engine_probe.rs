@@ -15,8 +15,10 @@ use std::time::Instant;
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let draft_path = PathBuf::from(args.next().context("usage: probe <draft.gguf> <target.gguf> [prompt] [k]")?);
-    let target_path = PathBuf::from(args.next().context("usage: probe <draft.gguf> <target.gguf> [prompt] [k]")?);
+    let draft_path =
+        PathBuf::from(args.next().context("usage: probe <draft.gguf> <target.gguf> [prompt] [k]")?);
+    let target_path =
+        PathBuf::from(args.next().context("usage: probe <draft.gguf> <target.gguf> [prompt] [k]")?);
     let prompt = args.next().unwrap_or_else(|| "The capital of France is".to_string());
     let k: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(8);
 
@@ -52,27 +54,19 @@ fn main() -> Result<()> {
     let step_ms = step_t.elapsed().as_millis();
     let per_token_ms = step_ms as f64 / k as f64;
 
-    println!(
-        "draft prefill_ms={prefill_ms} step_ms={step_ms} per_token_ms={per_token_ms:.2}"
-    );
+    println!("draft prefill_ms={prefill_ms} step_ms={step_ms} per_token_ms={per_token_ms:.2}");
     println!("draft token ids: {draft_ids:?}");
 
     // Compare against the target's full greedy completion of the same prompt.
     let target_t = Instant::now();
     let target = greedy_single_node_completion(&target_path, &prompt, k)?;
     let target_ms = target_t.elapsed().as_millis();
-    println!(
-        "target full_ms={target_ms} per_token_ms={:.2}",
-        target_ms as f64 / k as f64
-    );
+    println!("target full_ms={target_ms} per_token_ms={:.2}", target_ms as f64 / k as f64);
     println!("target token ids: {:?}", target.token_ids);
     println!("target text: {:?}", target.text);
 
-    let matches = draft_ids
-        .iter()
-        .zip(target.token_ids.iter())
-        .take_while(|(a, b)| **a == **b)
-        .count();
+    let matches =
+        draft_ids.iter().zip(target.token_ids.iter()).take_while(|(a, b)| **a == **b).count();
     println!(
         "[result] {matches}/{} draft tokens match target prefix ({}%)",
         draft_ids.len(),

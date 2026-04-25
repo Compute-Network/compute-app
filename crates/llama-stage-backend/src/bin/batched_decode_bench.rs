@@ -23,10 +23,8 @@ fn main() -> Result<()> {
 
     // Total decoded tokens stays constant across configs so we compare the
     // same amount of *work* under different batch shapes.
-    let total_tokens: usize = std::env::var("TOTAL_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(32);
+    let total_tokens: usize =
+        std::env::var("TOTAL_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(32);
     let prompt = "The capital of France is";
 
     for &batch_size in &[1usize, 2, 4, 8, 16] {

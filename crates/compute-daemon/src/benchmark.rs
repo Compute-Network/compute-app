@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::hardware::{GpuBackend, HardwareInfo};
+
 /// Results from a full node benchmark.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkResults {
@@ -17,6 +19,28 @@ pub struct BenchmarkResults {
     pub upload_speed_mbps: Option<f64>,
     pub disk_read_mbps: f64,
     pub estimated_tflops_fp16: f64,
+}
+
+/// Fast startup assessment used by the native app splash screen and scheduler
+/// metadata. This deliberately avoids heavyweight timed benchmarks so startup
+/// stays instant; the score is derived from detected hardware plus known GPU
+/// estimates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupAssessment {
+    pub score: u8,
+    pub tier: String,
+    pub assigned_model_id: String,
+    pub assigned_model_label: String,
+    pub split_capable: bool,
+    pub split_role: String,
+    pub split_model_id: Option<String>,
+    pub split_model_label: Option<String>,
+    pub split_reason: String,
+    pub estimated_tflops_fp16: f64,
+    pub estimated_memory_bandwidth_gbps: f64,
+    pub usable_accelerator_memory_mb: u64,
+    pub gpu_backend: String,
+    pub gpu_label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +81,285 @@ pub struct PathBenchmarkSuite {
     pub direct_temp: PathBenchmarkResult,
     pub daemon_local: PathBenchmarkResult,
     pub orchestrator: PathBenchmarkResult,
+}
+
+pub fn assess_node_startup(hw: &HardwareInfo) -> StartupAssessment {
+    let gpu = hw.gpus.first();
+    let backend = gpu.map(|g| &g.backend).unwrap_or(&GpuBackend::Cpu);
+    let gpu_label = gpu.map(|g| g.name.clone()).unwrap_or_else(|| "CPU".into());
+    let gpu_backend = match backend {
+        GpuBackend::Cuda => "cuda",
+        GpuBackend::Metal => "metal",
+        GpuBackend::Cpu => "cpu",
+    }
+    .to_string();
+
+    let raw_vram_mb = gpu.map(|g| g.vram_mb).unwrap_or(0);
+    let usable_accelerator_memory_mb = usable_accelerator_memory_mb(hw, backend, raw_vram_mb);
+    let estimated_tflops_fp16 =
+        gpu.map(|g| estimate_tflops(&g.name, g.vram_mb)).unwrap_or_default();
+    let estimated_memory_bandwidth_gbps =
+        estimate_memory_bandwidth_gbps(hw, backend, estimated_tflops_fp16);
+
+    let score = startup_score(
+        backend,
+        usable_accelerator_memory_mb,
+        estimated_tflops_fp16,
+        estimated_memory_bandwidth_gbps,
+        hw.cpu.threads,
+        hw.disk.available_gb,
+    );
+    let tier = capability_tier(score).to_string();
+    let (assigned_model_id, assigned_model_label) =
+        assigned_model_for_node(backend, usable_accelerator_memory_mb, estimated_tflops_fp16);
+    let (split_capable, split_role, split_reason) = split_assessment(
+        backend,
+        usable_accelerator_memory_mb,
+        estimated_tflops_fp16,
+        estimated_memory_bandwidth_gbps,
+    );
+    let (split_model_id, split_model_label) = if split_capable {
+        (
+            Some("gemma-4-e4b-q4".to_string()),
+            catalog_model_label("gemma-4-e4b-q4").map(str::to_string),
+        )
+    } else {
+        (None, None)
+    };
+
+    StartupAssessment {
+        score,
+        tier,
+        assigned_model_id,
+        assigned_model_label,
+        split_capable,
+        split_role,
+        split_model_id,
+        split_model_label,
+        split_reason,
+        estimated_tflops_fp16,
+        estimated_memory_bandwidth_gbps,
+        usable_accelerator_memory_mb,
+        gpu_backend,
+        gpu_label,
+    }
+}
+
+fn usable_accelerator_memory_mb(hw: &HardwareInfo, backend: &GpuBackend, raw_vram_mb: u64) -> u64 {
+    match backend {
+        GpuBackend::Cuda => raw_vram_mb,
+        GpuBackend::Metal => {
+            let total_memory_mb = (hw.memory.total_gb.max(0.0) * 1024.0) as u64;
+            let unified_mb = raw_vram_mb.min(total_memory_mb);
+            // Keep enough unified memory free for the OS, browser, and daemon.
+            ((unified_mb as f64) * 0.72) as u64
+        }
+        GpuBackend::Cpu => {
+            let available_mb = (hw.memory.available_gb.max(0.0) * 1024.0) as u64;
+            ((available_mb as f64) * 0.55) as u64
+        }
+    }
+}
+
+fn startup_score(
+    backend: &GpuBackend,
+    usable_mem_mb: u64,
+    tflops: f64,
+    memory_bandwidth_gbps: f64,
+    threads: usize,
+    disk_available_gb: f64,
+) -> u8 {
+    let mut score: f64 = match backend {
+        GpuBackend::Cuda | GpuBackend::Metal => 22.0,
+        GpuBackend::Cpu => 4.0,
+    };
+
+    score += match usable_mem_mb {
+        32_000.. => 26.0,
+        22_000.. => 23.0,
+        16_000.. => 19.0,
+        8_000.. => 13.0,
+        5_000.. => 8.0,
+        2_000.. => 4.0,
+        _ => 0.0,
+    };
+
+    score += if tflops >= 40.0 {
+        22.0
+    } else if tflops >= 14.0 {
+        18.0
+    } else if tflops >= 7.0 {
+        14.0
+    } else if tflops >= 3.0 {
+        9.0
+    } else if tflops > 0.0 {
+        4.0
+    } else {
+        0.0
+    };
+
+    score += if memory_bandwidth_gbps >= 500.0 {
+        15.0
+    } else if memory_bandwidth_gbps >= 200.0 {
+        12.0
+    } else if memory_bandwidth_gbps >= 100.0 {
+        8.0
+    } else if memory_bandwidth_gbps >= 40.0 {
+        4.0
+    } else {
+        0.0
+    };
+
+    score += match threads {
+        16.. => 8.0,
+        12.. => 7.0,
+        8.. => 5.0,
+        4.. => 3.0,
+        _ => 1.0,
+    };
+
+    if disk_available_gb >= 80.0 {
+        score += 7.0;
+    } else if disk_available_gb >= 40.0 {
+        score += 4.0;
+    } else if disk_available_gb >= 20.0 {
+        score += 2.0;
+    }
+
+    score.round().clamp(0.0, 100.0) as u8
+}
+
+fn capability_tier(score: u8) -> &'static str {
+    match score {
+        85..=100 => "ultra",
+        70..=84 => "plus",
+        50..=69 => "standard",
+        30..=49 => "lite",
+        _ => "cpu-only",
+    }
+}
+
+fn assigned_model_for_node(
+    backend: &GpuBackend,
+    usable_mem_mb: u64,
+    tflops: f64,
+) -> (String, String) {
+    let model_id = match backend {
+        GpuBackend::Metal | GpuBackend::Cuda if usable_mem_mb >= 22_000 && tflops >= 4.0 => {
+            "qwen-3.6"
+        }
+        GpuBackend::Metal | GpuBackend::Cuda if usable_mem_mb >= 8_000 && tflops >= 3.0 => {
+            "gemma-4-e4b-q4"
+        }
+        GpuBackend::Metal | GpuBackend::Cuda if usable_mem_mb >= 5_000 => "mistral-7b-q4",
+        _ => "gemma-3-270m-q4-draft",
+    };
+
+    let label = catalog_model_label(model_id).unwrap_or(model_id).to_string();
+    (model_id.to_string(), label)
+}
+
+fn split_assessment(
+    backend: &GpuBackend,
+    usable_mem_mb: u64,
+    tflops: f64,
+    memory_bandwidth_gbps: f64,
+) -> (bool, String, String) {
+    let has_accelerator = matches!(backend, GpuBackend::Cuda | GpuBackend::Metal);
+    if !has_accelerator {
+        return (false, "single-node only".into(), "no GPU acceleration detected".into());
+    }
+    if usable_mem_mb < 6_000 {
+        return (
+            false,
+            "single-node only".into(),
+            format!("{} usable accelerator memory", format_mb(usable_mem_mb)),
+        );
+    }
+    if tflops < 3.0 {
+        return (
+            false,
+            "single-node only".into(),
+            format!("{tflops:.1} estimated FP16 TFLOPS"),
+        );
+    }
+
+    let role = if usable_mem_mb >= 20_000 && memory_bandwidth_gbps >= 120.0 && tflops >= 6.0 {
+        "head/tail candidate"
+    } else if tflops >= 7.0 && memory_bandwidth_gbps >= 90.0 {
+        "head candidate"
+    } else {
+        "tail candidate"
+    };
+
+    (
+        true,
+        role.into(),
+        format!(
+            "{} usable · {tflops:.1} TFLOPS · {:.0} GB/s memory",
+            format_mb(usable_mem_mb),
+            memory_bandwidth_gbps
+        ),
+    )
+}
+
+fn estimate_memory_bandwidth_gbps(hw: &HardwareInfo, backend: &GpuBackend, tflops: f64) -> f64 {
+    let gpu_name = hw.gpus.first().map(|g| g.name.to_lowercase()).unwrap_or_default();
+
+    if matches!(backend, GpuBackend::Metal) {
+        if gpu_name.contains("ultra") {
+            return 800.0;
+        }
+        if gpu_name.contains("max") {
+            return 400.0;
+        }
+        if gpu_name.contains("pro") {
+            return 150.0;
+        }
+        return 100.0;
+    }
+
+    if matches!(backend, GpuBackend::Cuda) {
+        if gpu_name.contains("h100") {
+            return 3350.0;
+        }
+        if gpu_name.contains("a100") {
+            return 1555.0;
+        }
+        if gpu_name.contains("4090") {
+            return 1008.0;
+        }
+        if gpu_name.contains("3090") {
+            return 936.0;
+        }
+        if gpu_name.contains("4080") {
+            return 716.0;
+        }
+        if gpu_name.contains("3080") {
+            return 760.0;
+        }
+        if gpu_name.contains("4070") {
+            return 504.0;
+        }
+        return (tflops * 18.0).clamp(120.0, 700.0);
+    }
+
+    let thread_factor = hw.cpu.threads.max(1) as f64;
+    (18.0 + thread_factor * 2.0).clamp(20.0, 80.0)
+}
+
+fn catalog_model_label(model_id: &str) -> Option<&'static str> {
+    match model_id {
+        "qwen-3.6" => Some("Qwen 3.6 35B-A3B"),
+        "gemma-4-e4b-q4" => Some("Gemma 4 E4B Q4"),
+        "mistral-7b-q4" => Some("Mistral 7B Q4"),
+        "gemma-3-270m-q4-draft" => Some("Gemma 3 270M utility"),
+        _ => None,
+    }
+}
+
+fn format_mb(mb: u64) -> String {
+    if mb >= 1024 { format!("{:.1}GB", mb as f64 / 1024.0) } else { format!("{mb}MB") }
 }
 
 /// Run a CPU benchmark (simple computation throughput).

@@ -54,6 +54,8 @@ fn main() -> Result<()> {
         default_panic(info);
     }));
 
+    restore_plain_terminal_for_cli();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -83,6 +85,32 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn restore_plain_terminal_for_cli() {
+    if !(std::io::stdin().is_terminal()
+        || std::io::stdout().is_terminal()
+        || std::io::stderr().is_terminal())
+    {
+        return;
+    }
+
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+    let _ = crossterm::execute!(
+        std::io::stderr(),
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+    let _ = crossterm::terminal::disable_raw_mode();
+
+    #[cfg(unix)]
+    if std::io::stdin().is_terminal() {
+        let _ = std::process::Command::new("stty").arg("sane").status();
+    }
 }
 
 fn cmd_start() -> Result<()> {
@@ -122,7 +150,12 @@ fn cmd_start() -> Result<()> {
     compute_daemon::logging::init(true)?;
     daemon::write_pid()?;
 
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+    if !config.wallet.public_address.is_empty() && !config.wallet.node_token.is_empty() {
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(register_node_orchestrator(&config));
+        config = Config::load()?;
+    }
     let runtime = compute_daemon::runtime::DaemonRuntime::new(config.clone());
 
     println!("\n  Daemon started (PID: {})", std::process::id());
@@ -132,11 +165,6 @@ fn cmd_start() -> Result<()> {
     // Run the daemon event loop
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        // Register with orchestrator on startup
-        if !config.wallet.public_address.is_empty() && !config.wallet.node_token.is_empty() {
-            register_node_orchestrator(&config).await;
-        }
-
         if let Err(e) = runtime.run().await {
             eprintln!("Daemon error: {e}");
         }
@@ -821,13 +849,14 @@ fn print_path_result(result: &compute_daemon::benchmark::PathBenchmarkResult) {
 
 fn start_managed_benchmark_daemon()
 -> Result<Option<(Arc<compute_daemon::runtime::DaemonRuntime>, std::thread::JoinHandle<()>)>> {
-    let config = Config::load()?;
+    let mut config = Config::load()?;
     if config.wallet.public_address.is_empty() || config.wallet.node_token.is_empty() {
         return Ok(None);
     }
 
     let reg_rt = tokio::runtime::Runtime::new()?;
     reg_rt.block_on(register_node_orchestrator(&config));
+    config = Config::load()?;
 
     let runtime = Arc::new(compute_daemon::runtime::DaemonRuntime::new(config));
     let runtime_for_thread = Arc::clone(&runtime);
@@ -1168,7 +1197,16 @@ fn cmd_uninstall() -> Result<()> {
 
     // Stop daemon if running
     println!("  Stopping daemon...");
-    let _ = cmd_stop();
+    if let Err(e) = daemon::stop_daemon() {
+        let message = e.to_string();
+        if message.contains("stale PID file removed") || message.contains("no PID file") {
+            println!("  Daemon was not running.");
+        } else {
+            println!("  Warning: could not stop daemon: {e}");
+        }
+    } else {
+        println!("  Daemon stopped.");
+    }
 
     // Uninstall service if installed
     if compute_daemon::service::is_service_installed() {
@@ -1186,7 +1224,8 @@ fn cmd_uninstall() -> Result<()> {
 
     println!();
     println!("  Compute uninstalled.");
-    println!("  To also remove the binary: rm $(which compute)");
+    println!("  To also remove the binary:");
+    println!("    bin=$(command -v compute) && rm \"$bin\"");
     println!();
     Ok(())
 }

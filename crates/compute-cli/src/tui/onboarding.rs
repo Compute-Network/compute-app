@@ -462,7 +462,7 @@ impl OnboardingScreen {
             )),
             Line::from(Span::styled(
                 format!(
-                    "  Keep awake while Compute runs: {}  [C to toggle]",
+                    "  Prevent sleep: {}  [C to toggle]",
                     if self.caffeinate_when_running { "On" } else { "Off" }
                 ),
                 Style::default().fg(p.warning),

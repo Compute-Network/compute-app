@@ -8,6 +8,7 @@ pub struct Config {
     pub wallet: WalletConfig,
     pub network: NetworkConfig,
     pub docker: DockerConfig,
+    #[serde(default, skip_serializing)]
     pub logging: LoggingConfig,
     #[serde(default)]
     pub appearance: AppearanceConfig,
@@ -77,7 +78,7 @@ pub struct ModelsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentalConfig {
-    #[serde(default)]
+    #[serde(default = "default_true", skip_serializing)]
     pub stage_mode_enabled: bool,
     #[serde(default = "default_stage_backend")]
     pub stage_backend: String,
@@ -150,6 +151,24 @@ impl Default for ModelsConfig {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self { theme: default_theme() }
+    }
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        let compute_dir = config_dir()
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .or_else(|| std::env::var("USERPROFILE").ok())
+                    .map(|h| PathBuf::from(h).join(".compute"))
+            })
+            .unwrap_or_else(|| PathBuf::from("/tmp/.compute"));
+        Self {
+            level: "debug".into(),
+            file: compute_dir.join("logs").join("compute.log").to_string_lossy().into_owned(),
+            max_size_mb: 100,
+        }
     }
 }
 
@@ -236,11 +255,7 @@ impl Default for Config {
                 socket: default_docker_socket(),
                 image_cache_dir: compute_dir.join("images").to_string_lossy().into_owned(),
             },
-            logging: LoggingConfig {
-                level: "info".into(),
-                file: compute_dir.join("logs").join("compute.log").to_string_lossy().into_owned(),
-                max_size_mb: 100,
-            },
+            logging: LoggingConfig::default(),
             appearance: AppearanceConfig::default(),
             models: ModelsConfig {
                 cache_dir: compute_dir.join("models").to_string_lossy().into_owned(),
@@ -260,8 +275,12 @@ impl Config {
         }
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&contents).with_context(|| "Failed to parse config.toml")?;
+        // Stage mode is no longer user-configurable. Keep accepting the old
+        // key for existing config files, but never let a stale `false` disable
+        // split/stage inference.
+        config.experimental.stage_mode_enabled = true;
         Ok(config)
     }
 
@@ -302,13 +321,9 @@ impl Config {
             "network.orchestrator_url" => Some(self.network.orchestrator_url.clone()),
             "network.region" => Some(self.network.region.clone()),
             "network.advertise_host" => Some(self.network.advertise_host.clone()),
-            "logging.level" => Some(self.logging.level.clone()),
             "appearance.theme" => Some(self.appearance.theme.clone()),
             "models.active_model" => Some(self.models.active_model.clone()),
             "models.auto_download" => Some(self.models.auto_download.to_string()),
-            "experimental.stage_mode_enabled" => {
-                Some(self.experimental.stage_mode_enabled.to_string())
-            }
             "experimental.stage_backend" => Some(self.experimental.stage_backend.clone()),
             "experimental.stage_gateway_addr" => Some(self.experimental.stage_gateway_addr.clone()),
             "experimental.stage_gateway_autostart" => {
@@ -354,22 +369,16 @@ impl Config {
             "node.idle_threshold_minutes" => self.node.idle_threshold_minutes = value.parse()?,
             "node.pause_on_battery" => self.node.pause_on_battery = value.parse()?,
             "node.pause_on_fullscreen" => self.node.pause_on_fullscreen = value.parse()?,
-            "node.caffeinate_when_running" => {
-                self.node.caffeinate_when_running = value.parse()?
-            }
+            "node.caffeinate_when_running" => self.node.caffeinate_when_running = value.parse()?,
             "wallet.public_address" => self.wallet.public_address = value.to_string(),
             "wallet.node_id" => self.wallet.node_id = value.to_string(),
             "wallet.node_token" => self.wallet.node_token = value.to_string(),
             "network.orchestrator_url" => self.network.orchestrator_url = value.to_string(),
             "network.region" => self.network.region = value.to_string(),
             "network.advertise_host" => self.network.advertise_host = value.to_string(),
-            "logging.level" => self.logging.level = value.to_string(),
             "appearance.theme" => self.appearance.theme = value.to_string(),
             "models.active_model" => self.models.active_model = value.to_string(),
             "models.auto_download" => self.models.auto_download = value.parse()?,
-            "experimental.stage_mode_enabled" => {
-                self.experimental.stage_mode_enabled = value.parse()?
-            }
             "experimental.stage_backend" => self.experimental.stage_backend = value.to_string(),
             "experimental.stage_gateway_addr" => {
                 self.experimental.stage_gateway_addr = value.to_string()
@@ -492,7 +501,7 @@ mod tests {
         assert!(config.wallet.public_address.is_empty());
         assert_eq!(config.network.orchestrator_url, "https://api.computenetwork.sh");
         assert_eq!(config.network.region, "auto");
-        assert_eq!(config.logging.level, "info");
+        assert_eq!(config.logging.level, "debug");
         assert!(config.models.auto_download);
         assert_eq!(config.experimental.stage_acceleration, "auto");
         assert_eq!(config.experimental.stage_acceleration_provider, "auto");

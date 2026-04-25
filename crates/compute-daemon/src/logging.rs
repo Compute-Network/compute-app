@@ -7,7 +7,11 @@ use crate::config;
 ///
 /// Logs go to both stderr (for interactive use) and a file (for daemon mode).
 pub fn init(to_file: bool) -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "compute_cli=debug,compute_daemon=debug,compute_network=debug,llama_stage_backend=debug,stage_forward_lab=debug,info",
+        )
+    });
 
     if to_file {
         let logs_dir = config::logs_dir()?;

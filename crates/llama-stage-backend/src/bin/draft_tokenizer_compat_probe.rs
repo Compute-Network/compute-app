@@ -24,7 +24,8 @@ const SAMPLES: &[&str] = &[
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let target_path = PathBuf::from(args.next().context("usage: probe <target.gguf> <draft.gguf>")?);
+    let target_path =
+        PathBuf::from(args.next().context("usage: probe <target.gguf> <draft.gguf>")?);
     let draft_path = PathBuf::from(args.next().context("usage: probe <target.gguf> <draft.gguf>")?);
 
     if !target_path.exists() {
@@ -49,7 +50,8 @@ fn main() -> Result<()> {
         let t_ids = target.tokenize(sample)?;
         let d_ids = draft.tokenize(sample)?;
         let identical = t_ids == d_ids;
-        let is_chat_template = sample.contains("<start_of_turn>") || sample.contains("<end_of_turn>");
+        let is_chat_template =
+            sample.contains("<start_of_turn>") || sample.contains("<end_of_turn>");
 
         if is_chat_template {
             chat_template_total += 1;

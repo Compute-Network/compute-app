@@ -22,10 +22,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() -> Result<()> {
-    let model_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_gemma_model_path);
+    let model_path =
+        std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(default_gemma_model_path);
     if !model_path.exists() {
         bail!("model not found: {}", model_path.display());
     }
@@ -34,22 +32,18 @@ fn main() -> Result<()> {
     // Match production split: 42 layers total, head 0..=20, tail 21..=41.
     // Override via env if needed.
     let head_end: u32 = std::env::var("HEAD_END").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
-    let tail_start: u32 = std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(21);
+    let tail_start: u32 =
+        std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(21);
     let tail_end: u32 = std::env::var("TAIL_END").ok().and_then(|s| s.parse().ok()).unwrap_or(41);
 
-    eprintln!(
-        "[bench] split: head 0..={head_end}, tail {tail_start}..={tail_end}"
-    );
+    eprintln!("[bench] split: head 0..={head_end}, tail {tail_start}..={tail_end}");
 
-    let prompt = std::env::var("PROMPT")
-        .unwrap_or_else(|_| "The capital of France is".to_string());
+    let prompt = std::env::var("PROMPT").unwrap_or_else(|_| "The capital of France is".to_string());
 
     // Total decoded tokens stays constant across batch configs so per-token
     // numbers compare equal amounts of work.
-    let total_tokens: usize = std::env::var("TOTAL_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
+    let total_tokens: usize =
+        std::env::var("TOTAL_TOKENS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
 
     eprintln!("[bench] prompt={prompt:?} total_decoded_tokens={total_tokens}");
 
@@ -77,7 +71,8 @@ fn main() -> Result<()> {
 
     let request_id = "bench-1".to_string();
     let head_tensor = head.continue_head_tokens(&request_id, prompt_tokens.clone(), Some(64))?;
-    let tail_tensor = tail.continue_forward_with_tokens(head_tensor, prompt_tokens.clone(), false)?;
+    let tail_tensor =
+        tail.continue_forward_with_tokens(head_tensor, prompt_tokens.clone(), false)?;
     drop(tail_tensor); // discard prefill output; we only need KV state
 
     // The seed token for decode must be a valid id; use the last prompt token
@@ -89,9 +84,7 @@ fn main() -> Result<()> {
     let probe = head.continue_head_tokens(&request_id, vec![seed_token], None)?;
     let hidden_dim = probe.hidden_dim;
     let probe_bytes_per_token = probe.bytes.len();
-    eprintln!(
-        "[bench] hidden_dim={hidden_dim} bytes_per_token={probe_bytes_per_token}"
-    );
+    eprintln!("[bench] hidden_dim={hidden_dim} bytes_per_token={probe_bytes_per_token}");
 
     // Send the probe through tail to keep both KV caches in sync (and discard).
     let _ = tail.continue_forward_with_tokens(probe, vec![seed_token], false)?;
@@ -102,14 +95,7 @@ fn main() -> Result<()> {
 
     println!();
     println!("=== TAIL (decode_tail) ===");
-    bench_tail(
-        &head,
-        &tail,
-        &request_id,
-        seed_token,
-        total_tokens,
-        &[1, 2, 4, 8],
-    )?;
+    bench_tail(&head, &tail, &request_id, seed_token, total_tokens, &[1, 2, 4, 8])?;
 
     Ok(())
 }

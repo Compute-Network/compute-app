@@ -259,11 +259,7 @@ impl LlamaApi {
 
         let mut deps = Vec::new();
         for path in dylibs.iter().filter(|path| *path != &llama_path) {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
             // Only pre-load ggml family deps. Any stray libllama* file (e.g.
             // left behind by a previous install with a different ABI version)
             // is skipped — we already resolved the single libllama we want.
@@ -447,11 +443,7 @@ impl OwnedBatch {
     /// greedy-sample each candidate position to compare against the draft.
     /// Mirrors `token_and_hidden` (carries the token IDs as well) so the tail
     /// sees the same batch shape as in the production single-step path.
-    fn hidden_with_per_pos_logits(
-        tokens: Vec<i32>,
-        hidden: Vec<f32>,
-        token_count: usize,
-    ) -> Self {
+    fn hidden_with_per_pos_logits(tokens: Vec<i32>, hidden: Vec<f32>, token_count: usize) -> Self {
         let mut token_buf = tokens;
         let mut embd = hidden;
         let mut logits = vec![1i8; token_count];
@@ -467,12 +459,7 @@ impl OwnedBatch {
             logits: logits.as_mut_ptr(),
         };
 
-        Self {
-            _tokens: Some(token_buf),
-            _embd: Some(embd),
-            _logits: Some(logits),
-            raw,
-        }
+        Self { _tokens: Some(token_buf), _embd: Some(embd), _logits: Some(logits), raw }
     }
 }
 
@@ -564,14 +551,36 @@ pub struct GreedyCompletion {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum StageNodeRequest {
     Info,
-    Tokenize { text: String },
-    BeginPrompt { request_id: String, prompt: String, max_tokens: Option<u32> },
-    ContinueHeadTokens { request_id: String, token_ids: Vec<i32>, max_tokens: Option<u32> },
-    ContinueForward { tensor: StageTensor },
-    ContinueForwardTokens { tensor: StageTensor, token_ids: Vec<i32>, clear_memory: bool },
-    SampleTail { tensor: StageTensor },
-    SampleTailToken { tensor: StageTensor },
-    ClearDecodeSession { request_id: String },
+    Tokenize {
+        text: String,
+    },
+    BeginPrompt {
+        request_id: String,
+        prompt: String,
+        max_tokens: Option<u32>,
+    },
+    ContinueHeadTokens {
+        request_id: String,
+        token_ids: Vec<i32>,
+        max_tokens: Option<u32>,
+    },
+    ContinueForward {
+        tensor: StageTensor,
+    },
+    ContinueForwardTokens {
+        tensor: StageTensor,
+        token_ids: Vec<i32>,
+        clear_memory: bool,
+    },
+    SampleTail {
+        tensor: StageTensor,
+    },
+    SampleTailToken {
+        tensor: StageTensor,
+    },
+    ClearDecodeSession {
+        request_id: String,
+    },
     // Speculative decoding (spec_decode_v1). Head produces `draft_k` candidate
     // tokens via a small draft model, then runs the head stage of the target
     // model on those tokens in a single batched forward. Returns the stacked
@@ -595,7 +604,10 @@ pub enum StageNodeRequest {
     },
     // KV-cache rollback after partial draft acceptance. `keep_count` is the
     // number of token positions to retain from the start of the sequence.
-    RollbackKv { request_id: String, keep_count: u32 },
+    RollbackKv {
+        request_id: String,
+        keep_count: u32,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -669,8 +681,12 @@ pub struct StageNodeProfile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StageNodeResponse {
-    Info { info: StageNodeInfo },
-    TokenIds { token_ids: Vec<i32> },
+    Info {
+        info: StageNodeInfo,
+    },
+    TokenIds {
+        token_ids: Vec<i32>,
+    },
     // `tail_sample` is populated when the tail stage produces a token as a
     // side-effect of the decode (i.e. on ContinueForwardTokens / BeginPrompt
     // that lands on the tail). It lets the gateway skip a separate
@@ -684,8 +700,12 @@ pub enum StageNodeResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile: Option<StageNodeProfile>,
     },
-    Sample { sample: StageSample },
-    TokenSample { sample: GreedyTokenSample },
+    Sample {
+        sample: StageSample,
+    },
+    TokenSample {
+        sample: GreedyTokenSample,
+    },
     // Result of ContinueForwardVerifyK. `accepted_count` is the number of
     // draft tokens that matched the target's prediction (0..=draft_k).
     // `accepted_token_ids` has length accepted_count + 1: the accepted draft
@@ -708,7 +728,9 @@ pub enum StageNodeResponse {
         profile: Option<StageNodeProfile>,
     },
     Ack,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -964,13 +986,7 @@ impl Default for SpecDecodeConfig {
         // 92% accept rate, 5 spec rounds for 48 tokens, 2.88× over baseline. k=24 hits
         // a Metal kernel cliff (tail decode jumps 13ms → 158ms per round); k=8 leaves
         // a third of the win on the table.
-        Self {
-            enabled: true,
-            start_k: 4,
-            min_k: 1,
-            max_k: 16,
-            disable_after_consec_zero: 3,
-        }
+        Self { enabled: true, start_k: 4, min_k: 1, max_k: 16, disable_after_consec_zero: 3 }
     }
 }
 
@@ -1310,7 +1326,7 @@ impl LlamaStageBackend {
         let floats = unsafe { slice::from_raw_parts(ptr, token_count * hidden_dim) };
         if env::var_os("LLAMA_STAGE_DUMP_HIDDEN").is_some() {
             let n = 8.min(floats.len());
-            eprintln!(
+            tracing::debug!(
                 "[llama-stage] HEAD_EMIT request={} token_count={} hidden_dim={} first{}={:?}",
                 request_id,
                 token_count,
@@ -1321,9 +1337,8 @@ impl LlamaStageBackend {
         }
         let pack_started = Instant::now();
         let byte_len = std::mem::size_of_val(floats);
-        let bytes = unsafe {
-            slice::from_raw_parts(floats.as_ptr() as *const u8, byte_len).to_vec()
-        };
+        let bytes =
+            unsafe { slice::from_raw_parts(floats.as_ptr() as *const u8, byte_len).to_vec() };
         let pack_elapsed = pack_started.elapsed();
         let tensor_pack_ms = pack_elapsed.as_millis() as u64;
         let tensor_pack_us = pack_elapsed.as_micros() as u64;
@@ -1446,19 +1461,16 @@ impl LlamaStageBackend {
         let floats = unsafe {
             slice::from_raw_parts(input.bytes.as_ptr() as *const f32, float_count).to_vec()
         };
-        Ok((
-            floats,
-            {
-                let unpack_elapsed = unpack_started.elapsed();
-                StageNodeProfile {
-                    tensor_unpack_ms: unpack_elapsed.as_millis() as u64,
-                    tensor_unpack_us: unpack_elapsed.as_micros() as u64,
-                    hidden_bytes: input.bytes.len(),
-                    token_count,
-                    ..StageNodeProfile::default()
-                }
-            },
-        ))
+        Ok((floats, {
+            let unpack_elapsed = unpack_started.elapsed();
+            StageNodeProfile {
+                tensor_unpack_ms: unpack_elapsed.as_millis() as u64,
+                tensor_unpack_us: unpack_elapsed.as_micros() as u64,
+                hidden_bytes: input.bytes.len(),
+                token_count,
+                ..StageNodeProfile::default()
+            }
+        }))
     }
 
     fn forward_head_tokens_impl(
@@ -1524,9 +1536,14 @@ impl LlamaStageBackend {
 
         if env::var_os("LLAMA_STAGE_DUMP_HIDDEN").is_some() {
             let n = 8.min(hidden.len());
-            eprintln!(
+            tracing::debug!(
                 "[llama-stage] TAIL_RECV request={} stage={} token_count={} hidden_dim={} first{}={:?}",
-                input.request_id, layout.stage_id, token_count, input.hidden_dim, n, &hidden[..n]
+                input.request_id,
+                layout.stage_id,
+                token_count,
+                input.hidden_dim,
+                n,
+                &hidden[..n]
             );
         }
 
@@ -1802,10 +1819,7 @@ impl LlamaStageBackend {
         let mut state = self.state.borrow_mut();
         let layout = self.layout(&state)?.clone();
         if !layout.is_tail {
-            bail!(
-                "verify_batch_at_tail requires tail stage, got {}",
-                layout.stage_id
-            );
+            bail!("verify_batch_at_tail requires tail stage, got {}", layout.stage_id);
         }
 
         let model_handle = self.ensure_model(&mut state)?;
@@ -1819,10 +1833,7 @@ impl LlamaStageBackend {
         let expected_tokens = k + 1;
 
         if input.hidden_dim != hidden_dim {
-            bail!(
-                "hidden_dim mismatch: backend={hidden_dim}, tensor={}",
-                input.hidden_dim
-            );
+            bail!("hidden_dim mismatch: backend={hidden_dim}, tensor={}", input.hidden_dim);
         }
 
         let (hidden, unpack_profile) = Self::hidden_bytes_to_f32(&input)?;
@@ -1844,17 +1855,12 @@ impl LlamaStageBackend {
 
         let n_pos_before = session_state.n_pos;
 
-        let batch_tokens: Vec<i32> = std::iter::once(last_token)
-            .chain(draft_tokens.iter().copied())
-            .collect();
+        let batch_tokens: Vec<i32> =
+            std::iter::once(last_token).chain(draft_tokens.iter().copied()).collect();
         let batch = OwnedBatch::hidden_with_per_pos_logits(batch_tokens, hidden, expected_tokens);
         let decode_started = Instant::now();
         let rc = unsafe {
-            (self.api.decode_tail)(
-                session_state.session.ctx,
-                batch.raw,
-                layout.start_layer as i32,
-            )
+            (self.api.decode_tail)(session_state.session.ctx, batch.raw, layout.start_layer as i32)
         };
         let tail_decode_kernel_us = decode_started.elapsed().as_micros() as u64;
         if rc != 0 && rc != 1 {
@@ -1899,8 +1905,7 @@ impl LlamaStageBackend {
 
         let sample_at = |pos: usize| -> Result<i32> {
             let logits = unsafe { slice::from_raw_parts(logit_ptrs[pos], n_vocab) };
-            let (token_id, _) =
-                argmax_f32(logits).context("empty logits at verify position")?;
+            let (token_id, _) = argmax_f32(logits).context("empty logits at verify position")?;
             Ok(token_id as i32)
         };
 
@@ -2011,10 +2016,7 @@ impl LlamaStageBackend {
         let session_state = self.ensure_session(&mut state, request_id)?;
         let keep = keep_count as i32;
         if keep > session_state.n_pos {
-            bail!(
-                "rollback keep_count={keep} exceeds current n_pos={}",
-                session_state.n_pos
-            );
+            bail!("rollback keep_count={keep} exceeds current n_pos={}", session_state.n_pos);
         }
         if keep == session_state.n_pos {
             return Ok(());
@@ -2278,7 +2280,7 @@ fn connect_stage_node_with_retry(
         match RemoteStageNodeClient::connect(addr) {
             Ok(client) => {
                 if attempt > 1 {
-                    eprintln!("[gateway] connected to {addr} after {attempt} attempts");
+                    tracing::info!("[gateway] connected to {addr} after {attempt} attempts");
                 }
                 return Ok(client);
             }
@@ -2290,13 +2292,11 @@ fn connect_stage_node_with_retry(
                     .unwrap_or(false)
                     || err.to_string().contains("Connection refused");
                 if !is_refused || now >= deadline {
-                    return Err(err.context(format!(
-                        "connecting to {addr} (attempt {attempt})"
-                    )));
+                    return Err(err.context(format!("connecting to {addr} (attempt {attempt})")));
                 }
                 std::thread::sleep(Duration::from_millis(500));
                 if attempt % 10 == 0 {
-                    eprintln!(
+                    tracing::info!(
                         "[gateway] waiting for {addr} (attempt {attempt}, {:?} remaining)",
                         deadline.saturating_duration_since(now)
                     );
@@ -2334,7 +2334,7 @@ impl RemoteStagePair {
             // (e.g., both report 0..N-1). The decode functions only need each
             // shard's own local indices, so a non-contiguous report is fine
             // as long as the model_ids and hidden dims line up.
-            eprintln!(
+            tracing::info!(
                 "[gateway] note: head/tail layer ranges not contiguous in advertised indices: {}-{} then {}-{} (assuming per-stage shards)",
                 head_info.start_layer,
                 head_info.end_layer,
@@ -2392,23 +2392,27 @@ impl RemoteStagePair {
 
         let prompt_tokens_count = prompt_tokens.len() as u32;
         let t_head = std::time::Instant::now();
-        let ((mut head_tensor, head_profile), head_rpc) = match self
-            .head
-            .request_profiled(&StageNodeRequest::BeginPrompt {
+        let ((mut head_tensor, head_profile), head_rpc) =
+            match self.head.request_profiled(&StageNodeRequest::BeginPrompt {
                 request_id: request_id.clone(),
                 prompt: prompt.to_string(),
                 max_tokens: Some(max_tokens),
             })? {
-            (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => {
-                ((tensor.context("direct head begin missing tensor")?, profile.unwrap_or_default()), rpc)
-            }
-            (other, _) => bail!("expected tensor response, got {other:?}"),
-        };
+                (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => (
+                    (
+                        tensor.context("direct head begin missing tensor")?,
+                        profile.unwrap_or_default(),
+                    ),
+                    rpc,
+                ),
+                (other, _) => bail!("expected tensor response, got {other:?}"),
+            };
         let head_prefill_elapsed = t_head.elapsed();
         let head_prefill_ms = head_prefill_elapsed.as_millis() as u64;
         let head_prefill_us = head_prefill_elapsed.as_micros() as u64;
         let transfer_bytes = head_tensor.bytes.len();
-        let mut total_transfer_bytes = transfer_bytes + head_rpc.raw_request_bytes + head_rpc.raw_response_bytes;
+        let mut total_transfer_bytes =
+            transfer_bytes + head_rpc.raw_request_bytes + head_rpc.raw_response_bytes;
         let head_hidden_bytes_prefill = head_profile.hidden_bytes;
         let mut head_hidden_bytes_decode = 0usize;
         let mut head_pack_ms_total = head_profile.tensor_pack_ms;
@@ -2439,18 +2443,17 @@ impl RemoteStagePair {
 
         let t_tail = std::time::Instant::now();
         let head_tensor_for_tail = head_tensor.clone();
-        let ((mut tail_tensor, mut pending_sample, tail_profile), tail_rpc) = match self
-            .tail
-            .request_profiled(&StageNodeRequest::ContinueForwardTokens {
+        let ((mut tail_tensor, mut pending_sample, tail_profile), tail_rpc) =
+            match self.tail.request_profiled(&StageNodeRequest::ContinueForwardTokens {
                 tensor: head_tensor_for_tail,
                 token_ids: prompt_tokens,
                 clear_memory: true,
             })? {
-            (StageNodeResponse::Tensor { tensor, tail_sample, profile }, rpc) => {
-                ((tensor, tail_sample, profile.unwrap_or_default()), rpc)
-            }
-            (other, _) => bail!("expected tensor response, got {other:?}"),
-        };
+                (StageNodeResponse::Tensor { tensor, tail_sample, profile }, rpc) => {
+                    ((tensor, tail_sample, profile.unwrap_or_default()), rpc)
+                }
+                (other, _) => bail!("expected tensor response, got {other:?}"),
+            };
         let tail_prefill_elapsed = t_tail.elapsed();
         let mut tail_decode_ms_total = tail_prefill_elapsed.as_millis() as u64;
         let mut tail_decode_us_total = tail_prefill_elapsed.as_micros() as u64;
@@ -2503,9 +2506,10 @@ impl RemoteStagePair {
                 let tail_tensor_ref = tail_tensor
                     .clone()
                     .context("session tail tensor unavailable for sample fallback")?;
-                let (response, rpc) = self.tail.request_profiled(&StageNodeRequest::SampleTailToken {
-                    tensor: tail_tensor_ref.clone(),
-                })?;
+                let (response, rpc) =
+                    self.tail.request_profiled(&StageNodeRequest::SampleTailToken {
+                        tensor: tail_tensor_ref.clone(),
+                    })?;
                 total_transfer_bytes +=
                     tail_tensor_ref.bytes.len() + rpc.raw_request_bytes + rpc.raw_response_bytes;
                 stage_request_json_encode_ms += rpc.request_json_encode_ms;
@@ -2534,23 +2538,27 @@ impl RemoteStagePair {
             }
 
             let t_head_step = std::time::Instant::now();
-            let ((new_head_tensor, head_profile), head_rpc) = match self
-                .head
-                .request_profiled(&StageNodeRequest::ContinueHeadTokens {
+            let ((new_head_tensor, head_profile), head_rpc) =
+                match self.head.request_profiled(&StageNodeRequest::ContinueHeadTokens {
                     request_id: request_id.clone(),
                     token_ids: vec![sampled.token_id],
                     max_tokens: Some(max_tokens),
                 })? {
-                (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => {
-                    ((tensor.context("head continue missing tensor")?, profile.unwrap_or_default()), rpc)
-                }
-                (other, _) => bail!("expected tensor response, got {other:?}"),
-            };
+                    (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => (
+                        (
+                            tensor.context("head continue missing tensor")?,
+                            profile.unwrap_or_default(),
+                        ),
+                        rpc,
+                    ),
+                    (other, _) => bail!("expected tensor response, got {other:?}"),
+                };
             head_tensor = new_head_tensor;
             let head_step_elapsed = t_head_step.elapsed();
             head_decode_ms_total += head_step_elapsed.as_millis() as u64;
             head_decode_us_total += head_step_elapsed.as_micros() as u64;
-            total_transfer_bytes += head_tensor.bytes.len() + head_rpc.raw_request_bytes + head_rpc.raw_response_bytes;
+            total_transfer_bytes +=
+                head_tensor.bytes.len() + head_rpc.raw_request_bytes + head_rpc.raw_response_bytes;
             head_hidden_bytes_decode += head_profile.hidden_bytes;
             head_pack_ms_total += head_profile.tensor_pack_ms;
             head_pack_us_total += head_profile.tensor_pack_us;
@@ -2573,18 +2581,17 @@ impl RemoteStagePair {
 
             let t_tail_step = std::time::Instant::now();
             let head_tensor_for_tail = head_tensor.clone();
-            let ((new_tail_tensor, new_pending, tail_profile), tail_rpc) = match self
-                .tail
-                .request_profiled(&StageNodeRequest::ContinueForwardTokens {
+            let ((new_tail_tensor, new_pending, tail_profile), tail_rpc) =
+                match self.tail.request_profiled(&StageNodeRequest::ContinueForwardTokens {
                     tensor: head_tensor_for_tail.clone(),
                     token_ids: vec![sampled.token_id],
                     clear_memory: false,
                 })? {
-                (StageNodeResponse::Tensor { tensor, tail_sample, profile }, rpc) => {
-                    ((tensor, tail_sample, profile.unwrap_or_default()), rpc)
-                }
-                (other, _) => bail!("expected tensor response, got {other:?}"),
-            };
+                    (StageNodeResponse::Tensor { tensor, tail_sample, profile }, rpc) => {
+                        ((tensor, tail_sample, profile.unwrap_or_default()), rpc)
+                    }
+                    (other, _) => bail!("expected tensor response, got {other:?}"),
+                };
             tail_tensor = new_tail_tensor;
             pending_sample = new_pending;
             let tail_step_elapsed = t_tail_step.elapsed();
@@ -2700,10 +2707,7 @@ impl RemoteStageGateway {
             reconnect_after_prompt,
             sessions: HashMap::new(),
             draft: None,
-            spec_config: SpecDecodeConfig {
-                enabled: false,
-                ..SpecDecodeConfig::default()
-            },
+            spec_config: SpecDecodeConfig { enabled: false, ..SpecDecodeConfig::default() },
         })
     }
 
@@ -2786,19 +2790,21 @@ impl RemoteStageGateway {
         };
 
         let t_head = std::time::Instant::now();
-        let ((head_tensor, head_profile), head_rpc) = match self
-            .pair
-            .head
-            .request_profiled(&StageNodeRequest::BeginPrompt {
+        let ((head_tensor, head_profile), head_rpc) =
+            match self.pair.head.request_profiled(&StageNodeRequest::BeginPrompt {
                 request_id: request_id.to_string(),
                 prompt: prompt.to_string(),
                 max_tokens: Some(max_tokens),
             })? {
-            (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => {
-                ((tensor.context("gateway begin head tensor missing")?, profile.unwrap_or_default()), rpc)
-            }
-            (other, _) => bail!("expected tensor response, got {other:?}"),
-        };
+                (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => (
+                    (
+                        tensor.context("gateway begin head tensor missing")?,
+                        profile.unwrap_or_default(),
+                    ),
+                    rpc,
+                ),
+                (other, _) => bail!("expected tensor response, got {other:?}"),
+            };
         let head_prefill_elapsed = t_head.elapsed();
         let head_prefill_ms = head_prefill_elapsed.as_millis() as u64;
         let head_prefill_us = head_prefill_elapsed.as_micros() as u64;
@@ -2841,23 +2847,22 @@ impl RemoteStageGateway {
 
         let t_tail = std::time::Instant::now();
         let head_tensor_for_tail = head_tensor.clone();
-        let ((tail_tensor, pending_tail_sample, tail_profile), tail_rpc) = match self
-            .pair
-            .tail
-            .request_profiled(&StageNodeRequest::ContinueForwardTokens {
+        let ((tail_tensor, pending_tail_sample, tail_profile), tail_rpc) =
+            match self.pair.tail.request_profiled(&StageNodeRequest::ContinueForwardTokens {
                 tensor: head_tensor_for_tail,
                 token_ids: prompt_tokens.clone(),
                 clear_memory: true,
             })? {
-            (StageNodeResponse::Tensor { tensor, tail_sample, profile }, rpc) => {
-                ((tensor, tail_sample, profile.unwrap_or_default()), rpc)
-            }
-            (other, _) => bail!("expected tensor response, got {other:?}"),
-        };
+                (StageNodeResponse::Tensor { tensor, tail_sample, profile }, rpc) => {
+                    ((tensor, tail_sample, profile.unwrap_or_default()), rpc)
+                }
+                (other, _) => bail!("expected tensor response, got {other:?}"),
+            };
         let tail_prefill_elapsed = t_tail.elapsed();
         let tail_decode_ms = tail_prefill_elapsed.as_millis() as u64;
         let tail_decode_us = tail_prefill_elapsed.as_micros() as u64;
-        total_transfer_bytes += head_tensor.bytes.len() + tail_rpc.raw_request_bytes + tail_rpc.raw_response_bytes;
+        total_transfer_bytes +=
+            head_tensor.bytes.len() + tail_rpc.raw_request_bytes + tail_rpc.raw_response_bytes;
         tail_unpack_ms += tail_profile.tensor_unpack_ms;
         tail_unpack_us += tail_profile.tensor_unpack_us;
         stage_request_json_encode_ms += tail_rpc.request_json_encode_ms;
@@ -2890,10 +2895,7 @@ impl RemoteStageGateway {
             // Prime the draft engine with prompt[..n-1]; greedy_step_k() seeds
             // with the last prompt token on the first round so its logit is
             // computed against the full prompt context.
-            let draft = self
-                .draft
-                .as_mut()
-                .expect("spec_active() implies draft is Some");
+            let draft = self.draft.as_mut().expect("spec_active() implies draft is Some");
             draft.reset();
             if prompt_tokens.len() > 1 {
                 draft.prefill(&prompt_tokens[..prompt_tokens.len() - 1])?;
@@ -2996,9 +2998,10 @@ impl RemoteStageGateway {
                 .tail_tensor
                 .clone()
                 .context("tail tensor unavailable for sample fallback")?;
-            let (response, rpc) = self.pair.tail.request_profiled(&StageNodeRequest::SampleTailToken {
-                tensor: tail_tensor.clone(),
-            })?;
+            let (response, rpc) =
+                self.pair.tail.request_profiled(&StageNodeRequest::SampleTailToken {
+                    tensor: tail_tensor.clone(),
+                })?;
             session.timings.total_transfer_bytes +=
                 tail_tensor.bytes.len() + rpc.raw_request_bytes + rpc.raw_response_bytes;
             session.timings.stage_request_json_encode_ms += rpc.request_json_encode_ms;
@@ -3081,19 +3084,21 @@ impl RemoteStageGateway {
         last_token: i32,
     ) -> Result<()> {
         let t_head = std::time::Instant::now();
-        let ((new_head_tensor, head_profile), head_rpc) = match self
-            .pair
-            .head
-            .request_profiled(&StageNodeRequest::ContinueHeadTokens {
+        let ((new_head_tensor, head_profile), head_rpc) =
+            match self.pair.head.request_profiled(&StageNodeRequest::ContinueHeadTokens {
                 request_id: request_id.to_string(),
                 token_ids: vec![last_token],
                 max_tokens: Some(session.max_tokens),
             })? {
-            (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => {
-                ((tensor.context("single-step head tensor missing")?, profile.unwrap_or_default()), rpc)
-            }
-            (other, _) => bail!("expected tensor response, got {other:?}"),
-        };
+                (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => (
+                    (
+                        tensor.context("single-step head tensor missing")?,
+                        profile.unwrap_or_default(),
+                    ),
+                    rpc,
+                ),
+                (other, _) => bail!("expected tensor response, got {other:?}"),
+            };
         session.head_n_pos += 1;
         let head_step_elapsed = t_head.elapsed();
         session.timings.head_decode_ms += head_step_elapsed.as_millis() as u64;
@@ -3111,37 +3116,40 @@ impl RemoteStageGateway {
         session.timings.stage_request_write_us += head_rpc.request_write_us;
         session.timings.stage_response_read_ms += head_rpc.response_read_ms;
         session.timings.stage_response_read_us += head_rpc.response_read_us;
-        session.timings.stage_server_request_json_decode_ms += head_profile.server_request_json_decode_ms;
-        session.timings.stage_server_request_json_decode_us += head_profile.server_request_json_decode_us;
+        session.timings.stage_server_request_json_decode_ms +=
+            head_profile.server_request_json_decode_ms;
+        session.timings.stage_server_request_json_decode_us +=
+            head_profile.server_request_json_decode_us;
         session.timings.stage_server_handle_ms += head_profile.server_handle_ms;
         session.timings.stage_server_handle_us += head_profile.server_handle_us;
-        session.timings.stage_server_response_json_encode_ms += head_profile.server_response_json_encode_ms;
-        session.timings.stage_server_response_json_encode_us += head_profile.server_response_json_encode_us;
+        session.timings.stage_server_response_json_encode_ms +=
+            head_profile.server_response_json_encode_ms;
+        session.timings.stage_server_response_json_encode_us +=
+            head_profile.server_response_json_encode_us;
         session.timings.stage_server_response_write_ms += head_profile.server_response_write_ms;
         session.timings.stage_server_response_write_us += head_profile.server_response_write_us;
 
         let t_tail = std::time::Instant::now();
         let head_tensor_for_tail = new_head_tensor.clone();
-        let ((new_tail_tensor, new_pending, tail_profile), tail_rpc) = match self
-            .pair
-            .tail
-            .request_profiled(&StageNodeRequest::ContinueForwardTokens {
+        let ((new_tail_tensor, new_pending, tail_profile), tail_rpc) =
+            match self.pair.tail.request_profiled(&StageNodeRequest::ContinueForwardTokens {
                 tensor: head_tensor_for_tail,
                 token_ids: vec![last_token],
                 clear_memory: false,
             })? {
-            (StageNodeResponse::Tensor { tensor, tail_sample, profile }, rpc) => {
-                ((tensor, tail_sample, profile.unwrap_or_default()), rpc)
-            }
-            (other, _) => bail!("expected tensor response, got {other:?}"),
-        };
+                (StageNodeResponse::Tensor { tensor, tail_sample, profile }, rpc) => {
+                    ((tensor, tail_sample, profile.unwrap_or_default()), rpc)
+                }
+                (other, _) => bail!("expected tensor response, got {other:?}"),
+            };
         session.head_tensor = new_head_tensor;
         session.pending_tail_sample = new_pending;
         session.tail_tensor = new_tail_tensor;
         let tail_step_elapsed = t_tail.elapsed();
         session.timings.tail_decode_ms += tail_step_elapsed.as_millis() as u64;
         session.timings.tail_decode_us += tail_step_elapsed.as_micros() as u64;
-        let tail_tensor_bytes = session.tail_tensor.as_ref().map(|tensor| tensor.bytes.len()).unwrap_or(0);
+        let tail_tensor_bytes =
+            session.tail_tensor.as_ref().map(|tensor| tensor.bytes.len()).unwrap_or(0);
         session.timings.total_transfer_bytes +=
             tail_tensor_bytes + tail_rpc.raw_request_bytes + tail_rpc.raw_response_bytes;
         session.timings.tail_unpack_ms += tail_profile.tensor_unpack_ms;
@@ -3154,12 +3162,16 @@ impl RemoteStageGateway {
         session.timings.stage_request_write_us += tail_rpc.request_write_us;
         session.timings.stage_response_read_ms += tail_rpc.response_read_ms;
         session.timings.stage_response_read_us += tail_rpc.response_read_us;
-        session.timings.stage_server_request_json_decode_ms += tail_profile.server_request_json_decode_ms;
-        session.timings.stage_server_request_json_decode_us += tail_profile.server_request_json_decode_us;
+        session.timings.stage_server_request_json_decode_ms +=
+            tail_profile.server_request_json_decode_ms;
+        session.timings.stage_server_request_json_decode_us +=
+            tail_profile.server_request_json_decode_us;
         session.timings.stage_server_handle_ms += tail_profile.server_handle_ms;
         session.timings.stage_server_handle_us += tail_profile.server_handle_us;
-        session.timings.stage_server_response_json_encode_ms += tail_profile.server_response_json_encode_ms;
-        session.timings.stage_server_response_json_encode_us += tail_profile.server_response_json_encode_us;
+        session.timings.stage_server_response_json_encode_ms +=
+            tail_profile.server_response_json_encode_ms;
+        session.timings.stage_server_response_json_encode_us +=
+            tail_profile.server_response_json_encode_us;
         session.timings.stage_server_response_write_ms += tail_profile.server_response_write_ms;
         session.timings.stage_server_response_write_us += tail_profile.server_response_write_us;
         Ok(())
@@ -3171,15 +3183,10 @@ impl RemoteStageGateway {
         session: &mut GatewaySessionState,
         last_token: i32,
     ) -> Result<()> {
-        let k = session
-            .current_k
-            .max(self.spec_config.min_k)
-            .min(self.spec_config.max_k);
+        let k = session.current_k.max(self.spec_config.min_k).min(self.spec_config.max_k);
 
-        let draft = self
-            .draft
-            .as_mut()
-            .expect("run_spec_round invoked while spec_active() is true");
+        let draft =
+            self.draft.as_mut().expect("run_spec_round invoked while spec_active() is true");
         let draft_pos_before = draft.current_pos();
         let draft_started = Instant::now();
         let drafts = draft.greedy_step_k(last_token, k)?;
@@ -3194,19 +3201,18 @@ impl RemoteStageGateway {
         let head_n_pos_before = session.head_n_pos;
 
         let t_head = std::time::Instant::now();
-        let ((head_tensor, head_profile), head_rpc) = match self
-            .pair
-            .head
-            .request_profiled(&StageNodeRequest::ContinueHeadTokens {
+        let ((head_tensor, head_profile), head_rpc) =
+            match self.pair.head.request_profiled(&StageNodeRequest::ContinueHeadTokens {
                 request_id: request_id.to_string(),
                 token_ids: batch_tokens.clone(),
                 max_tokens: Some(session.max_tokens),
             })? {
-            (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => {
-                ((tensor.context("spec head tensor missing")?, profile.unwrap_or_default()), rpc)
-            }
-            (other, _) => bail!("expected tensor response, got {other:?}"),
-        };
+                (StageNodeResponse::Tensor { tensor, profile, .. }, rpc) => (
+                    (tensor.context("spec head tensor missing")?, profile.unwrap_or_default()),
+                    rpc,
+                ),
+                (other, _) => bail!("expected tensor response, got {other:?}"),
+            };
         session.head_n_pos += batch_tokens.len() as i32;
         let head_batch_elapsed = t_head.elapsed();
         session.timings.head_decode_ms += head_batch_elapsed.as_millis() as u64;
@@ -3224,12 +3230,16 @@ impl RemoteStageGateway {
         session.timings.stage_request_write_us += head_rpc.request_write_us;
         session.timings.stage_response_read_ms += head_rpc.response_read_ms;
         session.timings.stage_response_read_us += head_rpc.response_read_us;
-        session.timings.stage_server_request_json_decode_ms += head_profile.server_request_json_decode_ms;
-        session.timings.stage_server_request_json_decode_us += head_profile.server_request_json_decode_us;
+        session.timings.stage_server_request_json_decode_ms +=
+            head_profile.server_request_json_decode_ms;
+        session.timings.stage_server_request_json_decode_us +=
+            head_profile.server_request_json_decode_us;
         session.timings.stage_server_handle_ms += head_profile.server_handle_ms;
         session.timings.stage_server_handle_us += head_profile.server_handle_us;
-        session.timings.stage_server_response_json_encode_ms += head_profile.server_response_json_encode_ms;
-        session.timings.stage_server_response_json_encode_us += head_profile.server_response_json_encode_us;
+        session.timings.stage_server_response_json_encode_ms +=
+            head_profile.server_response_json_encode_ms;
+        session.timings.stage_server_response_json_encode_us +=
+            head_profile.server_response_json_encode_us;
         session.timings.stage_server_response_write_ms += head_profile.server_response_write_ms;
         session.timings.stage_server_response_write_us += head_profile.server_response_write_us;
 
@@ -3237,16 +3247,13 @@ impl RemoteStageGateway {
         let head_tensor_for_tail = head_tensor.clone();
         let head_tensor_bytes = head_tensor_for_tail.bytes.len();
         let ((accepted_count, accepted_token_ids, accepted_pieces, is_eog, tail_profile), tail_rpc) =
-            match self
-                .pair
-                .tail
-                .request_profiled(&StageNodeRequest::ContinueForwardVerifyK {
-                    request_id: request_id.to_string(),
-                    tensor: head_tensor_for_tail,
-                    last_token,
-                    draft_tokens: drafts.clone(),
-                    clear_memory: false,
-                })? {
+            match self.pair.tail.request_profiled(&StageNodeRequest::ContinueForwardVerifyK {
+                request_id: request_id.to_string(),
+                tensor: head_tensor_for_tail,
+                last_token,
+                draft_tokens: drafts.clone(),
+                clear_memory: false,
+            })? {
                 (
                     StageNodeResponse::VerifiedBatch {
                         accepted_count,
@@ -3288,12 +3295,16 @@ impl RemoteStageGateway {
         session.timings.stage_request_write_us += tail_rpc.request_write_us;
         session.timings.stage_response_read_ms += tail_rpc.response_read_ms;
         session.timings.stage_response_read_us += tail_rpc.response_read_us;
-        session.timings.stage_server_request_json_decode_ms += tail_profile.server_request_json_decode_ms;
-        session.timings.stage_server_request_json_decode_us += tail_profile.server_request_json_decode_us;
+        session.timings.stage_server_request_json_decode_ms +=
+            tail_profile.server_request_json_decode_ms;
+        session.timings.stage_server_request_json_decode_us +=
+            tail_profile.server_request_json_decode_us;
         session.timings.stage_server_handle_ms += tail_profile.server_handle_ms;
         session.timings.stage_server_handle_us += tail_profile.server_handle_us;
-        session.timings.stage_server_response_json_encode_ms += tail_profile.server_response_json_encode_ms;
-        session.timings.stage_server_response_json_encode_us += tail_profile.server_response_json_encode_us;
+        session.timings.stage_server_response_json_encode_ms +=
+            tail_profile.server_response_json_encode_ms;
+        session.timings.stage_server_response_json_encode_us +=
+            tail_profile.server_response_json_encode_us;
         session.timings.stage_server_response_write_ms += tail_profile.server_response_write_ms;
         session.timings.stage_server_response_write_us += tail_profile.server_response_write_us;
         session.timings.tail_decode_kernel_us += tail_profile.tail_decode_kernel_us;
@@ -3315,12 +3326,10 @@ impl RemoteStageGateway {
         let head_keep = head_n_pos_before + accepted_count as i32 + 1;
         if head_keep < session.head_n_pos {
             let rollback_started = Instant::now();
-            self.pair
-                .head
-                .request(&StageNodeRequest::RollbackKv {
-                    request_id: request_id.to_string(),
-                    keep_count: head_keep as u32,
-                })?;
+            self.pair.head.request(&StageNodeRequest::RollbackKv {
+                request_id: request_id.to_string(),
+                keep_count: head_keep as u32,
+            })?;
             let rollback_elapsed = rollback_started.elapsed();
             session.timings.spec_rollback_ms += rollback_elapsed.as_millis() as u64;
             session.timings.spec_rollback_us += rollback_elapsed.as_micros() as u64;
@@ -3362,17 +3371,11 @@ impl RemoteStageGateway {
         // calls can drain them without another forward pass. The very last id
         // is the bonus and carries `is_eog` for the round.
         let total = accepted_token_ids.len();
-        for (idx, (tid, piece)) in accepted_token_ids
-            .into_iter()
-            .zip(accepted_pieces.into_iter())
-            .enumerate()
+        for (idx, (tid, piece)) in
+            accepted_token_ids.into_iter().zip(accepted_pieces.into_iter()).enumerate()
         {
             let is_last = idx == total - 1;
-            let sample = GreedyTokenSample {
-                token_id: tid,
-                piece,
-                is_eog: is_last && is_eog,
-            };
+            let sample = GreedyTokenSample { token_id: tid, piece, is_eog: is_last && is_eog };
             if idx == 0 {
                 session.pending_tail_sample = Some(sample);
             } else {
@@ -3484,8 +3487,7 @@ pub fn handle_stage_node_request(
         }
         StageNodeRequest::ContinueForwardTokens { tensor, token_ids, clear_memory } => {
             let request_id = tensor.request_id.clone();
-            let tensor =
-                backend.continue_forward_with_tokens(tensor, token_ids, clear_memory)?;
+            let tensor = backend.continue_forward_with_tokens(tensor, token_ids, clear_memory)?;
             let tail_sample = backend.cached_tail_sample(&request_id);
             let profile = backend.last_profile(&request_id);
             let state = backend.state.borrow();
@@ -3693,20 +3695,12 @@ fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
         line.clear();
         let read = reader.read_line(&mut line)?;
         if read == 0 {
-            let tail = captured
-                .iter()
-                .rev()
-                .take(20)
-                .rev()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" | ");
+            let tail =
+                captured.iter().rev().take(20).rev().cloned().collect::<Vec<_>>().join(" | ");
             if tail.is_empty() {
                 bail!("child exited before announcing listening address (stderr was empty)");
             }
-            bail!(
-                "child exited before announcing listening address; last stderr lines: {tail}"
-            );
+            bail!("child exited before announcing listening address; last stderr lines: {tail}");
         }
         let trimmed = line.trim();
         if let Some(addr) = trimmed.strip_prefix("listening=") {
@@ -3719,7 +3713,7 @@ fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
             // it floods the TUI log panel.
             for prior in &captured {
                 if child_log_is_interesting(prior) {
-                    eprintln!("[child:{}] {}", addr, prior);
+                    forward_child_log_line(&addr, prior);
                 }
             }
             let forward = env::var_os("LLAMA_STAGE_FORWARD_STDERR").is_some();
@@ -3737,7 +3731,7 @@ fn read_listening_addr(stderr: ChildStderr) -> Result<String> {
                             // LLAMA_STAGE_FORWARD_STDERR=1 set.
                             let trimmed = buf.trim_end();
                             if forward || child_log_is_error(trimmed) {
-                                eprint!("[child:{}] {}", label, buf);
+                                forward_child_log_line(&label, trimmed);
                             }
                         }
                     }
@@ -3797,6 +3791,14 @@ fn child_log_is_error(line: &str) -> bool {
         "Segmentation fault",
     ];
     ERROR_NEEDLES.iter().any(|needle| line.contains(needle))
+}
+
+fn forward_child_log_line(label: &str, line: &str) {
+    if child_log_is_error(line) {
+        tracing::warn!("[child:{}] {}", label, line);
+    } else {
+        tracing::info!("[child:{}] {}", label, line);
+    }
 }
 
 struct ManagedServiceChild {
@@ -4185,7 +4187,7 @@ impl StageForwardBackend for LlamaStageBackend {
         let tokens = self.tokenize_prompt(model, prompt)?;
         drop(state);
         if Self::debug_flow_enabled() {
-            eprintln!(
+            tracing::debug!(
                 "[llama-stage] begin_prompt stage={} tokens={}",
                 layout.stage_id,
                 tokens.len()
@@ -4218,7 +4220,7 @@ impl StageForwardBackend for LlamaStageBackend {
             .context("no cached tail sample; call continue_forward first")?;
 
         if Self::debug_flow_enabled() {
-            eprintln!(
+            tracing::debug!(
                 "[llama-stage] sample_tail returning stage={} text={:?}",
                 layout.stage_id, cached.sample.text
             );
@@ -4241,7 +4243,12 @@ pub fn greedy_single_node_baseline(
     let backend = LlamaStageBackend {
         api,
         model_path,
-        state: RefCell::new(BackendState { layout: None, model: None, sessions: HashMap::new(), token_piece_cache: HashMap::new() }),
+        state: RefCell::new(BackendState {
+            layout: None,
+            model: None,
+            sessions: HashMap::new(),
+            token_piece_cache: HashMap::new(),
+        }),
     };
 
     let tokens = backend.tokenize_prompt(&model, prompt)?;
@@ -4271,7 +4278,12 @@ pub fn greedy_single_node_completion(
     let backend = LlamaStageBackend {
         api,
         model_path,
-        state: RefCell::new(BackendState { layout: None, model: None, sessions: HashMap::new(), token_piece_cache: HashMap::new() }),
+        state: RefCell::new(BackendState {
+            layout: None,
+            model: None,
+            sessions: HashMap::new(),
+            token_piece_cache: HashMap::new(),
+        }),
     };
 
     let prompt_tokens = backend.tokenize_prompt(&model, prompt)?;
@@ -4446,7 +4458,11 @@ mod wire_tests {
         };
         match round_trip_request(&req) {
             StageNodeRequest::ContinueForwardVerifyK {
-                request_id, tensor, last_token, draft_tokens, clear_memory,
+                request_id,
+                tensor,
+                last_token,
+                draft_tokens,
+                clear_memory,
             } => {
                 assert_eq!(request_id, "req-1");
                 assert_eq!(tensor.hidden_dim, 8);
@@ -4460,10 +4476,7 @@ mod wire_tests {
 
     #[test]
     fn rollback_kv_round_trips() {
-        let req = StageNodeRequest::RollbackKv {
-            request_id: "req-1".to_string(),
-            keep_count: 5,
-        };
+        let req = StageNodeRequest::RollbackKv { request_id: "req-1".to_string(), keep_count: 5 };
         match round_trip_request(&req) {
             StageNodeRequest::RollbackKv { request_id, keep_count } => {
                 assert_eq!(request_id, "req-1");
@@ -4489,7 +4502,11 @@ mod wire_tests {
         };
         match round_trip_response(&resp) {
             StageNodeResponse::VerifiedBatch {
-                accepted_count, accepted_token_ids, accepted_pieces, is_eog, profile,
+                accepted_count,
+                accepted_token_ids,
+                accepted_pieces,
+                is_eog,
+                profile,
             } => {
                 assert_eq!(accepted_count, 3);
                 assert_eq!(accepted_token_ids, vec![10, 20, 30, 99]);
@@ -4532,10 +4549,7 @@ mod wire_tests {
             profile: None,
         };
         let json = serde_json::to_string(&resp).expect("serialize");
-        assert!(
-            !json.contains("tail_sample"),
-            "tail_sample should be skipped when None: {json}"
-        );
+        assert!(!json.contains("tail_sample"), "tail_sample should be skipped when None: {json}");
         assert!(!json.contains("profile"), "profile should be skipped when None: {json}");
     }
 }
@@ -4654,8 +4668,7 @@ impl DraftEngine {
             bail!("draft logits null after decode");
         }
         let logits = unsafe { slice::from_raw_parts(logits, self.n_vocab) };
-        let (token_id, _) =
-            argmax_f32(logits).context("empty draft logits buffer")?;
+        let (token_id, _) = argmax_f32(logits).context("empty draft logits buffer")?;
         Ok(token_id as i32)
     }
 

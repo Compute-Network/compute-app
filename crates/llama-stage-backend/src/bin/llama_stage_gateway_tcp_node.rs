@@ -38,9 +38,8 @@ fn parse_args() -> Result<Args> {
             }
             "--reconnect-after-prompt" => reconnect_after_prompt = true,
             "--draft-model" => {
-                draft_model = Some(PathBuf::from(
-                    it.next().context("missing value for --draft-model")?,
-                ));
+                draft_model =
+                    Some(PathBuf::from(it.next().context("missing value for --draft-model")?));
             }
             other => bail!("unknown argument: {other}"),
         }
@@ -83,7 +82,8 @@ fn handle_stream(stream: TcpStream, gateway: &mut RemoteStageGateway) -> Result<
         };
 
         let response_bytes = rmp_serde::to_vec_named(&response)?;
-        let response_len = u32::try_from(response_bytes.len()).context("gateway response too large")?;
+        let response_len =
+            u32::try_from(response_bytes.len()).context("gateway response too large")?;
         writer.write_all(&response_len.to_le_bytes())?;
         writer.write_all(&response_bytes)?;
         writer.flush()?;

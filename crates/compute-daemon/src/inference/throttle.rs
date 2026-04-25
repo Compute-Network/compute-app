@@ -229,6 +229,7 @@ mod tests {
             idle_threshold_minutes: 5,
             pause_on_battery: true,
             pause_on_fullscreen: true,
+            caffeinate_when_running: true,
         };
         let controller = ThrottleController::new(config);
         assert_eq!(*controller.current_action(), ThrottleAction::FullSpeed);
@@ -244,6 +245,7 @@ mod tests {
             idle_threshold_minutes: 5,
             pause_on_battery: true,
             pause_on_fullscreen: true,
+            caffeinate_when_running: true,
         };
         let mut controller = ThrottleController::new(config);
 

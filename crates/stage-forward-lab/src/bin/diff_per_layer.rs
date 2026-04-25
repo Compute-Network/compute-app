@@ -13,16 +13,13 @@ fn read_bytes(path: &PathBuf, offset: u64, len: usize) -> Result<Vec<u8>> {
 }
 
 fn main() -> Result<()> {
-    let full = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| "/Users/macintosh/.compute/models/gemma-4-E4B-it-Q4_K_M.gguf".into()),
-    );
-    let tail = PathBuf::from(
-        std::env::args()
-            .nth(2)
-            .unwrap_or_else(|| "/Users/macintosh/.compute/stages/gemma-4-e4b-q4/tail-21-41.gguf".into()),
-    );
+    let full =
+        PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| {
+            "/Users/macintosh/.compute/models/gemma-4-E4B-it-Q4_K_M.gguf".into()
+        }));
+    let tail = PathBuf::from(std::env::args().nth(2).unwrap_or_else(|| {
+        "/Users/macintosh/.compute/stages/gemma-4-e4b-q4/tail-21-41.gguf".into()
+    }));
 
     let full_file = GgufFile::parse_file(&full)?;
     let tail_file = GgufFile::parse_file(&tail)?;
@@ -86,9 +83,15 @@ fn main() -> Result<()> {
     println!("tail == full second half? {}", second_match);
 
     if first_match {
-        println!("VERDICT: tail shard holds the HEAD half (rows 0..{}). Wrong slice.", tail_t.dimensions[1]);
+        println!(
+            "VERDICT: tail shard holds the HEAD half (rows 0..{}). Wrong slice.",
+            tail_t.dimensions[1]
+        );
     } else if second_match {
-        println!("VERDICT: tail shard holds the TAIL half (rows {}..{}). Correct slice.", tail_t.dimensions[1], full_t.dimensions[1]);
+        println!(
+            "VERDICT: tail shard holds the TAIL half (rows {}..{}). Correct slice.",
+            tail_t.dimensions[1], full_t.dimensions[1]
+        );
     } else {
         println!("VERDICT: tail shard does not match either half directly.");
     }

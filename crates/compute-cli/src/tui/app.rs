@@ -34,9 +34,10 @@ pub fn run_splash_then_dashboard() -> Result<()> {
 /// Run splash screen only (for `compute start`).
 pub fn run_splash_only() -> Result<()> {
     let hw = hardware::detect();
+    let assessment = compute_daemon::benchmark::assess_node_startup(&hw);
 
     let mut terminal = ratatui::init();
-    let mut splash = SplashScreen::new(&hw);
+    let mut splash = SplashScreen::new(&hw, assessment);
     let _ = splash.run(&mut terminal);
     ratatui::restore();
     Ok(())
@@ -58,6 +59,8 @@ fn run_inner(
     hw: hardware::HardwareInfo,
     config: &mut Config,
 ) -> Result<()> {
+    let assessment = compute_daemon::benchmark::assess_node_startup(&hw);
+
     // Check if wallet is configured — if not, show onboarding
     if config.wallet.public_address.is_empty() || config.wallet.node_token.is_empty() {
         let mut onboarding = OnboardingScreen::new();
@@ -67,10 +70,6 @@ fn run_inner(
                     *config = updated;
                 } else {
                     config.wallet.public_address = address;
-                }
-
-                if !config.wallet.node_token.is_empty() {
-                    register_node_async(config, &hw);
                 }
             }
             OnboardingResult::Skipped => {
@@ -82,6 +81,13 @@ fn run_inner(
 
     // Enable file logging so daemon output is captured
     let _ = compute_daemon::logging::init(true);
+
+    if !config.wallet.public_address.is_empty()
+        && !config.wallet.node_token.is_empty()
+        && config.wallet.node_id.is_empty()
+    {
+        register_node_blocking(config, &hw);
+    }
 
     // Start daemon runtime in background DURING splash so there's no lag on transition
     let daemon_config = config.clone();
@@ -102,7 +108,7 @@ fn run_inner(
     });
 
     // Show splash (daemon boots in parallel)
-    let mut splash = SplashScreen::new(&hw);
+    let mut splash = SplashScreen::new(&hw, assessment).with_daemon_state(state_rx.clone());
     let continue_to_dashboard = splash.run(terminal)?;
 
     if continue_to_dashboard {
@@ -140,6 +146,7 @@ pub async fn register_node_orchestrator(
         hardware::GpuBackend::Cpu => "cpu".to_string(),
     });
     let tflops = gpu.map(|g| compute_daemon::benchmark::estimate_tflops(&g.name, g.vram_mb));
+    let assessment = compute_daemon::benchmark::assess_node_startup(hw);
     let cpu_model = Some(hw.cpu.brand.clone());
     let cpu_cores = Some(hw.cpu.cores);
     let memory_mb = Some((hw.memory.total_gb * 1024.0) as u64);
@@ -165,15 +172,12 @@ pub async fn register_node_orchestrator(
         tflops_fp16: tflops,
         listen_port: Some(9090),
         ip_address,
-        pipeline_capable: Some(config.experimental.stage_mode_enabled),
-        memory_bandwidth_gbps: None,
+        pipeline_capable: Some(assessment.split_capable),
+        memory_bandwidth_gbps: Some(assessment.estimated_memory_bandwidth_gbps),
     };
 
     let node_id = client.register(&node).await?;
-    Ok(Some(NodeRegistrationResult {
-        node_id,
-        node_token: client.node_token().map(str::to_owned),
-    }))
+    Ok(Some(NodeRegistrationResult { node_id, node_token: client.node_token().map(str::to_owned) }))
 }
 
 fn detect_advertise_ip() -> Option<String> {
@@ -224,33 +228,27 @@ fn advertised_host(config: &Config) -> Option<String> {
     collect_advertise_ips().into_iter().next()
 }
 
-/// Register the node with the orchestrator. Fires and forgets — non-blocking.
-fn register_node_async(config: &Config, hw: &hardware::HardwareInfo) {
-    let config = config.clone();
-    let hw = hw.clone();
+fn register_node_blocking(config: &mut Config, hw: &hardware::HardwareInfo) {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    let Ok(rt) = rt else {
+        warn!("Failed to create runtime for node registration");
+        return;
+    };
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
-
-        if let Ok(rt) = rt {
-            rt.block_on(async {
-                match register_node_orchestrator(&config, &hw).await {
-                    Ok(Some(result)) => {
-                        tracing::info!("Node registered with orchestrator: {}", result.node_id);
-                        if let Ok(mut cfg) = Config::load() {
-                            cfg.wallet.node_id = result.node_id;
-                            if let Some(node_token) = result.node_token {
-                                cfg.wallet.node_token = node_token;
-                            }
-                            let _ = cfg.save();
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!("Failed to register node with orchestrator: {e}");
-                    }
-                }
-            });
+    match rt.block_on(register_node_orchestrator(config, hw)) {
+        Ok(Some(result)) => {
+            tracing::info!("Node registered with orchestrator: {}", result.node_id);
+            config.wallet.node_id = result.node_id;
+            if let Some(node_token) = result.node_token {
+                config.wallet.node_token = node_token;
+            }
+            if let Err(e) = config.save() {
+                warn!("Failed to save node registration to config: {e}");
+            }
         }
-    });
+        Ok(None) => {}
+        Err(e) => {
+            warn!("Failed to register node with orchestrator: {e}");
+        }
+    }
 }
