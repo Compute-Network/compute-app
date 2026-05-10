@@ -249,42 +249,36 @@ chmod +x "${TMPDIR}/compute"
 mv "${TMPDIR}/compute" "${INSTALL_DIR}/${BINARY_NAME}"
 echo "  ${GREEN}✓${RESET} Installed ${DIM}${BINARY_NAME}${RESET} to ${DIM}${INSTALL_DIR}${RESET}"
 
-BACKEND_INSTALLED=0
+(
+  if [ -f "${TMPDIR}/${STAGE_NODE_BINARY}" ]; then
+    chmod +x "${TMPDIR}/${STAGE_NODE_BINARY}"
+    mv "${TMPDIR}/${STAGE_NODE_BINARY}" "${INSTALL_DIR}/${STAGE_NODE_BINARY}"
+  fi
 
-if [ -f "${TMPDIR}/${STAGE_NODE_BINARY}" ]; then
-  chmod +x "${TMPDIR}/${STAGE_NODE_BINARY}"
-  mv "${TMPDIR}/${STAGE_NODE_BINARY}" "${INSTALL_DIR}/${STAGE_NODE_BINARY}"
-  BACKEND_INSTALLED=1
-fi
+  if [ -f "${TMPDIR}/${GATEWAY_BINARY}" ]; then
+    chmod +x "${TMPDIR}/${GATEWAY_BINARY}"
+    mv "${TMPDIR}/${GATEWAY_BINARY}" "${INSTALL_DIR}/${GATEWAY_BINARY}"
+  fi
 
-if [ -f "${TMPDIR}/${GATEWAY_BINARY}" ]; then
-  chmod +x "${TMPDIR}/${GATEWAY_BINARY}"
-  mv "${TMPDIR}/${GATEWAY_BINARY}" "${INSTALL_DIR}/${GATEWAY_BINARY}"
-  BACKEND_INSTALLED=1
-fi
+  # Clean up any dylibs/sos from a previous install — otherwise stale libllama
+  # variants with different ABI versions can be mistakenly loaded and crash the
+  # stage nodes with missing @rpath errors.
+  for stale in "${INSTALL_DIR}"/*.dylib "${INSTALL_DIR}"/*.so "${INSTALL_DIR}"/*.so.*; do
+    [ -e "$stale" ] || [ -L "$stale" ] || continue
+    rm -f "$stale"
+  done
 
-# Clean up any dylibs/sos from a previous install — otherwise stale libllama
-# variants with different ABI versions can be mistakenly loaded and crash the
-# stage nodes with missing @rpath errors.
-for stale in "${INSTALL_DIR}"/*.dylib "${INSTALL_DIR}"/*.so "${INSTALL_DIR}"/*.so.*; do
-  [ -e "$stale" ] || [ -L "$stale" ] || continue
-  rm -f "$stale"
-done
-
-# Move any bundled shared libraries (libllama.dylib / libggml.dylib / .so)
-# next to the binaries so the sidecars can dlopen them via @loader_path.
-# -e fails for broken symlinks (whose targets we already moved earlier in the
-# loop), so accept either an existing path or a symlink.
-for libfile in "${TMPDIR}"/*.dylib "${TMPDIR}"/*.so "${TMPDIR}"/*.so.*; do
-  [ -e "$libfile" ] || [ -L "$libfile" ] || continue
-  base=$(basename "$libfile")
-  mv "$libfile" "${INSTALL_DIR}/${base}"
-  BACKEND_INSTALLED=1
-done
-
-if [ "$BACKEND_INSTALLED" -eq 1 ]; then
-  echo "  ${GREEN}✓${RESET} Installed ${DIM}backend components${RESET}"
-fi
+  # Move any bundled shared libraries (libllama.dylib / libggml.dylib / .so)
+  # next to the binaries so the sidecars can dlopen them via @loader_path.
+  # -e fails for broken symlinks (whose targets we already moved earlier in the
+  # loop), so accept either an existing path or a symlink.
+  for libfile in "${TMPDIR}"/*.dylib "${TMPDIR}"/*.so "${TMPDIR}"/*.so.*; do
+    [ -e "$libfile" ] || [ -L "$libfile" ] || continue
+    base=$(basename "$libfile")
+    mv "$libfile" "${INSTALL_DIR}/${base}"
+  done
+) &
+spin "Installing LLM backend (this may take a while)" $!
 
 # Add to PATH if not already there
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
