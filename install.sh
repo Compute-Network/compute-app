@@ -249,16 +249,18 @@ chmod +x "${TMPDIR}/compute"
 mv "${TMPDIR}/compute" "${INSTALL_DIR}/${BINARY_NAME}"
 echo "  ${GREEN}✓${RESET} Installed ${DIM}${BINARY_NAME}${RESET} to ${DIM}${INSTALL_DIR}${RESET}"
 
+BACKEND_INSTALLED=0
+
 if [ -f "${TMPDIR}/${STAGE_NODE_BINARY}" ]; then
   chmod +x "${TMPDIR}/${STAGE_NODE_BINARY}"
   mv "${TMPDIR}/${STAGE_NODE_BINARY}" "${INSTALL_DIR}/${STAGE_NODE_BINARY}"
-  echo "  ${GREEN}✓${RESET} Installed ${DIM}${STAGE_NODE_BINARY}${RESET}"
+  BACKEND_INSTALLED=1
 fi
 
 if [ -f "${TMPDIR}/${GATEWAY_BINARY}" ]; then
   chmod +x "${TMPDIR}/${GATEWAY_BINARY}"
   mv "${TMPDIR}/${GATEWAY_BINARY}" "${INSTALL_DIR}/${GATEWAY_BINARY}"
-  echo "  ${GREEN}✓${RESET} Installed ${DIM}${GATEWAY_BINARY}${RESET}"
+  BACKEND_INSTALLED=1
 fi
 
 # Clean up any dylibs/sos from a previous install — otherwise stale libllama
@@ -277,8 +279,12 @@ for libfile in "${TMPDIR}"/*.dylib "${TMPDIR}"/*.so "${TMPDIR}"/*.so.*; do
   [ -e "$libfile" ] || [ -L "$libfile" ] || continue
   base=$(basename "$libfile")
   mv "$libfile" "${INSTALL_DIR}/${base}"
-  echo "  ${GREEN}✓${RESET} Installed ${DIM}${base}${RESET}"
+  BACKEND_INSTALLED=1
 done
+
+if [ "$BACKEND_INSTALLED" -eq 1 ]; then
+  echo "  ${GREEN}✓${RESET} Installed ${DIM}backend components${RESET}"
+fi
 
 # Add to PATH if not already there
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
@@ -310,7 +316,7 @@ fi
 OMLX_LOG="$HOME/.compute/logs/omlx-install.log"
 if [ "$OS" = "darwin" ] && [ "$ARCH" = "aarch64" ]; then
   if command -v omlx >/dev/null 2>&1; then
-    echo "  ${GREEN}✓${RESET} oMLX already installed ${DIM}($(command -v omlx))${RESET}"
+    :
   elif command -v brew >/dev/null 2>&1; then
     mkdir -p "$(dirname "$OMLX_LOG")"
     # Run brew inside `script -q /dev/null` so it writes to a fake PTY
@@ -340,9 +346,7 @@ fi
 # files (no silent permission errors) and surfaces the version so the
 # user can see at a glance whether they're on the latest tag.
 INSTALLED_VERSION=$("${INSTALL_DIR}/${BINARY_NAME}" --version 2>/dev/null || true)
-if [ -n "$INSTALLED_VERSION" ]; then
-  echo "  ${GREEN}✓${RESET} Verified ${DIM}${INSTALLED_VERSION}${RESET}"
-else
+if [ -z "$INSTALLED_VERSION" ]; then
   echo "  ${RED}✗${RESET} Could not run installed binary (--version failed)"
   echo "  ${DIM}Path: ${INSTALL_DIR}/${BINARY_NAME}${RESET}"
 fi
