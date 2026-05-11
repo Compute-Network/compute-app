@@ -12,7 +12,7 @@ use compute_network::client::{
 
 use super::dashboard::Dashboard;
 use super::onboarding::{OnboardingResult, OnboardingScreen};
-use super::splash::SplashScreen;
+use super::splash::{SplashScreen, UpdateGateOutcome};
 
 pub struct NodeRegistrationResult {
     pub node_id: String,
@@ -38,9 +38,16 @@ pub fn run_splash_only() -> Result<()> {
 
     let mut terminal = ratatui::init();
     let mut splash = SplashScreen::new(&hw, assessment);
-    if splash.run_update_gate(&mut terminal)? {
-        ratatui::restore();
-        return Ok(());
+    match splash.run_update_gate(&mut terminal)? {
+        UpdateGateOutcome::Continue => {}
+        UpdateGateOutcome::Exit => {
+            ratatui::restore();
+            return Ok(());
+        }
+        UpdateGateOutcome::Restart => {
+            ratatui::restore();
+            return relaunch_current_command();
+        }
     }
     let _ = splash.run(&mut terminal);
     ratatui::restore();
@@ -94,8 +101,10 @@ fn run_inner(
     }
 
     let mut splash = SplashScreen::new(&hw, assessment);
-    if splash.run_update_gate(terminal)? {
-        return Ok(());
+    match splash.run_update_gate(terminal)? {
+        UpdateGateOutcome::Continue => {}
+        UpdateGateOutcome::Exit => return Ok(()),
+        UpdateGateOutcome::Restart => return relaunch_current_command(),
     }
 
     // Start daemon runtime in background DURING splash so there's no lag on transition
@@ -131,6 +140,24 @@ fn run_inner(
     drop(daemon_handle);
 
     Ok(())
+}
+
+fn relaunch_current_command() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(exe).args(args).exec();
+        Err(err.into())
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::process::Command::new(exe).args(args).spawn()?;
+        std::process::exit(0);
+    }
 }
 
 /// Kill any llama-server processes we spawned on port 8090.

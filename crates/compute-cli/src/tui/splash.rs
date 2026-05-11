@@ -96,6 +96,13 @@ enum SplashPhase {
     Complete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateGateOutcome {
+    Continue,
+    Exit,
+    Restart,
+}
+
 impl SplashScreen {
     pub fn new(
         hardware_info: &compute_daemon::hardware::HardwareInfo,
@@ -313,9 +320,12 @@ impl SplashScreen {
         }
     }
 
-    /// Run only the splash update gate. Returns true when an update was installed and
-    /// the caller should exit so the user can restart into the new binary.
-    pub fn run_update_gate(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<bool> {
+    /// Run only the splash update gate. Returns `Restart` when an update was
+    /// installed and the caller should relaunch into the new binary.
+    pub fn run_update_gate(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+    ) -> anyhow::Result<UpdateGateOutcome> {
         let tick_rate = Duration::from_millis(50);
 
         loop {
@@ -326,12 +336,16 @@ impl SplashScreen {
                 && key.kind == KeyEventKind::Press
             {
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(UpdateGateOutcome::Exit),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(true);
+                        return Ok(UpdateGateOutcome::Exit);
                     }
                     KeyCode::Enter if self.phase == SplashPhase::Complete => {
-                        return Ok(self.update_applied);
+                        return Ok(if self.update_applied {
+                            UpdateGateOutcome::Restart
+                        } else {
+                            UpdateGateOutcome::Continue
+                        });
                     }
                     _ => {}
                 }
@@ -341,10 +355,10 @@ impl SplashScreen {
 
             if self.update_applied && self.phase == SplashPhase::Complete {
                 if self.step_timer.elapsed() > Duration::from_secs(3) {
-                    return Ok(true);
+                    return Ok(UpdateGateOutcome::Restart);
                 }
             } else if self.current_step > self.update_step {
-                return Ok(false);
+                return Ok(UpdateGateOutcome::Continue);
             }
         }
     }
@@ -867,10 +881,13 @@ impl SplashScreen {
         } else if self.update_applied {
             let msg = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "  Update installed. Restart compute to use the new version.",
+                    "  Update installed. Restarting Compute...",
                     Style::default().fg(p.success),
                 )),
-                Line::from(Span::styled("  Press Enter to close.", Style::default().fg(p.dim))),
+                Line::from(Span::styled(
+                    "  Press Enter to restart now.",
+                    Style::default().fg(p.dim),
+                )),
             ]);
             frame.render_widget(msg, right_chunks[5]);
         } else if self.phase == SplashPhase::UpdatingCompute {
