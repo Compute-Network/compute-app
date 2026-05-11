@@ -549,6 +549,7 @@ struct llm_graph_params {
     int32_t start_layer;
     int32_t end_layer;
     bool prefer_embd_input;
+    bool split_stage_output_embeddings;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -636,7 +637,8 @@ struct llm_graph_params {
             cross == other.cross &&
             start_layer == other.start_layer &&
             end_layer == other.end_layer &&
-            prefer_embd_input == other.prefer_embd_input;
+            prefer_embd_input == other.prefer_embd_input &&
+            split_stage_output_embeddings == other.split_stage_output_embeddings;
     }
 };
 
@@ -764,6 +766,7 @@ struct llm_graph_context {
     const int32_t start_layer;
     const int32_t end_layer;
     const bool prefer_embd_input;
+    const bool split_stage_output_embeddings;
 
     const llm_graph_cb & cb_func;
 

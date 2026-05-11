@@ -44,11 +44,17 @@ impl Globe {
 
     /// Advance the globe rotation by one tick.
     pub fn tick(&mut self) {
-        self.angle += self.rotation_speed;
+        self.tick_active(false);
+    }
+
+    /// Advance the globe rotation, accelerating while a request is active.
+    pub fn tick_active(&mut self, active: bool) {
+        let speed = if active { self.rotation_speed * 3.0 } else { self.rotation_speed };
+        self.angle += speed;
         if self.angle > std::f64::consts::TAU {
             self.angle -= std::f64::consts::TAU;
         }
-        self.pulse_phase += 0.1;
+        self.pulse_phase += if active { 0.18 } else { 0.1 };
     }
 
     /// Set the rotation angle directly (for startup animation).

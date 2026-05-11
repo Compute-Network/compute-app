@@ -38,6 +38,10 @@ pub fn run_splash_only() -> Result<()> {
 
     let mut terminal = ratatui::init();
     let mut splash = SplashScreen::new(&hw, assessment);
+    if splash.run_update_gate(&mut terminal)? {
+        ratatui::restore();
+        return Ok(());
+    }
     let _ = splash.run(&mut terminal);
     ratatui::restore();
     Ok(())
@@ -89,6 +93,11 @@ fn run_inner(
         register_node_blocking(config, &hw);
     }
 
+    let mut splash = SplashScreen::new(&hw, assessment);
+    if splash.run_update_gate(terminal)? {
+        return Ok(());
+    }
+
     // Start daemon runtime in background DURING splash so there's no lag on transition
     let daemon_config = config.clone();
     let runtime = compute_daemon::runtime::DaemonRuntime::with_hardware(daemon_config, hw.clone());
@@ -108,7 +117,7 @@ fn run_inner(
     });
 
     // Show splash (daemon boots in parallel)
-    let mut splash = SplashScreen::new(&hw, assessment).with_daemon_state(state_rx.clone());
+    let mut splash = splash.with_daemon_state(state_rx.clone());
     let continue_to_dashboard = splash.run(terminal)?;
 
     if continue_to_dashboard {

@@ -153,6 +153,90 @@ fn spawn_ready_probe(
     });
 }
 
+const BACKEND_WARMUP_TIMEOUT: Duration = Duration::from_secs(120);
+const BACKEND_WARMUP_PROMPT: &str = "warmup";
+
+fn set_backend_warmup_status(
+    state_tx: &watch::Sender<DaemonState>,
+    phase: BackendWarmupPhase,
+    backend: &str,
+    model_name: &str,
+    detail: impl Into<String>,
+) {
+    state_tx.send_modify(|state| {
+        state.backend_warmup = BackendWarmupStatus {
+            phase,
+            backend: backend.to_string(),
+            model_name: model_name.to_string(),
+            detail: detail.into(),
+        };
+    });
+}
+
+async fn warmup_omlx_backend(
+    client: &reqwest::Client,
+    port: u16,
+    model_folder: &str,
+) -> anyhow::Result<Duration> {
+    let started = std::time::Instant::now();
+    let body = serde_json::json!({
+        "model": model_folder,
+        "messages": [
+            {"role": "user", "content": BACKEND_WARMUP_PROMPT}
+        ],
+        "max_tokens": 1,
+        "temperature": 0,
+        "stream": false
+    });
+
+    let response = match tokio::time::timeout(
+        BACKEND_WARMUP_TIMEOUT,
+        client.post(format!("http://127.0.0.1:{port}/v1/chat/completions")).json(&body).send(),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => anyhow::bail!("warm-up request failed: {err}"),
+        Err(_) => anyhow::bail!("warm-up timed out after {}s", BACKEND_WARMUP_TIMEOUT.as_secs()),
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("warm-up returned {status}: {body}");
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), response.bytes()).await;
+    Ok(started.elapsed())
+}
+
+async fn warmup_gateway_backend(
+    client: &LlamaStageGatewayRelayClient,
+    model_name: &str,
+) -> anyhow::Result<Duration> {
+    let started = std::time::Instant::now();
+    let request_id = format!(
+        "warmup-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+
+    match tokio::time::timeout(
+        BACKEND_WARMUP_TIMEOUT,
+        client.complete_prompt(request_id, BACKEND_WARMUP_PROMPT.to_string(), Some(1), Vec::new()),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(started.elapsed()),
+        Ok(Err(err)) => anyhow::bail!("warm-up request failed for {model_name}: {err}"),
+        Err(_) => anyhow::bail!(
+            "warm-up timed out for {model_name} after {}s",
+            BACKEND_WARMUP_TIMEOUT.as_secs()
+        ),
+    }
+}
+
 fn local_mlx_variant_for_model(
     _config: &Config,
     model_name: &str,
@@ -166,9 +250,11 @@ fn local_mlx_variant_for_model(
 }
 
 fn spawn_omlx_ready_probe(
+    config: Config,
     mlx_port: Arc<AtomicU16>,
     model_name: String,
     ws_tx: tokio::sync::mpsc::Sender<String>,
+    state_tx: watch::Sender<DaemonState>,
 ) {
     tokio::spawn(async move {
         let client = reqwest::Client::new();
@@ -183,6 +269,61 @@ fn spawn_omlx_ready_probe(
                 {
                     Ok(resp) if resp.status().is_success() => {
                         info!("[health] oMLX ready after {:.1}s", attempt as f64 * 0.5);
+                        let Some(mlx) = local_mlx_variant_for_model(&config, &model_name) else {
+                            let msg = serde_json::json!({
+                                "type": "node_error",
+                                "model_name": model_name,
+                                "error": "MLX metadata missing for model",
+                            })
+                            .to_string();
+                            let _ = ws_tx.send(msg).await;
+                            return;
+                        };
+                        info!(
+                            "[omlx] Warming inference runtime for {} via {}",
+                            model_name, mlx.folder
+                        );
+                        set_backend_warmup_status(
+                            &state_tx,
+                            BackendWarmupPhase::Warming,
+                            "omlx",
+                            &model_name,
+                            "loading first token",
+                        );
+                        match warmup_omlx_backend(&client, port, &mlx.folder).await {
+                            Ok(elapsed) => {
+                                info!(
+                                    "[omlx] Warm-up complete for {} in {:.1}s",
+                                    model_name,
+                                    elapsed.as_secs_f64()
+                                );
+                                set_backend_warmup_status(
+                                    &state_tx,
+                                    BackendWarmupPhase::Ready,
+                                    "omlx",
+                                    &model_name,
+                                    format!("warm in {:.1}s", elapsed.as_secs_f64()),
+                                );
+                            }
+                            Err(err) => {
+                                warn!("[omlx] Warm-up failed for {}: {err}", model_name);
+                                set_backend_warmup_status(
+                                    &state_tx,
+                                    BackendWarmupPhase::Failed,
+                                    "omlx",
+                                    &model_name,
+                                    err.to_string(),
+                                );
+                                let msg = serde_json::json!({
+                                    "type": "node_error",
+                                    "model_name": model_name,
+                                    "error": format!("oMLX warm-up failed: {err}"),
+                                })
+                                .to_string();
+                                let _ = ws_tx.send(msg).await;
+                                return;
+                            }
+                        }
                         let msg = serde_json::json!({
                             "type": "node_ready",
                             "model_name": model_name,
@@ -208,6 +349,7 @@ async fn handle_single_node_mlx_assignment(
     model_name: &str,
     ws_outbound_tx: &tokio::sync::mpsc::Sender<String>,
     mlx_port: &Arc<AtomicU16>,
+    state_tx: &watch::Sender<DaemonState>,
 ) -> bool {
     let Some(mlx) = local_mlx_variant_for_model(config, model_name) else {
         return false;
@@ -238,7 +380,13 @@ async fn handle_single_node_mlx_assignment(
         "[omlx] Handling single-node assignment for {} via cached MLX snapshot {}",
         model_name, mlx.folder
     );
-    spawn_omlx_ready_probe(mlx_port.clone(), model_name.to_string(), ws_outbound_tx.clone());
+    spawn_omlx_ready_probe(
+        config.clone(),
+        mlx_port.clone(),
+        model_name.to_string(),
+        ws_outbound_tx.clone(),
+        state_tx.clone(),
+    );
     true
 }
 
@@ -500,10 +648,7 @@ fn mlx_model_cached(config: &Config, folder: &str) -> bool {
     )
 }
 
-fn preferred_idle_mlx_model(
-    config: &Config,
-    hw: &hardware::HardwareInfo,
-) -> Option<String> {
+fn preferred_idle_mlx_model(config: &Config, hw: &hardware::HardwareInfo) -> Option<String> {
     let configured = config.models.active_model.trim();
     let model_id = if configured.is_empty() || configured == "auto" {
         crate::benchmark::assess_node_startup(hw).assigned_model_id
@@ -515,18 +660,142 @@ fn preferred_idle_mlx_model(
     mlx_model_cached(config, &mlx.folder).then_some(model_id)
 }
 
+fn spawn_idle_omlx_warmup(
+    config: Config,
+    hw: hardware::HardwareInfo,
+    mlx_port: Arc<AtomicU16>,
+    state_tx: watch::Sender<DaemonState>,
+) {
+    tokio::spawn(async move {
+        let Some(model_name) = preferred_idle_mlx_model(&config, &hw) else {
+            return;
+        };
+        let Some(mlx) = local_mlx_variant_for_model(&config, &model_name) else {
+            return;
+        };
+
+        set_backend_warmup_status(
+            &state_tx,
+            BackendWarmupPhase::Warming,
+            "omlx",
+            &model_name,
+            "waiting for oMLX sidecar",
+        );
+
+        let client = reqwest::Client::new();
+        let mut port = 0;
+        for _ in 0..240u32 {
+            port = mlx_port.load(Ordering::Relaxed);
+            if port != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        if port == 0 {
+            set_backend_warmup_status(
+                &state_tx,
+                BackendWarmupPhase::Failed,
+                "omlx",
+                &model_name,
+                "oMLX sidecar did not become ready",
+            );
+            warn!("[omlx] Startup warm-up skipped: sidecar did not become ready");
+            return;
+        }
+
+        info!("[omlx] Startup warm-up for {} via cached MLX snapshot {}", model_name, mlx.folder);
+        set_backend_warmup_status(
+            &state_tx,
+            BackendWarmupPhase::Warming,
+            "omlx",
+            &model_name,
+            "loading first token",
+        );
+        match warmup_omlx_backend(&client, port, &mlx.folder).await {
+            Ok(elapsed) => {
+                info!(
+                    "[omlx] Startup warm-up complete for {} in {:.1}s",
+                    model_name,
+                    elapsed.as_secs_f64()
+                );
+                set_backend_warmup_status(
+                    &state_tx,
+                    BackendWarmupPhase::Ready,
+                    "omlx",
+                    &model_name,
+                    format!("warm in {:.1}s", elapsed.as_secs_f64()),
+                );
+            }
+            Err(err) => {
+                warn!("[omlx] Startup warm-up failed for {}: {err}", model_name);
+                set_backend_warmup_status(
+                    &state_tx,
+                    BackendWarmupPhase::Failed,
+                    "omlx",
+                    &model_name,
+                    err.to_string(),
+                );
+            }
+        }
+    });
+}
+
 async fn send_gateway_ready_or_error(
     gateway_result: anyhow::Result<LlamaStageGatewayRelayClient>,
     expected_model: &str,
     ws_tx: &tokio::sync::mpsc::Sender<String>,
+    state_tx: &watch::Sender<DaemonState>,
 ) {
     let msg = match gateway_result {
         Ok(client) => match client.model_name() {
-            Ok(model_name) if model_name == expected_model => serde_json::json!({
-                "type": "node_ready",
-                "model_name": model_name,
-            })
-            .to_string(),
+            Ok(model_name) if model_name == expected_model => {
+                info!("[gateway] Warming inference runtime for {model_name}");
+                set_backend_warmup_status(
+                    state_tx,
+                    BackendWarmupPhase::Warming,
+                    "llama-stage-gateway",
+                    &model_name,
+                    "loading first token",
+                );
+                match warmup_gateway_backend(&client, &model_name).await {
+                    Ok(elapsed) => {
+                        info!(
+                            "[gateway] Warm-up complete for {} in {:.1}s",
+                            model_name,
+                            elapsed.as_secs_f64()
+                        );
+                        set_backend_warmup_status(
+                            state_tx,
+                            BackendWarmupPhase::Ready,
+                            "llama-stage-gateway",
+                            &model_name,
+                            format!("warm in {:.1}s", elapsed.as_secs_f64()),
+                        );
+                        serde_json::json!({
+                            "type": "node_ready",
+                            "model_name": model_name,
+                        })
+                        .to_string()
+                    }
+                    Err(err) => {
+                        warn!("[gateway] Warm-up failed for {}: {err}", model_name);
+                        set_backend_warmup_status(
+                            state_tx,
+                            BackendWarmupPhase::Failed,
+                            "llama-stage-gateway",
+                            &model_name,
+                            err.to_string(),
+                        );
+                        serde_json::json!({
+                            "type": "node_error",
+                            "model_name": expected_model,
+                            "error": format!("stage gateway warm-up failed: {err}"),
+                        })
+                        .to_string()
+                    }
+                }
+            }
             Ok(model_name) => serde_json::json!({
                 "type": "node_error",
                 "model_name": expected_model,
@@ -577,6 +846,23 @@ fn gateway_model_path(config: &Config) -> PathBuf {
     } else {
         config.experimental.stage_gateway_model_path.clone().into()
     }
+}
+
+fn solo_assignment_model_available(config: &Config, model_name: &str) -> bool {
+    if detect_downloaded_models()
+        .split(',')
+        .map(str::trim)
+        .any(|model| model == model_name)
+    {
+        return true;
+    }
+
+    if model_name == "gemma-4-e4b-q4" {
+        let path = gateway_model_path(config);
+        return path.exists() && is_valid_gguf(&path);
+    }
+
+    false
 }
 
 /// Resolves the (model_path, local_start_layer, local_end_layer) that the
@@ -914,6 +1200,34 @@ pub struct DaemonState {
     pub uptime_secs: u64,
     pub inference_status: String,
     pub downloads: Vec<DownloadStatus>,
+    pub backend_warmup: BackendWarmupStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendWarmupPhase {
+    Idle,
+    Warming,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendWarmupStatus {
+    pub phase: BackendWarmupPhase,
+    pub backend: String,
+    pub model_name: String,
+    pub detail: String,
+}
+
+impl Default for BackendWarmupStatus {
+    fn default() -> Self {
+        Self {
+            phase: BackendWarmupPhase::Idle,
+            backend: String::new(),
+            model_name: String::new(),
+            detail: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -964,6 +1278,7 @@ impl Default for DaemonState {
             uptime_secs: 0,
             inference_status: "idle".into(),
             downloads: Vec::new(),
+            backend_warmup: BackendWarmupStatus::default(),
         }
     }
 }
@@ -1250,6 +1565,15 @@ impl DaemonRuntime {
             }
         }
 
+        if _omlx_manager.is_some() {
+            spawn_idle_omlx_warmup(
+                self.config.clone(),
+                hw.clone(),
+                mlx_port.clone(),
+                self.state_tx.clone(),
+            );
+        }
+
         // Start WebSocket relay to orchestrator
         let relay = RelayClient::new(
             &self.config,
@@ -1263,6 +1587,7 @@ impl DaemonRuntime {
         );
         let relay_latency = relay.last_latency_ms();
         let relay_tps = relay.last_tps();
+        let relay_tps_at_ms = relay.last_tps_at_ms();
         let relay_completed_requests = relay.completed_requests();
         let relay_is_connected = relay.is_connected();
         let relay_active_requests = relay.active_requests();
@@ -1541,6 +1866,7 @@ impl DaemonRuntime {
                                                         Ok(client),
                                                         &assignment.model_name,
                                                         &ws_outbound_tx,
+                                                        &self.state_tx,
                                                     )
                                                     .await;
                                                 }
@@ -1574,6 +1900,7 @@ impl DaemonRuntime {
                                         Ok(client),
                                         &assignment.model_name,
                                         &ws_outbound_tx,
+                                        &self.state_tx,
                                     )
                                     .await;
                                 }
@@ -1611,7 +1938,12 @@ impl DaemonRuntime {
                             &mut managed_gateway_stack,
                         )
                         .await;
-                        send_gateway_ready_or_error(gateway_result, &assignment.model_name, &ws_outbound_tx)
+                        send_gateway_ready_or_error(
+                            gateway_result,
+                            &assignment.model_name,
+                            &ws_outbound_tx,
+                            &self.state_tx,
+                        )
                             .await;
                         continue;
                     }
@@ -1619,6 +1951,29 @@ impl DaemonRuntime {
                     let assignment_mode = assignment.assignment_mode.as_deref().unwrap_or(
                         if assignment.total_stages > 1 { "rpc" } else { "solo" }
                     );
+
+                    if assignment_mode == "solo"
+                        && !solo_assignment_model_available(&self.config, &assignment.model_name)
+                    {
+                        warn!(
+                            "[assignment] rejecting solo assignment for {}: model is not cached locally",
+                            assignment.model_name
+                        );
+                        let msg = serde_json::json!({
+                            "type": "node_error",
+                            "model_name": assignment.model_name,
+                            "error": "model is not cached locally",
+                        })
+                        .to_string();
+                        let _ = ws_outbound_tx.send(msg).await;
+                        self.update_state(|state| {
+                            state.pipeline.active = false;
+                            state.pipeline.model = None;
+                            state.inference_status =
+                                "model missing; waiting for orchestrator download".into();
+                        });
+                        continue;
+                    }
 
                     // Set pipeline role for multi-node RPC inference
                     use crate::inference::manager::PipelineRole;
@@ -1762,6 +2117,7 @@ impl DaemonRuntime {
                             &assignment.model_name,
                             &ws_outbound_tx,
                             &mlx_port,
+                            &self.state_tx,
                         )
                         .await
                     {
@@ -1791,9 +2147,11 @@ impl DaemonRuntime {
                         // dedicated MLX assignment handler falls through. Relay request routing
                         // still prefers oMLX whenever the sidecar is up and the snapshot is cached.
                         spawn_omlx_ready_probe(
+                            self.config.clone(),
                             mlx_port.clone(),
                             assignment.model_name.clone(),
                             ws_outbound_tx.clone(),
+                            self.state_tx.clone(),
                         );
                     }
 
@@ -1920,10 +2278,22 @@ impl DaemonRuntime {
                     let is_actively_inferring = active_requests > 0;
                     let last_tps_bits = relay_tps.load(std::sync::atomic::Ordering::Relaxed);
                     let last_tps = f64::from_bits(last_tps_bits);
+                    let last_tps_at_ms = relay_tps_at_ms.load(std::sync::atomic::Ordering::Relaxed);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let recently_completed = last_tps_at_ms > 0
+                        && now_ms.saturating_sub(last_tps_at_ms) < 5_000;
 
                     // Hold the most recent measured TPS for a few seconds so the
                     // dashboard chart and numeric label can actually render it.
-                    if is_actively_inferring && last_tps > 0.0 {
+                    // The 1Hz metrics tick almost never lands inside the
+                    // microsecond window between the relay's
+                    // `active_requests` decrement and `last_tps` store, so we
+                    // also accept "tps was written within the last 5s" as a
+                    // signal that a request just completed.
+                    if (is_actively_inferring || recently_completed) && last_tps > 0.0 {
                         held_tps = last_tps;
                         held_tps_until = Some(std::time::Instant::now() + Duration::from_secs(5));
                         baseline_tps = last_tps;
@@ -2183,8 +2553,13 @@ impl DaemonRuntime {
                                 managed_gateway_stack,
                             )
                             .await;
-                            send_gateway_ready_or_error(gateway_result, model_name, ws_outbound_tx)
-                                .await;
+                            send_gateway_ready_or_error(
+                                gateway_result,
+                                model_name,
+                                ws_outbound_tx,
+                                &self.state_tx,
+                            )
+                            .await;
                         }
                     }
                     return;
@@ -2261,6 +2636,7 @@ impl DaemonRuntime {
                             model_name,
                             ws_outbound_tx,
                             &mlx_port,
+                            &self.state_tx,
                         )
                         .await
                         {
@@ -2301,9 +2677,11 @@ impl DaemonRuntime {
                             })
                         {
                             spawn_omlx_ready_probe(
+                                self.config.clone(),
                                 mlx_port.clone(),
                                 model_name.to_string(),
                                 ws_outbound_tx.clone(),
+                                self.state_tx.clone(),
                             );
                             return;
                         }

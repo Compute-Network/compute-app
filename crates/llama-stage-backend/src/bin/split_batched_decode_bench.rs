@@ -13,6 +13,7 @@
 // apples.
 //
 // Usage: split_batched_decode_bench [model.gguf]
+//        HEAD_MODEL=head.gguf TAIL_MODEL=tail.gguf split_batched_decode_bench
 use anyhow::{Result, bail};
 use llama_stage_backend::{
     LlamaStageBackend, StageNodeConfig, StagePayloadKind as PayloadKind,
@@ -24,17 +25,32 @@ use std::time::Instant;
 fn main() -> Result<()> {
     let model_path =
         std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(default_gemma_model_path);
-    if !model_path.exists() {
-        bail!("model not found: {}", model_path.display());
+    let head_model_path =
+        std::env::var("HEAD_MODEL").map(PathBuf::from).unwrap_or_else(|_| model_path.clone());
+    let tail_model_path =
+        std::env::var("TAIL_MODEL").map(PathBuf::from).unwrap_or_else(|_| model_path.clone());
+    if !head_model_path.exists() {
+        bail!("head model not found: {}", head_model_path.display());
     }
-    eprintln!("[bench] model = {}", model_path.display());
+    if !tail_model_path.exists() {
+        bail!("tail model not found: {}", tail_model_path.display());
+    }
+    eprintln!("[bench] model      = {}", model_path.display());
+    eprintln!("[bench] head model = {}", head_model_path.display());
+    eprintln!("[bench] tail model = {}", tail_model_path.display());
 
-    // Match production split: 42 layers total, head 0..=20, tail 21..=41.
+    // Match production split for a full GGUF: 42 layers total, head 0..=20,
+    // tail 21..=41. Reindexed shard GGUFs each start at layer 0, so default
+    // the tail shard to 0..=20 when TAIL_MODEL is explicitly supplied.
     // Override via env if needed.
     let head_end: u32 = std::env::var("HEAD_END").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let has_tail_model_override = std::env::var_os("TAIL_MODEL").is_some();
+    let default_tail_start = if has_tail_model_override { 0 } else { 21 };
+    let default_tail_end = if has_tail_model_override { 20 } else { 41 };
     let tail_start: u32 =
-        std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(21);
-    let tail_end: u32 = std::env::var("TAIL_END").ok().and_then(|s| s.parse().ok()).unwrap_or(41);
+        std::env::var("TAIL_START").ok().and_then(|s| s.parse().ok()).unwrap_or(default_tail_start);
+    let tail_end: u32 =
+        std::env::var("TAIL_END").ok().and_then(|s| s.parse().ok()).unwrap_or(default_tail_end);
 
     eprintln!("[bench] split: head 0..={head_end}, tail {tail_start}..={tail_end}");
 
@@ -48,7 +64,7 @@ fn main() -> Result<()> {
     eprintln!("[bench] prompt={prompt:?} total_decoded_tokens={total_tokens}");
 
     let head = build_stage_backend(&StageNodeConfig {
-        model_path: model_path.clone(),
+        model_path: head_model_path,
         stage_id: "bench-head".to_string(),
         start_layer: 0,
         end_layer: head_end,
@@ -56,7 +72,7 @@ fn main() -> Result<()> {
         is_tail: false,
     })?;
     let tail = build_stage_backend(&StageNodeConfig {
-        model_path: model_path.clone(),
+        model_path: tail_model_path,
         stage_id: "bench-tail".to_string(),
         start_layer: tail_start,
         end_layer: tail_end,
@@ -91,11 +107,11 @@ fn main() -> Result<()> {
 
     println!();
     println!("=== HEAD (decode_head) ===");
-    bench_head(&head, &request_id, seed_token, total_tokens, &[1, 2, 4, 8])?;
+    bench_head(&head, &request_id, seed_token, total_tokens, &[1, 2, 4, 8, 16])?;
 
     println!();
     println!("=== TAIL (decode_tail) ===");
-    bench_tail(&head, &tail, &request_id, seed_token, total_tokens, &[1, 2, 4, 8])?;
+    bench_tail(&head, &tail, &request_id, seed_token, total_tokens, &[1, 2, 4, 8, 16])?;
 
     Ok(())
 }

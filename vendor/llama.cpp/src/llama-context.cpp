@@ -2194,6 +2194,7 @@ llm_graph_params llama_context::graph_params(
     // though its input is hidden states from an upstream stage. Trust ubatch.embd as the
     // authoritative signal that the input is already an embedding, independent of start_layer.
     const bool prefer_embd_input = ubatch.embd != nullptr && (split_stage_active || ubatch.token == nullptr);
+    const bool split_stage_output_embeddings = split_stage_active && cparams.embeddings;
 
     return {
         /*.arch        =*/ model.arch,
@@ -2211,6 +2212,7 @@ llm_graph_params llama_context::graph_params(
         /*.start_layer =*/ stage_start_layer,
         /*.end_layer   =*/ stage_end_layer,
         /*.prefer_embd_input =*/ prefer_embd_input,
+        /*.split_stage_output_embeddings =*/ split_stage_output_embeddings,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,

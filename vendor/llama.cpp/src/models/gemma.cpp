@@ -63,7 +63,7 @@ llm_build_gemma::llm_build_gemma(const llama_model & model, const llm_graph_para
                     model.layers[il].wo, NULL,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
         }
-        if (il == n_layer - 1 && end_layer == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && end_layer == n_layer - 1 && !split_stage_output_embeddings && inp_out_ids) {
             cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
             inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
@@ -95,7 +95,7 @@ llm_build_gemma::llm_build_gemma(const llama_model & model, const llm_graph_para
     }
     cur = inpL;
 
-    if (end_layer < n_layer - 1) {
+    if (split_stage_output_embeddings || end_layer < n_layer - 1) {
         res->t_embd = cur;
         ggml_build_forward_expand(gf, cur);
         return;

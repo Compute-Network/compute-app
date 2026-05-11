@@ -71,6 +71,8 @@ pub struct OnboardingScreen {
     auth_status: Option<String>,
     theme_mode: ThemeMode,
     caffeinate_when_running: bool,
+    auto_download_models: bool,
+    pause_on_battery: bool,
 }
 
 #[derive(PartialEq)]
@@ -103,6 +105,8 @@ impl OnboardingScreen {
                 .unwrap_or_default()
                 .node
                 .caffeinate_when_running,
+            auto_download_models: Config::load().unwrap_or_default().models.auto_download,
+            pause_on_battery: Config::load().unwrap_or_default().node.pause_on_battery,
         }
     }
 
@@ -148,9 +152,20 @@ impl OnboardingScreen {
                         self.theme_mode = self.theme_mode.toggle();
                         self.persist_theme();
                     }
-                    KeyCode::Char('c') | KeyCode::Char('C') => {
+                    KeyCode::Char('p')
+                    | KeyCode::Char('P')
+                    | KeyCode::Char('c')
+                    | KeyCode::Char('C') => {
                         self.caffeinate_when_running = !self.caffeinate_when_running;
                         self.persist_caffeinate_preference();
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        self.auto_download_models = !self.auto_download_models;
+                        self.persist_auto_download_preference();
+                    }
+                    KeyCode::Char('b') | KeyCode::Char('B') => {
+                        self.pause_on_battery = !self.pause_on_battery;
+                        self.persist_battery_preference();
                     }
                     KeyCode::Char('s') | KeyCode::Char('S') => {
                         return Some(OnboardingResult::Skipped);
@@ -263,6 +278,20 @@ impl OnboardingScreen {
     fn persist_caffeinate_preference(&self) {
         let mut config = Config::load().unwrap_or_default();
         config.node.caffeinate_when_running = self.caffeinate_when_running;
+        let _ = config::ensure_dirs();
+        let _ = config.save();
+    }
+
+    fn persist_auto_download_preference(&self) {
+        let mut config = Config::load().unwrap_or_default();
+        config.models.auto_download = self.auto_download_models;
+        let _ = config::ensure_dirs();
+        let _ = config.save();
+    }
+
+    fn persist_battery_preference(&self) {
+        let mut config = Config::load().unwrap_or_default();
+        config.node.pause_on_battery = self.pause_on_battery;
         let _ = config::ensure_dirs();
         let _ = config.save();
     }
@@ -432,7 +461,9 @@ impl OnboardingScreen {
 
         // Bottom help
         let help_text = match self.step {
-            OnboardingStep::Welcome => "  [←/→] Theme  [C] Caffeinate  [Enter] Continue  [S] Skip",
+            OnboardingStep::Welcome => {
+                "  [←/→] Theme  [P] Sleep  [D] Downloads  [B] Battery  [Enter] Continue"
+            }
             OnboardingStep::WalletInput => "  [Enter] Open wallet login  [S] Skip  [Esc] Quit",
             OnboardingStep::DependencyCheck => "  [Enter] Retry  [Esc] Quit",
             OnboardingStep::Installing => "  Installing...",
@@ -462,8 +493,26 @@ impl OnboardingScreen {
             )),
             Line::from(Span::styled(
                 format!(
-                    "  Prevent sleep: {}  [C to toggle]",
+                    "  Prevent sleep while running: {}  [P to toggle]",
                     if self.caffeinate_when_running { "On" } else { "Off" }
+                ),
+                Style::default().fg(p.warning),
+            )),
+            Line::from(Span::styled(
+                "  Keeps Macs awake for active jobs; turn off for battery-first use.",
+                Style::default().fg(p.dim),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "  Auto-download assigned models: {}  [D to toggle]",
+                    if self.auto_download_models { "On" } else { "Off" }
+                ),
+                Style::default().fg(p.warning),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "  Pause on battery: {}  [B to toggle]",
+                    if self.pause_on_battery { "On" } else { "Off" }
                 ),
                 Style::default().fg(p.warning),
             )),

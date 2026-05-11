@@ -14,7 +14,9 @@ use ratatui::{
 use tokio::sync::watch;
 
 use compute_daemon::benchmark::StartupAssessment;
-use compute_daemon::runtime::{DaemonState, DownloadPhase, DownloadStatus};
+use compute_daemon::runtime::{BackendWarmupPhase, DaemonState, DownloadPhase, DownloadStatus};
+
+use crate::updater::AutoUpdateOutcome;
 
 use super::globe::Globe;
 use super::theme;
@@ -73,12 +75,20 @@ pub struct SplashScreen {
     model_step: usize,
     /// Live daemon state, used to show startup model download progress.
     daemon_state_rx: Option<watch::Receiver<DaemonState>>,
+    /// Step index for checking GitHub release tags and installing updates.
+    update_step: usize,
+    /// Tracks auto-update progress.
+    update_rx: Option<mpsc::Receiver<Result<AutoUpdateOutcome, String>>>,
+    /// True after a new Compute bundle has been installed.
+    update_applied: bool,
 }
 
 #[derive(PartialEq)]
 enum SplashPhase {
     GlobeFadeIn,
     StepsRunning,
+    /// Waiting for Compute auto-update check/install to complete.
+    UpdatingCompute,
     /// Waiting for llama-server install to complete
     InstallingLlama,
     /// Waiting for model to load into llama-server
@@ -125,7 +135,13 @@ impl SplashScreen {
             format!("no · {}", assessment.split_reason)
         };
 
+        let update_step = 0;
         let mut steps = vec![
+            StartupStep {
+                label: "Checking for Compute updates...".into(),
+                done: false,
+                result: None,
+            },
             StartupStep {
                 label: "Detecting hardware...".into(),
                 done: false,
@@ -235,6 +251,9 @@ impl SplashScreen {
             llama_status_step,
             model_step,
             daemon_state_rx: None,
+            update_step,
+            update_rx: None,
+            update_applied: false,
         }
     }
 
@@ -265,6 +284,9 @@ impl SplashScreen {
                         open_url("https://computenetwork.sh/docs/llama-server");
                     }
                     KeyCode::Enter if self.phase == SplashPhase::Complete => {
+                        if self.update_applied {
+                            return Ok(false);
+                        }
                         return Ok(true);
                     }
                     // Any key during animation speeds it up (but not during install)
@@ -283,7 +305,46 @@ impl SplashScreen {
                 && self.start_time.elapsed() > Duration::from_secs(4)
                 && !self.has_active_download()
             {
+                if self.update_applied {
+                    return Ok(false);
+                }
                 return Ok(true);
+            }
+        }
+    }
+
+    /// Run only the splash update gate. Returns true when an update was installed and
+    /// the caller should exit so the user can restart into the new binary.
+    pub fn run_update_gate(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<bool> {
+        let tick_rate = Duration::from_millis(50);
+
+        loop {
+            terminal.draw(|frame| self.draw(frame))?;
+
+            if event::poll(tick_rate)?
+                && let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(true);
+                    }
+                    KeyCode::Enter if self.phase == SplashPhase::Complete => {
+                        return Ok(self.update_applied);
+                    }
+                    _ => {}
+                }
+            }
+
+            self.tick();
+
+            if self.update_applied && self.phase == SplashPhase::Complete {
+                if self.step_timer.elapsed() > Duration::from_secs(3) {
+                    return Ok(true);
+                }
+            } else if self.current_step > self.update_step {
+                return Ok(false);
             }
         }
     }
@@ -318,6 +379,12 @@ impl SplashScreen {
                 if self.current_step < self.steps.len() {
                     let step_delay = self.step_delay(self.current_step);
                     if self.step_timer.elapsed() > step_delay {
+                        if self.current_step == self.update_step {
+                            self.start_compute_update();
+                            self.phase = SplashPhase::UpdatingCompute;
+                            return;
+                        }
+
                         if self.current_step == self.llama_status_step && !self.llama_ready {
                             self.steps[self.current_step].done = false;
                             self.start_llama_install();
@@ -326,9 +393,58 @@ impl SplashScreen {
                         }
 
                         if self.current_step == self.model_step && self.stage_mode_enabled {
+                            if self.has_active_download() {
+                                self.steps[self.current_step].label =
+                                    "Downloading assigned model...".into();
+                                return;
+                            }
+
+                            if let Some(state_rx) = self.daemon_state_rx.as_ref() {
+                                let warmup = state_rx.borrow().backend_warmup.clone();
+                                match warmup.phase {
+                                    BackendWarmupPhase::Warming => {
+                                        self.steps[self.current_step].label =
+                                            "Warming inference runtime...".into();
+                                        self.steps[self.current_step].result =
+                                            Some(format_warmup_detail(&warmup));
+                                        return;
+                                    }
+                                    BackendWarmupPhase::Ready => {
+                                        self.model_loaded.store(true, Ordering::Relaxed);
+                                        self.steps[self.current_step].label =
+                                            "Inference runtime warm".into();
+                                        self.steps[self.current_step].result =
+                                            Some(format_warmup_detail(&warmup));
+                                        self.steps[self.current_step].done = true;
+                                        self.current_step += 1;
+                                        self.step_timer = Instant::now();
+                                        return;
+                                    }
+                                    BackendWarmupPhase::Failed => {
+                                        self.model_loaded.store(true, Ordering::Relaxed);
+                                        self.steps[self.current_step].label =
+                                            "Inference warm-up failed".into();
+                                        self.steps[self.current_step].result =
+                                            Some(format_warmup_detail(&warmup));
+                                        self.steps[self.current_step].done = true;
+                                        self.current_step += 1;
+                                        self.step_timer = Instant::now();
+                                        return;
+                                    }
+                                    BackendWarmupPhase::Idle => {
+                                        if state_rx.borrow().running
+                                            && self.step_timer.elapsed() < Duration::from_secs(8)
+                                        {
+                                            self.steps[self.current_step].label =
+                                                "Starting inference runtime...".into();
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+
                             self.model_loaded.store(true, Ordering::Relaxed);
-                            self.steps[self.current_step].label =
-                                "Inference runtime ready".into();
+                            self.steps[self.current_step].label = "Inference runtime ready".into();
                             self.steps[self.current_step].done = true;
                             self.current_step += 1;
                             self.step_timer = Instant::now();
@@ -359,6 +475,13 @@ impl SplashScreen {
                     }
                 } else {
                     self.phase = SplashPhase::Complete;
+                }
+            }
+            SplashPhase::UpdatingCompute => {
+                if let Some(ref rx) = self.update_rx {
+                    if let Ok(result) = rx.try_recv() {
+                        self.finish_compute_update(result);
+                    }
                 }
             }
             SplashPhase::LoadingModel => {
@@ -415,7 +538,9 @@ impl SplashScreen {
     }
 
     fn step_delay(&self, step_index: usize) -> Duration {
-        if step_index == 0 {
+        if step_index == self.update_step {
+            Duration::from_millis(100)
+        } else if step_index == 1 {
             Duration::from_millis(200)
         } else if step_index == self.llama_status_step.saturating_sub(1) {
             Duration::from_millis(300)
@@ -425,6 +550,70 @@ impl SplashScreen {
             Duration::from_millis(350)
         } else {
             Duration::from_millis(180)
+        }
+    }
+
+    fn start_compute_update(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let result = crate::updater::auto_update_blocking().map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
+    fn finish_compute_update(&mut self, result: Result<AutoUpdateOutcome, String>) {
+        match result {
+            Ok(AutoUpdateOutcome::UpToDate { current }) => {
+                self.steps[self.current_step].label = "Compute is up to date".into();
+                self.steps[self.current_step].result = Some(format!("v{current}"));
+                self.steps[self.current_step].done = true;
+                self.current_step += 1;
+                self.step_timer = Instant::now();
+                self.phase = SplashPhase::StepsRunning;
+            }
+            Ok(AutoUpdateOutcome::Updated { version }) => {
+                self.steps[self.current_step].label = format!("Updated Compute to v{version}");
+                self.steps[self.current_step].result = Some("restart required".into());
+                self.steps[self.current_step].done = true;
+                self.current_step = self.steps.len();
+                self.update_applied = true;
+                self.step_timer = Instant::now();
+                self.phase = SplashPhase::Complete;
+            }
+            Ok(AutoUpdateOutcome::Skipped { version, reason }) => {
+                self.steps[self.current_step].label = "Auto-update skipped".into();
+                self.steps[self.current_step].result = Some(format!("v{version} · {reason}"));
+                self.steps[self.current_step].done = true;
+                self.current_step += 1;
+                self.step_timer = Instant::now();
+                self.phase = SplashPhase::StepsRunning;
+            }
+            Ok(AutoUpdateOutcome::NoRelease) => {
+                self.steps[self.current_step].label = "No Compute release found".into();
+                self.steps[self.current_step].done = true;
+                self.current_step += 1;
+                self.step_timer = Instant::now();
+                self.phase = SplashPhase::StepsRunning;
+            }
+            Ok(AutoUpdateOutcome::NoCompatibleAsset { tag, html_url }) => {
+                self.steps[self.current_step].label =
+                    format!("{tag} has no binary for this platform");
+                self.steps[self.current_step].result = Some(html_url);
+                self.steps[self.current_step].done = true;
+                self.current_step += 1;
+                self.step_timer = Instant::now();
+                self.phase = SplashPhase::StepsRunning;
+            }
+            Err(e) => {
+                self.steps[self.current_step].label = "Update check failed".into();
+                self.steps[self.current_step].result = Some(e);
+                self.steps[self.current_step].done = true;
+                self.current_step += 1;
+                self.step_timer = Instant::now();
+                self.phase = SplashPhase::StepsRunning;
+            }
         }
     }
 
@@ -496,7 +685,18 @@ impl SplashScreen {
 
     fn skip_to_complete(&mut self) {
         // Don't skip if we're in the middle of installing llama or waiting for model
-        if self.phase == SplashPhase::InstallingLlama || self.phase == SplashPhase::LoadingModel {
+        if self.phase == SplashPhase::UpdatingCompute
+            || self.phase == SplashPhase::InstallingLlama
+            || self.phase == SplashPhase::LoadingModel
+            || (self.current_step <= self.update_step && !self.steps[self.update_step].done)
+        {
+            return;
+        }
+        if self
+            .daemon_state_rx
+            .as_ref()
+            .is_some_and(|rx| rx.borrow().backend_warmup.phase == BackendWarmupPhase::Warming)
+        {
             return;
         }
         for step in &mut self.steps {
@@ -631,9 +831,12 @@ impl SplashScreen {
             let is_loading_model =
                 i == self.current_step && self.phase == SplashPhase::LoadingModel;
 
+            let is_updating = i == self.current_step && self.phase == SplashPhase::UpdatingCompute;
+
             let (icon, color) = if step.done {
                 ("  ✓ ".to_string(), p.success)
-            } else if is_installing
+            } else if is_updating
+                || is_installing
                 || is_loading_model
                 || (i == self.current_step && self.phase == SplashPhase::StepsRunning)
             {
@@ -660,6 +863,27 @@ impl SplashScreen {
         // Bottom message
         if let Some(download) = self.visible_download() {
             let msg = Paragraph::new(download_lines(&download));
+            frame.render_widget(msg, right_chunks[5]);
+        } else if self.update_applied {
+            let msg = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  Update installed. Restart compute to use the new version.",
+                    Style::default().fg(p.success),
+                )),
+                Line::from(Span::styled("  Press Enter to close.", Style::default().fg(p.dim))),
+            ]);
+            frame.render_widget(msg, right_chunks[5]);
+        } else if self.phase == SplashPhase::UpdatingCompute {
+            let msg = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  Checking GitHub release tags...",
+                    Style::default().fg(p.warning),
+                )),
+                Line::from(Span::styled(
+                    "  Set COMPUTE_AUTO_UPDATE=0 to disable.",
+                    Style::default().fg(p.dim),
+                )),
+            ]);
             frame.render_widget(msg, right_chunks[5]);
         } else if self.phase == SplashPhase::Complete {
             let msg = Paragraph::new(vec![
@@ -698,6 +922,23 @@ fn format_vram(vram_mb: u64) -> String {
 
 fn format_gb(value: f64) -> String {
     if value >= 10.0 { format!("{value:.0}GB") } else { format!("{value:.1}GB") }
+}
+
+fn format_warmup_detail(warmup: &compute_daemon::runtime::BackendWarmupStatus) -> String {
+    let backend = warmup.backend.trim();
+    let model = warmup.model_name.trim();
+    let detail = warmup.detail.trim();
+
+    match (backend.is_empty(), model.is_empty(), detail.is_empty()) {
+        (false, false, false) => format!("{backend} · {model} · {detail}"),
+        (false, false, true) => format!("{backend} · {model}"),
+        (false, true, false) => format!("{backend} · {detail}"),
+        (true, false, false) => format!("{model} · {detail}"),
+        (false, true, true) => backend.to_string(),
+        (true, false, true) => model.to_string(),
+        (true, true, false) => detail.to_string(),
+        (true, true, true) => String::new(),
+    }
 }
 
 fn download_lines(download: &DownloadStatus) -> Vec<Line<'static>> {

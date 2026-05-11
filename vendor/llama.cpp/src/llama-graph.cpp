@@ -955,6 +955,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     start_layer      (params.start_layer),
     end_layer        (params.end_layer),
     prefer_embd_input(params.prefer_embd_input),
+    split_stage_output_embeddings(params.split_stage_output_embeddings),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

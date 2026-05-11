@@ -90,6 +90,7 @@ mod ffi {
     #[derive(Clone, Copy)]
     pub enum ggml_type {
         F32 = 0,
+        F16 = 1,
     }
 
     #[repr(C)]
@@ -346,13 +347,26 @@ impl LlamaModelHandle {
     }
 
     pub(crate) fn create_session(&self, api: &LlamaApi) -> Result<LlamaSession> {
+        let n_ctx = env_u32("LLAMA_STAGE_N_CTX").unwrap_or(8192);
+        let n_batch = env_u32("LLAMA_STAGE_N_BATCH").unwrap_or(2048);
+        let n_ubatch = env_u32("LLAMA_STAGE_N_UBATCH").unwrap_or(n_batch);
+        self.create_session_with_limits(api, n_ctx, n_batch, n_ubatch)
+    }
+
+    pub(crate) fn create_session_with_limits(
+        &self,
+        api: &LlamaApi,
+        n_ctx: u32,
+        n_batch: u32,
+        n_ubatch: u32,
+    ) -> Result<LlamaSession> {
         let force_cpu = std::env::var_os("LLAMA_STAGE_FORCE_CPU").is_some();
 
         let mut cparams = unsafe { (api.context_default_params)() };
         let threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
-        cparams.n_ctx = 8192;
-        cparams.n_batch = 2048;
-        cparams.n_ubatch = 2048;
+        cparams.n_ctx = n_ctx;
+        cparams.n_batch = n_batch;
+        cparams.n_ubatch = n_ubatch.min(n_batch);
         cparams.n_seq_max = 1;
         cparams.n_threads = threads;
         cparams.n_threads_batch = threads;
@@ -360,11 +374,13 @@ impl LlamaModelHandle {
         cparams.rope_scaling_type = ffi::llama_rope_scaling_type::Unspecified;
         cparams.attention_type = ffi::llama_attention_type::Unspecified;
         cparams.flash_attn_type = ffi::llama_flash_attn_type::Enabled;
-        cparams.type_k = ffi::ggml_type::F32;
-        cparams.type_v = ffi::ggml_type::F32;
+        let force_f32_kv = std::env::var_os("LLAMA_STAGE_FORCE_F32_KV").is_some();
+        let kv_type = if force_f32_kv { ffi::ggml_type::F32 } else { ffi::ggml_type::F16 };
+        cparams.type_k = kv_type;
+        cparams.type_v = kv_type;
         cparams.offload_kqv = !force_cpu;
         cparams.op_offload = !force_cpu;
-        cparams.kv_unified = true;
+        cparams.kv_unified = std::env::var_os("LLAMA_STAGE_KV_UNIFIED").is_some();
         cparams.embeddings = false;
 
         let ctx = unsafe { (api.init_from_model)(self.model, cparams) };
@@ -943,6 +959,7 @@ struct GatewaySessionState {
     tail_tensor: Option<StageTensor>,
     text: String,
     token_ids: Vec<i32>,
+    context_token_ids: Vec<i32>,
     timings: RemoteStageTimings,
     // Sample produced by the tail as a side-effect of the most recent
     // ContinueForwardTokens call, ready for the next step_completion to
@@ -962,13 +979,17 @@ struct GatewaySessionState {
     // consecutive low-acceptance rounds and recovers on full accepts.
     current_k: u32,
     consec_low_accept: u32,
+    spec_suspended: bool,
+    pending_draft_commit: Vec<i32>,
 }
 
 /// Tunables for the adaptive speculative-decoding loop. A request can opt out
 /// entirely by passing `enabled=false`; otherwise `start_k` is the initial
 /// draft window and the loop will shrink it on consecutive low-acceptance
-/// rounds. Defaults align with the validated bench sweet spot (k=4) and the
-/// "drop to k=1 then disable" rule from the Phase 0 plan.
+/// rounds. Defaults are tuned for the current Gemma-4 E4B head/tail shards
+/// with the Gemma-3 270M draft: use k=1 continuously. Even zero-accept k=1
+/// rounds still return a verified target bonus token, which remains faster
+/// than falling back to the legacy split single-step path.
 #[derive(Debug, Clone, Copy)]
 pub struct SpecDecodeConfig {
     pub enabled: bool,
@@ -978,16 +999,111 @@ pub struct SpecDecodeConfig {
     /// After this many consecutive 0-accept rounds at the smallest k, suspend
     /// speculation for the remainder of the session.
     pub disable_after_consec_zero: u32,
+    /// Opportunistic prompt-lookup drafting. When non-zero, the gateway first
+    /// tries exact suffix matches in the already verified token stream before
+    /// paying for the model draft. Tail verification still decides acceptance.
+    pub lookup_min_ngram: u32,
+    pub lookup_max_ngram: u32,
+    pub lookup_max_tokens: u32,
 }
 
 impl Default for SpecDecodeConfig {
     fn default() -> Self {
-        // max_k=16 measured optimal on Apple Silicon Gemma-4-E4B-Q4 + Gemma-3-270M draft:
-        // 92% accept rate, 5 spec rounds for 48 tokens, 2.88× over baseline. k=24 hits
-        // a Metal kernel cliff (tail decode jumps 13ms → 158ms per round); k=8 leaves
-        // a third of the win on the table.
-        Self { enabled: true, start_k: 4, min_k: 1, max_k: 16, disable_after_consec_zero: 3 }
+        // Real Gemma-4 head/tail shards have low draft agreement with the
+        // Gemma-3 270M draft. Keep the lookup window conservative by default:
+        // 2-token repeats are common in lists/translations but were too weak
+        // to safely carry multi-token guesses in varied prompt tests.
+        Self {
+            enabled: true,
+            start_k: 1,
+            min_k: 1,
+            max_k: 1,
+            disable_after_consec_zero: 0,
+            lookup_min_ngram: 3,
+            lookup_max_ngram: 16,
+            lookup_max_tokens: 2,
+        }
     }
+}
+
+impl SpecDecodeConfig {
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        config.apply_env();
+        config
+    }
+
+    fn apply_env(&mut self) {
+        if let Ok(raw) = env::var("LLAMA_STAGE_SPEC_ENABLED") {
+            self.enabled =
+                !matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off");
+        }
+        if let Some(value) = env_u32("LLAMA_STAGE_SPEC_START_K") {
+            self.start_k = value;
+        }
+        if let Some(value) = env_u32("LLAMA_STAGE_SPEC_MIN_K") {
+            self.min_k = value;
+        }
+        if let Some(value) = env_u32("LLAMA_STAGE_SPEC_MAX_K") {
+            self.max_k = value;
+        }
+        if let Some(value) = env_u32("LLAMA_STAGE_SPEC_DISABLE_AFTER_ZERO") {
+            self.disable_after_consec_zero = value;
+        }
+        if let Some(value) = env_u32("LLAMA_STAGE_SPEC_LOOKUP_MIN_NGRAM") {
+            self.lookup_min_ngram = value;
+        }
+        if let Some(value) = env_u32("LLAMA_STAGE_SPEC_LOOKUP_MAX_NGRAM") {
+            self.lookup_max_ngram = value;
+        }
+        if let Some(value) = env_u32("LLAMA_STAGE_SPEC_LOOKUP_MAX_TOKENS") {
+            self.lookup_max_tokens = value;
+        }
+
+        self.min_k = self.min_k.max(1);
+        self.max_k = self.max_k.max(self.min_k);
+        self.start_k = self.start_k.max(self.min_k).min(self.max_k);
+        if self.lookup_min_ngram == 0 || self.lookup_max_ngram == 0 {
+            self.lookup_min_ngram = 0;
+            self.lookup_max_ngram = 0;
+        } else {
+            self.lookup_min_ngram = self.lookup_min_ngram.max(1);
+            self.lookup_max_ngram = self.lookup_max_ngram.max(self.lookup_min_ngram);
+            self.lookup_max_tokens = self.lookup_max_tokens.max(1);
+        }
+    }
+}
+
+fn lookup_draft_tokens(context: &[i32], k: usize, min_ngram: usize, max_ngram: usize) -> Vec<i32> {
+    if k == 0 || min_ngram == 0 || max_ngram == 0 || context.len() <= min_ngram {
+        return Vec::new();
+    }
+
+    let max_n = max_ngram.min(context.len() - 1);
+    if max_n < min_ngram {
+        return Vec::new();
+    }
+
+    for n in (min_ngram..=max_n).rev() {
+        let suffix_start = context.len() - n;
+        let suffix = &context[suffix_start..];
+        let last_start_with_next = context.len().saturating_sub(n + 1);
+        for start in (0..=last_start_with_next).rev() {
+            if &context[start..start + n] == suffix {
+                let next_start = start + n;
+                let next_end = (next_start + k.min(n)).min(context.len());
+                if next_start < next_end {
+                    return context[next_start..next_end].to_vec();
+                }
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    env::var(name).ok().and_then(|raw| raw.parse::<u32>().ok())
 }
 
 pub struct RemoteStageGateway {
@@ -2910,6 +3026,7 @@ impl RemoteStageGateway {
                 tail_tensor,
                 text: String::new(),
                 token_ids: Vec::new(),
+                context_token_ids: prompt_tokens.clone(),
                 timings: RemoteStageTimings {
                     head_prefill_ms,
                     head_decode_ms: 0,
@@ -2973,6 +3090,8 @@ impl RemoteStageGateway {
                 head_n_pos: n_pos_after_prefill,
                 current_k: self.spec_config.start_k.max(self.spec_config.min_k),
                 consec_low_accept: 0,
+                spec_suspended: false,
+                pending_draft_commit: Vec::new(),
             },
         );
 
@@ -3031,6 +3150,7 @@ impl RemoteStageGateway {
 
         session.text.push_str(&sampled.piece);
         session.token_ids.push(sampled.token_id);
+        session.context_token_ids.push(sampled.token_id);
 
         let done = sampled.is_eog || session.token_ids.len() as u32 >= session.max_tokens;
         if done {
@@ -3059,7 +3179,7 @@ impl RemoteStageGateway {
         //   3. Single-token decode (legacy path) otherwise.
         if let Some(next) = session.pending_committed.pop_front() {
             session.pending_tail_sample = Some(next);
-        } else if self.spec_active() {
+        } else if self.spec_active() && !session.spec_suspended {
             self.run_spec_round(request_id, &mut session, sampled.token_id)?;
         } else {
             self.run_single_step(request_id, &mut session, sampled.token_id)?;
@@ -3183,13 +3303,33 @@ impl RemoteStageGateway {
         session: &mut GatewaySessionState,
         last_token: i32,
     ) -> Result<()> {
-        let k = session.current_k.max(self.spec_config.min_k).min(self.spec_config.max_k);
-
-        let draft =
-            self.draft.as_mut().expect("run_spec_round invoked while spec_active() is true");
-        let draft_pos_before = draft.current_pos();
         let draft_started = Instant::now();
-        let drafts = draft.greedy_step_k(last_token, k)?;
+        let requested_k = session.current_k.max(self.spec_config.min_k).min(self.spec_config.max_k);
+        let lookup_k = if self.spec_config.lookup_max_tokens > 0 {
+            self.spec_config.lookup_max_tokens
+        } else {
+            requested_k
+        };
+        let mut used_lookup_draft = false;
+        let mut pending_draft_commit = Vec::new();
+        let mut draft_pos_before = 0;
+        let lookup_drafts = lookup_draft_tokens(
+            &session.context_token_ids,
+            lookup_k as usize,
+            self.spec_config.lookup_min_ngram as usize,
+            self.spec_config.lookup_max_ngram as usize,
+        );
+        let drafts = if !lookup_drafts.is_empty() {
+            used_lookup_draft = true;
+            lookup_drafts
+        } else {
+            let draft =
+                self.draft.as_mut().expect("run_spec_round invoked while spec_active() is true");
+            pending_draft_commit = std::mem::take(&mut session.pending_draft_commit);
+            draft_pos_before = draft.current_pos();
+            draft.greedy_step_k_with_prefix(&pending_draft_commit, last_token, requested_k)?
+        };
+        let effective_k = drafts.len() as u32;
         let draft_elapsed = draft_started.elapsed();
         session.timings.spec_draft_ms += draft_elapsed.as_millis() as u64;
         session.timings.spec_draft_us += draft_elapsed.as_micros() as u64;
@@ -3336,28 +3476,48 @@ impl RemoteStageGateway {
             session.head_n_pos = head_keep;
         }
 
-        // Roll the draft KV back to (state-before-greedy) + last_token + accepted.
-        // greedy_step writes its INPUT to KV then samples the next token, so
-        // after greedy_step_k(T, k) the chain wrote T, D_1, ..., D_{k-1} but
-        // NOT D_k (D_k was sampled past the written window). When tail accepts
-        // all k drafts, the draft KV is one position short of target — feed
-        // D_k now so subsequent rounds seed cleanly with the bonus token.
-        let target_pos = draft_pos_before + 1 + accepted_count as i32;
-        if target_pos > draft.current_pos() {
-            if let Some(&last_draft) = drafts.last() {
-                let _ = draft.greedy_step(last_draft)?;
+        if used_lookup_draft {
+            // The model draft did no work this round. Keep it catch-up aligned
+            // by deferring the verified target tokens that precede the next
+            // round's `last_token`; a later model-draft fallback will prefill
+            // these in one chunk before sampling.
+            session.pending_draft_commit.push(last_token);
+            session
+                .pending_draft_commit
+                .extend(drafts.iter().copied().take(accepted_count as usize));
+        } else {
+            let draft =
+                self.draft.as_mut().expect("run_spec_round invoked while spec_active() is true");
+            // Align draft KV to (state-before-greedy) + pending + last_token + accepted.
+            // greedy_step writes its INPUT to KV then samples the next token, so
+            // after greedy_step_k(T, k) the chain wrote T, D_1, ..., D_{k-1} but
+            // NOT D_k (D_k was sampled past the written window). On full accept,
+            // defer D_k and batch it into the next draft decode with the bonus
+            // token instead of paying an extra one-token draft call here.
+            let target_pos =
+                draft_pos_before + pending_draft_commit.len() as i32 + 1 + accepted_count as i32;
+            if target_pos > draft.current_pos() {
+                if let Some(&last_draft) = drafts.last() {
+                    session.pending_draft_commit.push(last_draft);
+                }
+            } else {
+                draft.rollback_to(target_pos)?;
             }
         }
-        draft.rollback_to(target_pos)?;
 
         // Adaptive k: shrink on consecutive low accepts, recover on full
         // accepts. Bound by [min_k, max_k] from spec_config.
         if accepted_count == 0 {
             session.consec_low_accept = session.consec_low_accept.saturating_add(1);
-            if session.consec_low_accept >= 2 {
+            if effective_k <= self.spec_config.min_k
+                && self.spec_config.disable_after_consec_zero > 0
+                && session.consec_low_accept >= self.spec_config.disable_after_consec_zero
+            {
+                session.spec_suspended = true;
+            } else if session.consec_low_accept >= 2 {
                 session.current_k = (session.current_k / 2).max(self.spec_config.min_k);
             }
-        } else if accepted_count == k {
+        } else if accepted_count == effective_k {
             session.consec_low_accept = 0;
             session.current_k = (session.current_k.saturating_mul(2))
                 .min(self.spec_config.max_k)
@@ -3614,17 +3774,17 @@ fn resolve_vendor_lib_dir() -> Result<PathBuf> {
         }
     }
 
+    let baked = PathBuf::from(env!("LLAMA_STAGE_VENDOR_LIB_DIR"));
+    if dir_has_libllama(&baked) {
+        return Ok(baked);
+    }
+
     if let Some(bin_dir) = default_compute_bin_dir() {
         for candidate in [bin_dir.clone(), bin_dir.join("lib")] {
             if dir_has_libllama(&candidate) {
                 return Ok(candidate);
             }
         }
-    }
-
-    let baked = PathBuf::from(env!("LLAMA_STAGE_VENDOR_LIB_DIR"));
-    if dir_has_libllama(&baked) {
-        return Ok(baked);
     }
 
     bail!(
@@ -4222,7 +4382,8 @@ impl StageForwardBackend for LlamaStageBackend {
         if Self::debug_flow_enabled() {
             tracing::debug!(
                 "[llama-stage] sample_tail returning stage={} text={:?}",
-                layout.stage_id, cached.sample.text
+                layout.stage_id,
+                cached.sample.text
             );
         }
 
@@ -4552,6 +4713,25 @@ mod wire_tests {
         assert!(!json.contains("tail_sample"), "tail_sample should be skipped when None: {json}");
         assert!(!json.contains("profile"), "profile should be skipped when None: {json}");
     }
+
+    #[test]
+    fn lookup_draft_uses_most_recent_exact_suffix_match() {
+        let context = [1, 2, 3, 4, 9, 2, 3, 4, 10, 2, 3, 4];
+        assert_eq!(lookup_draft_tokens(&context, 2, 3, 8), vec![10, 2]);
+    }
+
+    #[test]
+    fn lookup_draft_respects_min_ngram() {
+        let context = [1, 7, 2, 7];
+        assert!(lookup_draft_tokens(&context, 1, 2, 8).is_empty());
+        assert_eq!(lookup_draft_tokens(&context, 1, 1, 8), vec![2]);
+    }
+
+    #[test]
+    fn lookup_draft_caps_guess_to_suffix_len() {
+        let context = [1, 2, 10, 11, 12, 1, 2];
+        assert_eq!(lookup_draft_tokens(&context, 8, 2, 8), vec![10, 11]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4571,6 +4751,7 @@ pub struct DraftEngine {
     model: LlamaModelHandle,
     session: LlamaSession,
     n_vocab: usize,
+    max_batch_tokens: usize,
     next_pos: i32,
 }
 
@@ -4584,14 +4765,22 @@ impl DraftEngine {
     pub fn load(model_path: impl AsRef<Path>) -> Result<Self> {
         let api = LlamaApi::load()?;
         let model = LlamaModelHandle::new(&api, model_path.as_ref())?;
-        let session = model.create_session(&api)?;
+        let n_ctx = env_u32("LLAMA_STAGE_DRAFT_N_CTX").unwrap_or(8192);
+        let n_batch = env_u32("LLAMA_STAGE_DRAFT_N_BATCH").unwrap_or(64).max(1);
+        let n_ubatch = env_u32("LLAMA_STAGE_DRAFT_N_UBATCH").unwrap_or(n_batch).max(1);
+        let session = model.create_session_with_limits(&api, n_ctx, n_batch, n_ubatch)?;
         session.clear_memory(&api);
         let vocab = unsafe { (api.model_get_vocab)(model.model) };
         if vocab.is_null() {
             bail!("draft model vocab unavailable");
         }
         let n_vocab = unsafe { (api.vocab_n_tokens)(vocab) as usize };
-        Ok(Self { api, model, session, n_vocab, next_pos: 0 })
+        let mut draft =
+            Self { api, model, session, n_vocab, max_batch_tokens: n_batch as usize, next_pos: 0 };
+        if std::env::var_os("LLAMA_STAGE_DRAFT_SKIP_WARMUP").is_none() {
+            draft.warmup()?;
+        }
+        Ok(draft)
     }
 
     pub fn n_vocab(&self) -> usize {
@@ -4607,6 +4796,23 @@ impl DraftEngine {
     pub fn reset(&mut self) {
         self.session.clear_memory(&self.api);
         self.next_pos = 0;
+    }
+
+    fn warmup(&mut self) -> Result<()> {
+        let warmup_token = 0;
+        let batch = OwnedBatch::token_only(vec![warmup_token, warmup_token]);
+        let rc = unsafe { (self.api.decode)(self.session.ctx, batch.raw) };
+        if rc != 0 && rc != 1 {
+            bail!("draft warmup llama_decode returned {rc}");
+        }
+        let logits = unsafe { (self.api.get_logits_ith)(self.session.ctx, -1) };
+        if logits.is_null() {
+            bail!("draft warmup logits null after decode");
+        }
+        let first = unsafe { *logits };
+        std::hint::black_box(first);
+        self.reset();
+        Ok(())
     }
 
     /// Tokenize text using the draft model's vocab. For canary-string startup
@@ -4643,12 +4849,14 @@ impl DraftEngine {
         if tokens.is_empty() {
             return Ok(());
         }
-        let batch = OwnedBatch::token_only(tokens.to_vec());
-        let rc = unsafe { (self.api.decode)(self.session.ctx, batch.raw) };
-        if rc != 0 && rc != 1 {
-            bail!("draft prefill llama_decode returned {rc}");
+        for chunk in tokens.chunks(self.max_batch_tokens) {
+            let batch = OwnedBatch::token_only(chunk.to_vec());
+            let rc = unsafe { (self.api.decode)(self.session.ctx, batch.raw) };
+            if rc != 0 && rc != 1 {
+                bail!("draft prefill llama_decode returned {rc}");
+            }
+            self.next_pos += chunk.len() as i32;
         }
-        self.next_pos += tokens.len() as i32;
         Ok(())
     }
 
@@ -4685,6 +4893,55 @@ impl DraftEngine {
             let next = self.greedy_step(cur)?;
             out.push(next);
             cur = next;
+        }
+        Ok(out)
+    }
+
+    /// Like `greedy_step_k`, but first commits target-accepted draft tokens
+    /// that were deferred from a prior full-accept round. The prefix and the
+    /// current `last_token` are decoded in one batch, avoiding an extra draft
+    /// call while leaving the KV in the same state as separate greedy steps.
+    pub fn greedy_step_k_with_prefix(
+        &mut self,
+        prefix_tokens: &[i32],
+        last_token: i32,
+        k: u32,
+    ) -> Result<Vec<i32>> {
+        if prefix_tokens.is_empty() {
+            return self.greedy_step_k(last_token, k);
+        }
+        if k == 0 {
+            self.prefill(prefix_tokens)?;
+            return Ok(Vec::new());
+        }
+        if prefix_tokens.len() + 1 > self.max_batch_tokens {
+            self.prefill(prefix_tokens)?;
+            return self.greedy_step_k(last_token, k);
+        }
+
+        let mut tokens = Vec::with_capacity(prefix_tokens.len() + 1);
+        tokens.extend_from_slice(prefix_tokens);
+        tokens.push(last_token);
+        let batch = OwnedBatch::token_only(tokens);
+        let rc = unsafe { (self.api.decode)(self.session.ctx, batch.raw) };
+        if rc != 0 && rc != 1 {
+            bail!("draft greedy_step_k_with_prefix llama_decode returned {rc}");
+        }
+        self.next_pos += prefix_tokens.len() as i32 + 1;
+
+        let logits = unsafe { (self.api.get_logits_ith)(self.session.ctx, -1) };
+        if logits.is_null() {
+            bail!("draft logits null after prefix decode");
+        }
+        let logits = unsafe { slice::from_raw_parts(logits, self.n_vocab) };
+        let (token_id, _) = argmax_f32(logits).context("empty draft logits buffer")?;
+
+        let mut out = Vec::with_capacity(k as usize);
+        let mut cur = token_id as i32;
+        out.push(cur);
+        for _ in 1..k {
+            cur = self.greedy_step(cur)?;
+            out.push(cur);
         }
         Ok(out)
     }

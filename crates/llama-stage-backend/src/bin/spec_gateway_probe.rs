@@ -196,14 +196,8 @@ fn main() -> Result<()> {
     drop(baseline_gw);
 
     // === Spec run: connect_with_draft enables the spec path. ===
-    eprintln!("[probe] === spec (k_max=4 adaptive) ===");
-    let spec_config = SpecDecodeConfig {
-        enabled: true,
-        start_k: 4,
-        min_k: 1,
-        max_k: 16,
-        disable_after_consec_zero: 3,
-    };
+    let spec_config = SpecDecodeConfig::from_env();
+    eprintln!("[probe] === spec ({spec_config:?}) ===");
     let mut spec_gw = RemoteStageGateway::connect_with_draft(
         head.addr(),
         tail.addr(),

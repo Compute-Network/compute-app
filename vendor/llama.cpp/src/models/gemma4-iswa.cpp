@@ -35,7 +35,8 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
     // TODO: is causal == true correct? might need some changes
     auto * inp_attn = build_attn_inp_kv_iswa();
 
-    ggml_tensor * inp_out_ids = end_layer == n_layer - 1 ? build_inp_out_ids() : nullptr;
+    ggml_tensor * inp_out_ids =
+        end_layer == n_layer - 1 && !split_stage_output_embeddings ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * inp_per_layer = nullptr;
     if (model.per_layer_tok_embd) {
@@ -246,7 +247,7 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
     }
     cur = inpL;
 
-    if (end_layer < n_layer - 1) {
+    if (split_stage_output_embeddings || end_layer < n_layer - 1) {
         res->t_embd = cur;
         ggml_build_forward_expand(gf, cur);
         return;

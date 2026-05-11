@@ -23,6 +23,13 @@ use if_addrs::{IfAddr, get_if_addrs};
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, UdpSocket};
 
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Serialize)]
 struct IdentifyMessage {
     r#type: String,
@@ -209,6 +216,12 @@ pub struct RelayClient {
     last_latency_ms: Arc<AtomicU64>,
     /// Real tok/s from the last inference response (stored as f64 bits)
     last_tps: Arc<AtomicU64>,
+    /// Wall-clock millis when `last_tps` was last written (UNIX epoch).
+    /// 0 means never. The runtime uses this to keep the throughput chart
+    /// alive for a few seconds after a request completes, since the
+    /// 1Hz metrics tick almost never lands inside the microsecond
+    /// window between `active_requests` decrement and `last_tps` store.
+    last_tps_at_ms: Arc<AtomicU64>,
     /// Number of successfully completed relay requests observed by this process
     completed_requests: Arc<AtomicU64>,
     /// Whether a relay request is actively being processed
@@ -242,6 +255,10 @@ impl RelayClient {
 
     pub fn last_tps(&self) -> Arc<AtomicU64> {
         self.last_tps.clone()
+    }
+
+    pub fn last_tps_at_ms(&self) -> Arc<AtomicU64> {
+        self.last_tps_at_ms.clone()
     }
 
     pub fn completed_requests(&self) -> Arc<AtomicU64> {
@@ -290,6 +307,7 @@ impl RelayClient {
             shutdown,
             last_latency_ms: Arc::new(AtomicU64::new(0)),
             last_tps: Arc::new(AtomicU64::new(0)),
+            last_tps_at_ms: Arc::new(AtomicU64::new(0)),
             completed_requests: Arc::new(AtomicU64::new(0)),
             is_active: Arc::new(AtomicBool::new(false)),
             is_connected: Arc::new(AtomicBool::new(false)),
@@ -479,6 +497,7 @@ impl RelayClient {
                             let active_requests = self.active_requests.clone();
                             let last_latency_ms = self.last_latency_ms.clone();
                             let last_tps = self.last_tps.clone();
+                            let last_tps_at_ms = self.last_tps_at_ms.clone();
                             let completed_requests = self.completed_requests.clone();
                             let active_cancels = active_cancels.clone();
                             let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -514,6 +533,7 @@ impl RelayClient {
                                             let tps =
                                                 (comp_tokens as f64 / total_ms as f64) * 1000.0;
                                             last_tps.store(tps.to_bits(), Ordering::Relaxed);
+                                            last_tps_at_ms.store(now_epoch_ms(), Ordering::Relaxed);
                                         }
                                     }
                                     if (200..400).contains(&final_response.status) {
@@ -595,6 +615,7 @@ impl RelayClient {
                                         .or(gateway_tps)
                                     {
                                         last_tps.store(tps.to_bits(), Ordering::Relaxed);
+                                        last_tps_at_ms.store(now_epoch_ms(), Ordering::Relaxed);
                                     }
                                     if (200..400).contains(&response.status) {
                                         completed_requests.fetch_add(1, Ordering::Relaxed);

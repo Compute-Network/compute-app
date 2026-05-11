@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -252,6 +252,32 @@ struct ConfigItem {
     kind: ConfigItemKind,
 }
 
+#[derive(Clone, Copy)]
+enum LocalChatLineKind {
+    User,
+    Assistant,
+    Status,
+    Error,
+}
+
+struct LocalChatLine {
+    kind: LocalChatLineKind,
+    label: String,
+    text: String,
+}
+
+struct LocalChatResponse {
+    backend: String,
+    elapsed: Duration,
+}
+
+enum LocalChatEvent {
+    Start { model_label: String },
+    Delta(String),
+    Done(LocalChatResponse),
+    Error(String),
+}
+
 const CONFIG_ITEMS: &[ConfigItem] = &[
     ConfigItem { label: "Node Name", key: "node.name", kind: ConfigItemKind::Text },
     ConfigItem { label: "Usage Priority", key: "node.max_gpu_usage", kind: ConfigItemKind::Choice },
@@ -290,7 +316,7 @@ pub struct Dashboard {
     pipeline: PipelineStatus,
     network: NetworkStats,
     throughput_history: VecDeque<u64>,
-    smoothed_tps: f64,
+    throughput_phase: f64,
     last_throughput_push: Instant,
     sys: sysinfo::System,
     live_metrics: LiveMetrics,
@@ -310,6 +336,11 @@ pub struct Dashboard {
     models_selected: usize,
     model_downloads: BTreeMap<String, f64>, // model_id -> progress 0.0-1.0, negative = failed
     download_progress_rxs: Vec<std::sync::mpsc::Receiver<(String, f64)>>,
+    local_chat_input: String,
+    local_chat_focused: bool,
+    local_chat_pending: bool,
+    local_chat_lines: VecDeque<LocalChatLine>,
+    local_chat_rx: Option<mpsc::Receiver<LocalChatEvent>>,
 }
 
 impl Dashboard {
@@ -345,7 +376,7 @@ impl Dashboard {
             pipeline: PipelineStatus::default(),
             network,
             throughput_history: VecDeque::from(vec![0; 60]),
-            smoothed_tps: 0.0,
+            throughput_phase: 0.0,
             last_throughput_push: Instant::now(),
             sys: sysinfo::System::new_all(),
             live_metrics: LiveMetrics::default(),
@@ -365,6 +396,11 @@ impl Dashboard {
             models_selected: 0,
             model_downloads: BTreeMap::new(),
             download_progress_rxs: Vec::new(),
+            local_chat_input: String::new(),
+            local_chat_focused: false,
+            local_chat_pending: false,
+            local_chat_lines: VecDeque::new(),
+            local_chat_rx: None,
         }
     }
 
@@ -380,6 +416,15 @@ impl Dashboard {
                 && key.kind == KeyEventKind::Press
             {
                 match key.code {
+                    _ if self.local_chat_focused && self.active_tab == Tab::Logs => {
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            return Ok(());
+                        }
+                        self.handle_local_chat_key(key.code);
+                        continue;
+                    }
                     // Config editing mode intercepts all keys
                     _ if self.config_editing && self.active_tab == Tab::Config => {
                         self.handle_config_key(key.code);
@@ -428,6 +473,11 @@ impl Dashboard {
                     KeyCode::Char('/') if self.active_tab == Tab::Logs => {
                         self.show_debug_logs = !self.show_debug_logs;
                         self.log_scroll = 0;
+                    }
+                    KeyCode::Enter if self.active_tab == Tab::Logs => {
+                        if !self.local_chat_pending {
+                            self.local_chat_focused = true;
+                        }
                     }
                     KeyCode::Up if self.active_tab == Tab::Config => {
                         if self.config_selected > 0 {
@@ -480,7 +530,31 @@ impl Dashboard {
     }
 
     fn tick(&mut self) {
-        self.globe.tick();
+        self.globe.tick_active(self.pipeline.active_requests > 0);
+
+        let mut chat_events = Vec::new();
+        let mut chat_disconnected = false;
+        if let Some(rx) = self.local_chat_rx.as_ref() {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => chat_events.push(event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        chat_disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let saw_terminal_chat_event = chat_events
+            .iter()
+            .any(|event| matches!(event, LocalChatEvent::Done(_) | LocalChatEvent::Error(_)));
+        if chat_disconnected && !saw_terminal_chat_event {
+            chat_events.push(LocalChatEvent::Error("local chat worker disconnected".into()));
+        }
+        for event in chat_events {
+            self.handle_local_chat_event(event);
+        }
 
         // Poll manual model download progress. Keep receivers independent so
         // users can queue several model downloads from the Models tab.
@@ -520,26 +594,8 @@ impl Dashboard {
                 self.model_downloads.insert(download.model_id, progress);
             }
 
-            // Smooth toward target
-            let target = state.pipeline.tokens_per_sec;
-            if target > self.smoothed_tps {
-                self.smoothed_tps += (target - self.smoothed_tps) * 0.3;
-            } else {
-                self.smoothed_tps += (target - self.smoothed_tps) * 0.15;
-            }
-            if self.smoothed_tps < 1.0 {
-                self.smoothed_tps = 0.0;
-            }
-
-            // Push every 200ms (60 entries = 12 seconds visible)
-            // O(1) VecDeque operations instead of O(n) Vec::remove(0)
-            if self.last_throughput_push.elapsed() >= Duration::from_millis(200) {
-                if self.throughput_history.len() >= 60 {
-                    self.throughput_history.pop_front();
-                }
-                self.throughput_history.push_back(self.smoothed_tps as u64);
-                self.last_throughput_push = Instant::now();
-            }
+            let processing = state.pipeline.active_requests > 0;
+            self.update_throughput_pattern(processing);
 
             self.pipeline = state.pipeline;
         } else {
@@ -549,14 +605,7 @@ impl Dashboard {
                 self.last_metrics_update = Instant::now();
             }
 
-            // Push one value every 500ms
-            if self.last_throughput_push.elapsed() >= Duration::from_millis(500) {
-                if self.throughput_history.len() >= 60 {
-                    self.throughput_history.pop_front();
-                }
-                self.throughput_history.push_back(0);
-                self.last_throughput_push = Instant::now();
-            }
+            self.update_throughput_pattern(false);
         }
 
         // Refresh logs every 2 seconds when on logs tab
@@ -574,6 +623,126 @@ impl Dashboard {
             }
             self.last_network_update = Instant::now();
         }
+    }
+
+    fn update_throughput_pattern(&mut self, processing: bool) {
+        let interval =
+            if processing { Duration::from_millis(100) } else { Duration::from_millis(250) };
+        if self.last_throughput_push.elapsed() < interval {
+            return;
+        }
+
+        if self.throughput_history.len() >= 60 {
+            self.throughput_history.pop_front();
+        }
+
+        if processing {
+            self.throughput_phase += 0.42;
+            let i = self.throughput_history.len() as f64;
+            let primary = ((i * 0.4) + self.throughput_phase * 1.2).sin() * 0.5 + 0.5;
+            let secondary = (self.throughput_phase * 0.67).sin() * 0.5 + 0.5;
+            let value = (6.0 + primary * 28.0 + secondary * 5.0).round().clamp(1.0, 40.0);
+            self.throughput_history.push_back(value as u64);
+        } else {
+            self.throughput_phase += 0.12;
+            self.throughput_history.push_back(0);
+        }
+
+        self.last_throughput_push = Instant::now();
+    }
+
+    fn handle_local_chat_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.local_chat_focused = false;
+                self.local_chat_input.clear();
+            }
+            KeyCode::Enter => {
+                let prompt = self.local_chat_input.trim().to_string();
+                self.local_chat_input.clear();
+                self.local_chat_focused = false;
+                if !prompt.is_empty() {
+                    self.submit_local_chat(prompt);
+                }
+            }
+            KeyCode::Backspace => {
+                self.local_chat_input.pop();
+            }
+            KeyCode::Char(c) => {
+                self.local_chat_input.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    fn push_local_chat_line(
+        &mut self,
+        kind: LocalChatLineKind,
+        label: String,
+        text: impl Into<String>,
+    ) {
+        self.local_chat_lines.push_back(LocalChatLine { kind, label, text: text.into() });
+        while self.local_chat_lines.len() > 24 {
+            self.local_chat_lines.pop_front();
+        }
+    }
+
+    fn handle_local_chat_event(&mut self, event: LocalChatEvent) {
+        self.log_scroll = 0;
+        match event {
+            LocalChatEvent::Start { model_label } => {
+                self.push_local_chat_line(LocalChatLineKind::Assistant, model_label, String::new());
+            }
+            LocalChatEvent::Delta(delta) => {
+                if let Some(line) = self
+                    .local_chat_lines
+                    .iter_mut()
+                    .rev()
+                    .find(|line| matches!(line.kind, LocalChatLineKind::Assistant))
+                {
+                    line.text.push_str(&delta);
+                }
+            }
+            LocalChatEvent::Done(response) => {
+                self.local_chat_rx = None;
+                self.local_chat_pending = false;
+                self.push_local_chat_line(
+                    LocalChatLineKind::Status,
+                    "local".to_string(),
+                    format!(
+                        "completed via {} in {:.2}s",
+                        response.backend,
+                        response.elapsed.as_secs_f64()
+                    ),
+                );
+            }
+            LocalChatEvent::Error(err) => {
+                self.local_chat_rx = None;
+                self.local_chat_pending = false;
+                self.push_local_chat_line(LocalChatLineKind::Error, "error".to_string(), err);
+            }
+        }
+    }
+
+    fn submit_local_chat(&mut self, prompt: String) {
+        if self.local_chat_pending {
+            self.push_local_chat_line(
+                LocalChatLineKind::Status,
+                "local".to_string(),
+                "local node is still answering",
+            );
+            return;
+        }
+
+        self.push_local_chat_line(LocalChatLineKind::User, "user".to_string(), prompt.clone());
+        self.log_scroll = 0;
+
+        let (tx, rx) = mpsc::channel();
+        self.local_chat_rx = Some(rx);
+        self.local_chat_pending = true;
+        std::thread::spawn(move || {
+            run_local_chat_request(&prompt, tx);
+        });
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -969,18 +1138,16 @@ impl Dashboard {
         )));
         frame.render_widget(label, chunks[0]);
 
-        // Fixed scale: max 200, baseline offset 25 (always 1 visible block)
-        let display_data: Vec<u64> = self.throughput_history.iter().map(|&v| v + 25).collect();
+        let display_data: Vec<u64> = self.throughput_history.iter().copied().collect();
 
         let sparkline =
-            Sparkline::default().data(&display_data).max(200).style(Style::default().fg(p.text));
+            Sparkline::default().data(&display_data).max(40).style(Style::default().fg(p.text));
 
         let sparkline_area =
             Rect { x: chunks[2].x + 2, width: chunks[2].width.saturating_sub(4), ..chunks[2] };
         frame.render_widget(sparkline, sparkline_area);
 
-        // Show actual value (0 when idle, not 1)
-        let current_tps = self.throughput_history.back().unwrap_or(&0);
+        let current_tps = self.pipeline.tokens_per_sec.max(0.0).round() as u64;
         let tps_label = Paragraph::new(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -1024,6 +1191,8 @@ impl Dashboard {
 
         if self.active_tab == Tab::Logs && w >= 58 {
             spans.extend([
+                Span::styled(" [Enter]", dim),
+                Span::styled(" chat ", dim),
                 Span::styled(" [/]", dim),
                 Span::styled(if self.show_debug_logs { "hide debug" } else { "show debug" }, dim),
             ]);
@@ -1035,22 +1204,32 @@ impl Dashboard {
 
     fn draw_logs_panel(&self, frame: &mut Frame, area: Rect) {
         let p = theme::palette();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        let show_local_chat_input = self.local_chat_focused || self.local_chat_pending;
+        let constraints = if show_local_chat_input {
+            vec![
+                Constraint::Length(5), // Header
+                Constraint::Min(5),    // Log content
+                Constraint::Length(3), // Local chat input
+                Constraint::Length(1), // Shortcuts
+            ]
+        } else {
+            vec![
                 Constraint::Length(5), // Header
                 Constraint::Min(5),    // Log content
                 Constraint::Length(1), // Shortcuts
-            ])
-            .split(area);
+            ]
+        };
+        let chunks =
+            Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
 
         self.draw_header(frame, chunks[0]);
 
         let visible_height = chunks[1].height as usize;
+        let wrap_width = chunks[1].width.saturating_sub(2).max(1) as usize;
 
         if self.log_lines.is_empty() {
             // Generate live status lines from daemon state
-            let mut lines = vec![
+            let mut visual_lines = vec![
                 Line::from(Span::styled(
                     "  LIVE STATUS",
                     Style::default().fg(p.dim).add_modifier(Modifier::BOLD),
@@ -1065,27 +1244,27 @@ impl Dashboard {
                 let m = (uptime % 3600) / 60;
                 let s = uptime % 60;
 
-                lines.push(Line::from(Span::styled(
+                visual_lines.push(Line::from(Span::styled(
                     format!("  [{h:02}:{m:02}:{s:02}] Daemon running"),
                     Style::default().fg(p.success),
                 )));
-                lines.push(Line::from(Span::styled(
+                visual_lines.push(Line::from(Span::styled(
                     format!("  [{h:02}:{m:02}:{s:02}] Idle state: {}", state.idle_state),
                     Style::default().fg(p.muted),
                 )));
-                lines.push(Line::from(Span::styled(
+                visual_lines.push(Line::from(Span::styled(
                     format!(
                         "  [{h:02}:{m:02}:{s:02}] CPU: {:.0}% | RAM: {:.1}GB",
                         state.live_metrics.cpu_usage, state.live_metrics.memory_used_gb
                     ),
                     Style::default().fg(p.muted),
                 )));
-                lines.push(Line::from(Span::styled(
+                visual_lines.push(Line::from(Span::styled(
                     format!("  [{h:02}:{m:02}:{s:02}] Inference: {}", state.inference_status),
                     Style::default().fg(p.muted),
                 )));
                 if state.pipeline.active {
-                    lines.push(Line::from(Span::styled(
+                    visual_lines.push(Line::from(Span::styled(
                         format!(
                             "  [{h:02}:{m:02}:{s:02}] Pipeline active: {:.1} tok/s",
                             state.pipeline.tokens_per_sec
@@ -1094,19 +1273,23 @@ impl Dashboard {
                     )));
                 }
             } else {
-                lines.push(Line::from(Span::styled(
+                visual_lines.push(Line::from(Span::styled(
                     "  Daemon not connected",
                     Style::default().fg(p.dim),
                 )));
             }
 
-            let widget = Paragraph::new(lines)
+            self.append_local_chat_log_lines(&mut visual_lines, wrap_width);
+            let total = visual_lines.len();
+            let start = total.saturating_sub(visible_height);
+            let visible_lines: Vec<Line> = visual_lines[start..].to_vec();
+
+            let widget = Paragraph::new(visible_lines)
                 .wrap(Wrap { trim: false })
                 .block(Block::default().borders(Borders::NONE));
             frame.render_widget(widget, chunks[1]);
         } else {
             // Show log file content with scrolling
-            let wrap_width = chunks[1].width.saturating_sub(2).max(1) as usize;
             let mut visual_lines: Vec<Line> = Vec::new();
             for line in &self.log_lines {
                 let lower = line.to_ascii_lowercase();
@@ -1129,6 +1312,7 @@ impl Dashboard {
                         .push(Line::from(Span::styled(wrapped, Style::default().fg(color))));
                 }
             }
+            self.append_local_chat_log_lines(&mut visual_lines, wrap_width);
 
             let total = visual_lines.len();
             let max_scroll = total.saturating_sub(visible_height);
@@ -1153,7 +1337,57 @@ impl Dashboard {
             frame.render_widget(logs, chunks[1]);
         }
 
-        self.draw_shortcuts(frame, chunks[2]);
+        if show_local_chat_input {
+            self.draw_local_chat_input(frame, chunks[2]);
+            self.draw_shortcuts(frame, chunks[3]);
+        } else {
+            self.draw_shortcuts(frame, chunks[2]);
+        }
+    }
+
+    fn append_local_chat_log_lines(&self, visual_lines: &mut Vec<Line>, wrap_width: usize) {
+        let p = theme::palette();
+        if self.local_chat_lines.is_empty() {
+            return;
+        }
+        visual_lines.push(Line::from(""));
+        for entry in &self.local_chat_lines {
+            let color = match entry.kind {
+                LocalChatLineKind::User => p.text,
+                LocalChatLineKind::Assistant => p.success,
+                LocalChatLineKind::Status => p.dim,
+                LocalChatLineKind::Error => p.danger,
+            };
+            let prefix = format!("[{}]: ", entry.label);
+            for wrapped in wrap_plain_line(&format!("{prefix}{}", entry.text), wrap_width) {
+                visual_lines.push(Line::from(Span::styled(
+                    format!("  {wrapped}"),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+    }
+
+    fn draw_local_chat_input(&self, frame: &mut Frame, area: Rect) {
+        let p = theme::palette();
+        let input_label = if self.local_chat_focused {
+            format!("  > {}_", self.local_chat_input)
+        } else if self.local_chat_pending {
+            "  thinking...".into()
+        } else {
+            "  press Enter to chat with local node".into()
+        };
+        let widget = Paragraph::new(Line::from(Span::styled(
+            input_label,
+            Style::default().fg(if self.local_chat_focused || self.local_chat_pending {
+                p.success
+            } else {
+                p.dim
+            }),
+        )))
+        .block(Block::default().borders(Borders::TOP))
+        .wrap(Wrap { trim: false });
+        frame.render_widget(widget, area);
     }
 
     /// Get a config value for display. Caller should cache the Config if calling multiple times.
@@ -1892,6 +2126,309 @@ impl Dashboard {
         ]));
         frame.render_widget(footer, chunks[2]);
     }
+}
+
+enum LocalChatBackend {
+    Omlx { model_id: String, folder: String },
+    LlamaServer,
+}
+
+fn run_local_chat_request(prompt: &str, tx: mpsc::Sender<LocalChatEvent>) {
+    let started = Instant::now();
+    let result = match resolve_local_chat_backend() {
+        Ok(backend) => match backend {
+            LocalChatBackend::Omlx { model_id, folder } => {
+                let model_label = chat_model_label(&model_id);
+                let _ = tx.send(LocalChatEvent::Start { model_label: model_label.clone() });
+                stream_openai_chat(
+                    "http://127.0.0.1:8091/v1/chat/completions",
+                    &folder,
+                    prompt,
+                    &tx,
+                )
+                .map(|_| LocalChatResponse { backend: "omlx".into(), elapsed: started.elapsed() })
+            }
+            LocalChatBackend::LlamaServer => {
+                let model_label = chat_model_label(&active_model_id());
+                let _ = tx.send(LocalChatEvent::Start { model_label: model_label.clone() });
+                stream_openai_chat(
+                    "http://127.0.0.1:8090/v1/chat/completions",
+                    "local",
+                    prompt,
+                    &tx,
+                )
+                .map(|_| LocalChatResponse {
+                    backend: "llama-server".into(),
+                    elapsed: started.elapsed(),
+                })
+            }
+        },
+        Err(err) => Err(err),
+    };
+
+    match result {
+        Ok(response) => {
+            let _ = tx.send(LocalChatEvent::Done(response));
+        }
+        Err(err) => {
+            let _ = tx.send(LocalChatEvent::Error(err));
+        }
+    };
+}
+
+fn resolve_local_chat_backend() -> Result<LocalChatBackend, String> {
+    let config = compute_daemon::config::Config::load().unwrap_or_default();
+    let active = config.models.active_model.trim().to_string();
+    let models = model_entries();
+
+    let active_mlx = models.iter().find(|entry| {
+        entry.id == active
+            && uses_mlx_snapshot(entry)
+            && entry.mlx_folder.is_some()
+            && is_model_downloaded(entry.id)
+    });
+    let fallback_mlx = models.iter().find(|entry| {
+        uses_mlx_snapshot(entry) && entry.mlx_folder.is_some() && is_model_downloaded(entry.id)
+    });
+
+    if let Some(entry) = active_mlx.or(fallback_mlx) {
+        if is_http_ready("http://127.0.0.1:8091/v1/models") {
+            return Ok(LocalChatBackend::Omlx {
+                model_id: entry.id.to_string(),
+                folder: entry.mlx_folder.unwrap_or_default().to_string(),
+            });
+        }
+    }
+
+    if is_http_ready("http://127.0.0.1:8090/health") {
+        return Ok(LocalChatBackend::LlamaServer);
+    }
+
+    Err("local chat backend is not ready yet".into())
+}
+
+fn active_model_id() -> String {
+    compute_daemon::config::Config::load()
+        .map(|config| config.models.active_model)
+        .unwrap_or_else(|_| "local".into())
+}
+
+fn chat_model_label(model_id: &str) -> String {
+    match model_id {
+        "qwen-3.6" => "qwen3.6".into(),
+        "gemma-4-e4b-q4" => "gemma4".into(),
+        "gemma-4-26b-a4b-q4" => "gemma4".into(),
+        "" | "auto" => "node".into(),
+        other => other.to_string(),
+    }
+}
+
+fn no_think_prompt(prompt: &str) -> String {
+    format!("{prompt}\n\n/no_think")
+}
+
+fn is_http_ready(url: &str) -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+    client.get(url).send().is_ok_and(|resp| resp.status().is_success())
+}
+
+fn stream_openai_chat(
+    url: &str,
+    model: &str,
+    prompt: &str,
+    tx: &mpsc::Sender<LocalChatEvent>,
+) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|err| format!("local chat client failed: {err}"))?;
+    let user_prompt = no_think_prompt(prompt);
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Return only the final answer. Do not include thinking, chain-of-thought, analysis, planning, or reasoning steps."
+            },
+            {"role": "user", "content": user_prompt}
+        ],
+        "max_tokens": 192,
+        "temperature": 0.4,
+        "stream": true,
+        "enable_thinking": false,
+        "chat_template_kwargs": {
+            "enable_thinking": false
+        }
+    });
+
+    let mut response = client
+        .post(url)
+        .json(&body)
+        .send()
+        .map_err(|err| format!("local chat request failed: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().unwrap_or_default();
+        return Err(format!("local chat returned {status}: {text}"));
+    }
+
+    let mut pending = String::new();
+    let mut buffer = [0u8; 8192];
+    let mut saw_content = false;
+
+    loop {
+        let bytes_read = std::io::Read::read(&mut response, &mut buffer)
+            .map_err(|err| format!("local chat stream read failed: {err}"))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        pending.push_str(&String::from_utf8_lossy(&buffer[..bytes_read]));
+        while let Some(newline) = pending.find('\n') {
+            let raw_line = pending[..newline].trim_end_matches('\r').to_string();
+            pending.drain(..=newline);
+            if raw_line.trim().is_empty() {
+                continue;
+            }
+            let Some(data) = raw_line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                return if saw_content {
+                    Ok(())
+                } else {
+                    let content = post_openai_chat(url, model, prompt)?;
+                    if !content.is_empty() {
+                        let _ = tx.send(LocalChatEvent::Delta(content));
+                    }
+                    Ok(())
+                };
+            }
+
+            let value: serde_json::Value = serde_json::from_str(data)
+                .map_err(|err| format!("local chat stream parse failed: {err}"))?;
+            if let Some(delta) = extract_stream_delta(&value) {
+                if !delta.is_empty() {
+                    saw_content = true;
+                    let _ = tx.send(LocalChatEvent::Delta(delta));
+                }
+            }
+            if stream_choice_finished(&value) {
+                return if saw_content {
+                    Ok(())
+                } else {
+                    let content = post_openai_chat(url, model, prompt)?;
+                    if !content.is_empty() {
+                        let _ = tx.send(LocalChatEvent::Delta(content));
+                    }
+                    Ok(())
+                };
+            }
+        }
+    }
+
+    if saw_content {
+        Ok(())
+    } else {
+        let content = post_openai_chat(url, model, prompt)?;
+        if !content.is_empty() {
+            let _ = tx.send(LocalChatEvent::Delta(content));
+        }
+        Ok(())
+    }
+}
+
+fn extract_stream_delta(value: &serde_json::Value) -> Option<String> {
+    value
+        .pointer("/choices/0/delta/content")
+        .and_then(content_value_to_string)
+        .or_else(|| value.pointer("/choices/0/message/content").and_then(content_value_to_string))
+        .or_else(|| value.pointer("/choices/0/text").and_then(content_value_to_string))
+        .or_else(|| {
+            value.pointer("/choices/0/delta").and_then(|delta| delta.as_str().map(str::to_string))
+        })
+}
+
+fn stream_choice_finished(value: &serde_json::Value) -> bool {
+    value.pointer("/choices/0/finish_reason").is_some_and(|finish_reason| {
+        !finish_reason.is_null()
+            && finish_reason.as_str().map(|text| !text.is_empty()).unwrap_or(true)
+    })
+}
+
+fn post_openai_chat(url: &str, model: &str, prompt: &str) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|err| format!("local chat client failed: {err}"))?;
+    let user_prompt = no_think_prompt(prompt);
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Return only the final answer. Do not include thinking, chain-of-thought, analysis, planning, or reasoning steps."
+            },
+            {"role": "user", "content": user_prompt}
+        ],
+        "max_tokens": 192,
+        "temperature": 0.4,
+        "stream": false,
+        "enable_thinking": false,
+        "chat_template_kwargs": {
+            "enable_thinking": false
+        }
+    });
+
+    let response = client
+        .post(url)
+        .json(&body)
+        .send()
+        .map_err(|err| format!("local chat fallback request failed: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().unwrap_or_default();
+        return Err(format!("local chat fallback returned {status}: {text}"));
+    }
+
+    let value: serde_json::Value = response
+        .json()
+        .map_err(|err| format!("local chat fallback response parse failed: {err}"))?;
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(content_value_to_string)
+        .or_else(|| value.pointer("/choices/0/text").and_then(content_value_to_string))
+        .map(|content| content.trim().to_string())
+        .filter(|content| !content.is_empty())
+        .ok_or_else(|| "local chat returned an empty response".into())
+}
+
+fn content_value_to_string(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+
+    value.as_array().map(|parts| {
+        parts
+            .iter()
+            .filter_map(|part| {
+                part.as_str()
+                    .map(str::to_string)
+                    .or_else(|| part.get("text").and_then(|text| text.as_str()).map(str::to_string))
+                    .or_else(|| {
+                        part.get("content").and_then(|text| text.as_str()).map(str::to_string)
+                    })
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    })
 }
 
 fn load_recent_logs(n: usize) -> Vec<String> {

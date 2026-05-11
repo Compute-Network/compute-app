@@ -100,12 +100,14 @@ fn main() -> Result<()> {
                 bail!("--draft-model path does not exist: {}", path.display());
             }
             eprintln!("draft_model={}", path.display());
+            let spec_config = SpecDecodeConfig::from_env();
+            eprintln!("spec_config={spec_config:?}");
             RemoteStageGateway::connect_with_draft(
                 &args.head_addr,
                 &args.tail_addr,
                 args.reconnect_after_prompt,
                 path,
-                SpecDecodeConfig::default(),
+                spec_config,
             )?
         }
         None => RemoteStageGateway::connect(
