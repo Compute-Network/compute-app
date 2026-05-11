@@ -2,7 +2,9 @@ use anyhow::Result;
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::Duration;

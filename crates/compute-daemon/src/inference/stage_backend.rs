@@ -997,8 +997,9 @@ mod tests {
     use tempfile::tempdir;
 
     fn pin_test_worker_host() {
+        let host = std::env::current_exe().expect("resolve test executable");
         unsafe {
-            std::env::set_var("COMPUTE_GGML_STAGE_WORKER_HOST", "/bin/sh");
+            std::env::set_var("COMPUTE_GGML_STAGE_WORKER_HOST", host);
         }
     }
 

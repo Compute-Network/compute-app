@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
 use crate::config;
 
 /// Install compute as a system service (launchd on macOS, systemd on Linux).
