@@ -248,6 +248,12 @@ pub struct RelayClient {
     mlx_port: Arc<AtomicU16>,
 }
 
+#[derive(Clone)]
+struct StreamMetrics {
+    last_tps: Arc<AtomicU64>,
+    last_tps_at_ms: Arc<AtomicU64>,
+}
+
 impl RelayClient {
     pub fn last_latency_ms(&self) -> Arc<AtomicU64> {
         self.last_latency_ms.clone()
@@ -514,6 +520,10 @@ impl RelayClient {
                                         stage_client,
                                         gateway_client,
                                         mlx_port,
+                                        Some(StreamMetrics {
+                                            last_tps: last_tps.clone(),
+                                            last_tps_at_ms: last_tps_at_ms.clone(),
+                                        }),
                                     )
                                     .await;
                                     let total_ms = start.elapsed().as_millis() as u64;
@@ -524,17 +534,11 @@ impl RelayClient {
                                     let network_latency = total_ms.min(200);
                                     last_latency_ms.store(network_latency, Ordering::Relaxed);
 
-                                    if let Some(usage) = final_response.body.get("usage") {
-                                        let comp_tokens = usage
-                                            .get("completion_tokens")
-                                            .and_then(|v| v.as_u64())
-                                            .unwrap_or(0);
-                                        if comp_tokens > 0 && total_ms > 0 {
-                                            let tps =
-                                                (comp_tokens as f64 / total_ms as f64) * 1000.0;
-                                            last_tps.store(tps.to_bits(), Ordering::Relaxed);
-                                            last_tps_at_ms.store(now_epoch_ms(), Ordering::Relaxed);
-                                        }
+                                    if let Some(tps) =
+                                        response_tokens_per_second(&final_response.body, total_ms)
+                                    {
+                                        last_tps.store(tps.to_bits(), Ordering::Relaxed);
+                                        last_tps_at_ms.store(now_epoch_ms(), Ordering::Relaxed);
                                     }
                                     if (200..400).contains(&final_response.status) {
                                         completed_requests.fetch_add(1, Ordering::Relaxed);
@@ -589,23 +593,13 @@ impl RelayClient {
                                         Ordering::Relaxed,
                                     );
 
-                                    let gateway_tps =
-                                        response.body.get("usage").and_then(|usage| {
-                                            let completion_tokens = usage
-                                                .get("completion_tokens")
-                                                .and_then(|v| v.as_u64())?;
-                                            let total_ms = response
-                                                .body
-                                                .get("gateway_timings")
-                                                .and_then(|t| t.get("total_ms"))
-                                                .and_then(|v| v.as_u64())?;
-                                            if completion_tokens == 0 || total_ms == 0 {
-                                                return None;
-                                            }
-                                            Some(
-                                                (completion_tokens as f64 / total_ms as f64)
-                                                    * 1000.0,
-                                            )
+                                    let gateway_tps = response
+                                        .body
+                                        .get("gateway_timings")
+                                        .and_then(|t| t.get("total_ms"))
+                                        .and_then(|v| v.as_u64())
+                                        .and_then(|gateway_ms| {
+                                            response_tokens_per_second(&response.body, gateway_ms)
                                         });
                                     if let Some(tps) = response
                                         .body
@@ -723,6 +717,7 @@ async fn handle_streaming_request(
     stage_client: Arc<tokio::sync::Mutex<Option<StagePrototypeClient>>>,
     gateway_client: Arc<tokio::sync::Mutex<Option<LlamaStageGatewayRelayClient>>>,
     mlx_port: Arc<AtomicU16>,
+    stream_metrics: Option<StreamMetrics>,
 ) -> RelayResponse {
     // v0.4.3: MLX-preferred models stream through oMLX before we consider
     // the llama-server fallback. Mirror of the non-streaming path in
@@ -748,6 +743,7 @@ async fn handle_streaming_request(
                 response_tx,
                 &mut cancel_rx,
                 "oMLX",
+                stream_metrics.clone(),
             )
             .await;
         }
@@ -786,6 +782,7 @@ async fn handle_streaming_request(
         response_tx,
         &mut cancel_rx,
         "llama-server",
+        stream_metrics,
     )
     .await
 }
@@ -805,6 +802,7 @@ async fn proxy_openai_stream(
     response_tx: mpsc::Sender<String>,
     cancel_rx: &mut oneshot::Receiver<()>,
     backend_label: &'static str,
+    stream_metrics: Option<StreamMetrics>,
 ) -> RelayResponse {
     let started_at = std::time::Instant::now();
     let resp = match tokio::select! {
@@ -898,8 +896,18 @@ async fn proxy_openai_stream(
                     break;
                 }
 
-                if data.contains("usage") {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                    let delta_tokens = stream_delta_completion_tokens(&parsed);
+                    if delta_tokens > 0 {
+                        completion_tokens = completion_tokens.saturating_add(delta_tokens);
+                        publish_stream_tps(
+                            &stream_metrics,
+                            completion_tokens,
+                            started_at.elapsed().as_millis() as u64,
+                        );
+                    }
+
+                    if data.contains("usage") {
                         if let Some(usage) = parsed.get("usage") {
                             last_usage = Some(usage.clone());
                             prompt_tokens = usage
@@ -923,6 +931,8 @@ async fn proxy_openai_stream(
         }
     }
 
+    let usage = normalized_stream_usage(last_usage, prompt_tokens, completion_tokens);
+
     RelayResponse {
         id: request_id.to_string(),
         r#type: "inference_response".into(),
@@ -931,13 +941,130 @@ async fn proxy_openai_stream(
             "stream_complete": true,
             "backend": backend_label,
             "gateway_timings": { "total_ms": started_at.elapsed().as_millis() as u64 },
-            "usage": last_usage.unwrap_or(serde_json::json!({
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens,
-            })),
+            "usage": usage,
         }),
     }
+}
+
+fn publish_stream_tps(metrics: &Option<StreamMetrics>, completion_tokens: u64, elapsed_ms: u64) {
+    if completion_tokens == 0 || elapsed_ms == 0 {
+        return;
+    }
+    if let Some(metrics) = metrics {
+        let tps = (completion_tokens as f64 / elapsed_ms as f64) * 1000.0;
+        metrics.last_tps.store(tps.to_bits(), Ordering::Relaxed);
+        metrics.last_tps_at_ms.store(now_epoch_ms(), Ordering::Relaxed);
+    }
+}
+
+fn normalized_stream_usage(
+    last_usage: Option<serde_json::Value>,
+    observed_prompt_tokens: u64,
+    observed_completion_tokens: u64,
+) -> serde_json::Value {
+    let mut usage = last_usage.unwrap_or_else(|| serde_json::json!({}));
+    let prompt_tokens =
+        usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(observed_prompt_tokens);
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)
+        .unwrap_or(observed_completion_tokens);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v >= prompt_tokens.saturating_add(completion_tokens))
+        .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
+
+    if let Some(obj) = usage.as_object_mut() {
+        obj.insert("prompt_tokens".into(), serde_json::json!(prompt_tokens));
+        obj.insert("completion_tokens".into(), serde_json::json!(completion_tokens));
+        obj.insert("total_tokens".into(), serde_json::json!(total_tokens));
+    } else {
+        usage = serde_json::json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        });
+    }
+    usage
+}
+
+fn response_tokens_per_second(body: &serde_json::Value, total_ms: u64) -> Option<f64> {
+    let completion_tokens = body
+        .get("usage")
+        .and_then(|usage| usage.get("completion_tokens"))
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)
+        .or_else(|| completion_tokens_from_response_body(body))?;
+    if total_ms == 0 {
+        return None;
+    }
+    Some((completion_tokens as f64 / total_ms as f64) * 1000.0)
+}
+
+fn ensure_usage_for_response(body: &mut serde_json::Value, request_body: &serde_json::Value) {
+    let existing_prompt =
+        body.get("usage").and_then(|usage| usage.get("prompt_tokens")).and_then(|v| v.as_u64());
+    let existing_completion =
+        body.get("usage").and_then(|usage| usage.get("completion_tokens")).and_then(|v| v.as_u64());
+    if existing_completion.is_some_and(|tokens| tokens > 0) {
+        return;
+    }
+
+    let Some(completion_tokens) = completion_tokens_from_response_body(body) else {
+        return;
+    };
+    let prompt_tokens = existing_prompt
+        .unwrap_or_else(|| estimate_tokens_from_text(&extract_request_prompt(request_body)));
+    let total_tokens = prompt_tokens.saturating_add(completion_tokens);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "usage".into(),
+            serde_json::json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            }),
+        );
+    }
+}
+
+fn completion_tokens_from_response_body(body: &serde_json::Value) -> Option<u64> {
+    let mut tokens = 0u64;
+    if let Some(choices) = body.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(content) = choice
+                .pointer("/message/content")
+                .and_then(|v| v.as_str())
+                .or_else(|| choice.get("text").and_then(|v| v.as_str()))
+            {
+                tokens = tokens.saturating_add(estimate_tokens_from_text(content));
+            }
+        }
+    }
+    if tokens > 0 { Some(tokens) } else { None }
+}
+
+fn stream_delta_completion_tokens(chunk: &serde_json::Value) -> u64 {
+    let mut tokens = 0u64;
+    if let Some(choices) = chunk.get("choices").and_then(|v| v.as_array()) {
+        for choice in choices {
+            if let Some(content) = choice
+                .pointer("/delta/content")
+                .and_then(|v| v.as_str())
+                .or_else(|| choice.get("text").and_then(|v| v.as_str()))
+            {
+                tokens = tokens.saturating_add(estimate_tokens_from_text(content));
+            }
+        }
+    }
+    tokens
+}
+
+fn estimate_tokens_from_text(text: &str) -> u64 {
+    let visible_chars = text.chars().filter(|c| !c.is_control()).count();
+    if visible_chars == 0 { 0 } else { ((visible_chars as u64).saturating_add(3) / 4).max(1) }
 }
 
 async fn handle_stage_gateway_streaming_request(
@@ -1261,6 +1388,7 @@ async fn handle_omlx_request(
             let body_text = resp.text().await.unwrap_or_default();
             let mut parsed: serde_json::Value = serde_json::from_str(&body_text)
                 .unwrap_or_else(|_| serde_json::json!({"raw": body_text}));
+            ensure_usage_for_response(&mut parsed, &request.body);
             if let Some(obj) = parsed.as_object_mut() {
                 obj.insert("backend".into(), serde_json::json!("omlx"));
                 obj.insert(
@@ -1372,7 +1500,11 @@ async fn handle_stage_gateway_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{AssignmentPush, extract_request_prompt, extract_stop_sequences};
+    use super::{
+        AssignmentPush, completion_tokens_from_response_body, ensure_usage_for_response,
+        extract_request_prompt, extract_stop_sequences, normalized_stream_usage,
+        response_tokens_per_second, stream_delta_completion_tokens,
+    };
 
     #[test]
     fn assignment_push_deserializes_gateway_head_payload() {
@@ -1440,6 +1572,62 @@ mod tests {
         assert!(parsed.gateway_role.is_none());
         assert!(parsed.gateway_tail_addr.is_none());
         assert!(parsed.gateway_tail_bind.is_none());
+    }
+
+    #[test]
+    fn stream_delta_completion_tokens_counts_content_chunks() {
+        let chunk = serde_json::json!({
+            "choices": [
+                {"delta": {"content": "hello"}},
+                {"delta": {"content": ""}},
+                {"delta": {"role": "assistant"}}
+            ]
+        });
+        assert_eq!(stream_delta_completion_tokens(&chunk), 2);
+    }
+
+    #[test]
+    fn normalized_stream_usage_preserves_upstream_usage_but_fills_zero_completion() {
+        let usage = normalized_stream_usage(
+            Some(serde_json::json!({
+                "prompt_tokens": 11,
+                "completion_tokens": 0,
+                "total_tokens": 11
+            })),
+            0,
+            7,
+        );
+        assert_eq!(usage["prompt_tokens"].as_u64(), Some(11));
+        assert_eq!(usage["completion_tokens"].as_u64(), Some(7));
+        assert_eq!(usage["total_tokens"].as_u64(), Some(18));
+    }
+
+    #[test]
+    fn ensure_usage_for_response_estimates_omlx_completion_when_missing() {
+        let request = serde_json::json!({
+            "messages": [{"role": "user", "content": "write a sentence"}]
+        });
+        let mut body = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "meaningful output"}}]
+        });
+
+        ensure_usage_for_response(&mut body, &request);
+
+        assert!(body["usage"]["prompt_tokens"].as_u64().unwrap_or_default() > 0);
+        assert!(body["usage"]["completion_tokens"].as_u64().unwrap_or_default() > 0);
+        assert!(
+            body["usage"]["total_tokens"].as_u64().unwrap_or_default()
+                >= body["usage"]["completion_tokens"].as_u64().unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn response_tokens_per_second_falls_back_to_completion_text() {
+        let body = serde_json::json!({
+            "choices": [{"message": {"content": "abcd efgh"}}]
+        });
+        assert_eq!(completion_tokens_from_response_body(&body), Some(3));
+        assert_eq!(response_tokens_per_second(&body, 1_000), Some(3.0));
     }
 
     #[test]

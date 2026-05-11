@@ -2445,6 +2445,7 @@ impl DaemonRuntime {
                     )
                 };
                 let pending = node.pending_compute.unwrap_or(0.0);
+                let total_earned = node.total_earned_compute.unwrap_or(0.0);
 
                 let tps = node.tokens_per_second.unwrap_or(0.0);
                 let served = node.requests_served.unwrap_or(0) as u64;
@@ -2475,6 +2476,9 @@ impl DaemonRuntime {
                         state.pipeline.requests_served = *served_baseline;
                     }
                     state.earnings.pending = pending;
+                    if total_earned > state.earnings.all_time {
+                        state.earnings.all_time = total_earned;
+                    }
                 });
 
                 // Fetch time-bucketed earnings from reward_events
@@ -2490,7 +2494,10 @@ impl DaemonRuntime {
                                 state.earnings.today = e.today;
                                 state.earnings.this_week = e.this_week;
                                 state.earnings.this_month = e.this_month;
-                                state.earnings.all_time = e.all_time;
+                                state.earnings.all_time = e.all_time.max(state.earnings.all_time);
+                                if e.pending > state.earnings.pending {
+                                    state.earnings.pending = e.pending;
+                                }
                             });
                         }
                         Err(err) => {
@@ -2791,8 +2798,12 @@ impl DaemonRuntime {
                 uptime_seconds: Some(state.uptime_secs as i64),
                 pipeline_id,
                 pipeline_stage,
-                requests_served: None,
-                tokens_per_second: None,
+                requests_served: Some(state.pipeline.requests_served.min(i64::MAX as u64) as i64),
+                tokens_per_second: state
+                    .pipeline
+                    .tokens_per_sec
+                    .is_finite()
+                    .then_some(state.pipeline.tokens_per_sec.max(0.0)),
                 downloaded_models: Some(detect_downloaded_models()),
                 auto_download_enabled: Some(self.config.models.auto_download),
                 inference_slots_total: slots_total,
