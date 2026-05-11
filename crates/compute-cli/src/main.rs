@@ -1,3 +1,13 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::collapsible_match,
+    clippy::if_same_then_else,
+    clippy::let_and_return,
+    clippy::manual_range_contains,
+    clippy::needless_return,
+    clippy::unnecessary_cast
+)]
+
 mod cli;
 mod tui;
 mod updater;

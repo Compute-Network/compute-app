@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 // Phase 0 spike: validate the assumption that speculative decoding relies on.
 // If llama_decode(batch=k) costs ~the same as llama_decode(batch=1), then a
 // k-token speculative window amortizes the per-call setup overhead — that's

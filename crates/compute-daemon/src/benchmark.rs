@@ -277,11 +277,7 @@ fn split_assessment(
         );
     }
     if tflops < 3.0 {
-        return (
-            false,
-            "single-node only".into(),
-            format!("{tflops:.1} estimated FP16 TFLOPS"),
-        );
+        return (false, "single-node only".into(), format!("{tflops:.1} estimated FP16 TFLOPS"));
     }
 
     let role = if usable_mem_mb >= 20_000 && memory_bandwidth_gbps >= 120.0 && tflops >= 6.0 {

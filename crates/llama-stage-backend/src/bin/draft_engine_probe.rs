@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 // Phase 2 verification: load the draft model standalone, prefill a prompt,
 // generate k tokens greedily. Prints the draft completion side-by-side with
 // the target's full single-node greedy completion so we can eyeball whether

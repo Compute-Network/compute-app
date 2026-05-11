@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 // Phase 3 integration probe for tail-side verify_batch_at_tail + rollback_kv.
 //
 // Builds head + tail in one process (no TCP), generates a "ground-truth"

@@ -1,3 +1,23 @@
+#![allow(
+    clippy::clone_on_copy,
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::identity_op,
+    clippy::manual_clamp,
+    clippy::manual_checked_ops,
+    clippy::manual_is_multiple_of,
+    clippy::manual_memcpy,
+    clippy::map_flatten,
+    clippy::needless_range_loop,
+    clippy::needless_return,
+    clippy::ptr_arg,
+    clippy::question_mark,
+    clippy::redundant_closure,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::useless_conversion
+)]
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

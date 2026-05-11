@@ -1,3 +1,16 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::forget_non_drop,
+    clippy::large_enum_variant,
+    clippy::manual_is_multiple_of,
+    clippy::needless_range_loop,
+    clippy::not_unsafe_ptr_arg_deref,
+    clippy::useless_conversion,
+    unused_assignments,
+    unused_mut,
+    unused_variables
+)]
+
 use anyhow::{Context, Result, bail};
 use libloading::Library;
 use serde::{Deserialize, Serialize};

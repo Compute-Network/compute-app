@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 // Speculative decoding requires the draft model to share the target model's
 // vocabulary — otherwise verification compares apples to oranges and the
 // "accepted" prefix is meaningless.

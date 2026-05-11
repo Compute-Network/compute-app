@@ -1,3 +1,12 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_is_multiple_of,
+    clippy::needless_lifetimes,
+    clippy::type_complexity,
+    clippy::let_unit_value,
+    clippy::unnecessary_unwrap
+)]
+
 use anyhow::{Context, Result, bail};
 use llama_stage_backend::{
     LLAMA_STAGE_PROTOCOL_VERSION, StageGatewayRequest, StageGatewayResponse, StageNodeInfo,

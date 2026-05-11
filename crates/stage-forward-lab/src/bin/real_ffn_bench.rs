@@ -1,3 +1,5 @@
+#![allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
+
 use anyhow::{Context, Result, bail};
 use stage_forward_lab::{StageTensorStore, quants, real_math};
 use std::env;

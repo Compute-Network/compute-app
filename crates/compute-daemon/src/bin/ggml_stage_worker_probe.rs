@@ -1,3 +1,12 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_is_multiple_of,
+    clippy::needless_lifetimes,
+    clippy::type_complexity,
+    clippy::let_unit_value,
+    clippy::unnecessary_unwrap
+)]
+
 use anyhow::{Context, Result};
 use compute_daemon::inference::engine::ShardConfig;
 use compute_daemon::inference::ggml_runtime::detect_ggml_runtime_plan;

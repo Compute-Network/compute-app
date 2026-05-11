@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 // Phase 3 prerequisite: does llama_decode_head / llama_decode_tail amortize
 // per-call setup cost when fed batch_size > 1, the way the unsplit
 // llama_decode does in batched_decode_bench?

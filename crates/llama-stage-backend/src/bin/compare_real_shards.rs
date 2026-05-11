@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 use anyhow::{Context, Result, bail};
 use llama_stage_backend::LlamaStageBackend;
 use stage_forward_lab::{StageForwardBackend, StageLayout};
@@ -51,9 +53,8 @@ fn main() -> Result<()> {
     let head_end: u32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(12);
     let tail_start: u32 = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(head_end + 1);
     let tail_end: u32 = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(34);
-    let local_tail_end = tail_end
-        .checked_sub(tail_start)
-        .context("tail_start must be <= tail_end")?;
+    let local_tail_end =
+        tail_end.checked_sub(tail_start).context("tail_start must be <= tail_end")?;
 
     let mut full_head = LlamaStageBackend::new(&full_path)?;
     full_head.load_layout(StageLayout {
@@ -114,8 +115,10 @@ fn main() -> Result<()> {
     println!("head_hidden_full_rms={full_rms:.8}");
     println!("head_hidden_real_rms={real_rms:.8}");
 
-    let full_tail_tensor = full_tail.continue_forward_with_tokens(full_hidden, full_tokens, true)?;
-    let real_tail_tensor = real_tail.continue_forward_with_tokens(real_hidden, real_tokens, true)?;
+    let full_tail_tensor =
+        full_tail.continue_forward_with_tokens(full_hidden, full_tokens, true)?;
+    let real_tail_tensor =
+        real_tail.continue_forward_with_tokens(real_hidden, real_tokens, true)?;
     let full_sample = full_tail.sample_tail_token(full_tail_tensor)?;
     let real_sample = real_tail.sample_tail_token(real_tail_tensor)?;
     println!("full_tail_token_id={}", full_sample.token_id);

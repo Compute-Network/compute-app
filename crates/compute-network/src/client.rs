@@ -286,9 +286,8 @@ impl OrchestratorClient {
 
     /// Fetch the latest pipeline assignment for this node.
     pub async fn get_assignment(&self, node_id: &str) -> Result<Option<PipelineAssignment>> {
-        let mut request = self
-            .client
-            .get(format!("{}/v1/pipelines/assignment/{}", self.base_url, node_id));
+        let mut request =
+            self.client.get(format!("{}/v1/pipelines/assignment/{}", self.base_url, node_id));
         if let Some(token) = self.node_token.as_deref() {
             request = request.bearer_auth(token);
         }
@@ -306,9 +305,8 @@ impl OrchestratorClient {
 
     /// Get pending rewards for a wallet.
     pub async fn get_rewards(&self, wallet_address: &str) -> Result<RewardInfo> {
-        let mut request = self
-            .client
-            .get(format!("{}/v1/rewards/{}", self.base_url, wallet_address));
+        let mut request =
+            self.client.get(format!("{}/v1/rewards/{}", self.base_url, wallet_address));
         if let Some(token) = self.node_token.as_deref() {
             request = request.bearer_auth(token);
         }
@@ -323,9 +321,7 @@ impl OrchestratorClient {
     }
 
     pub async fn get_node_by_wallet(&self, wallet_address: &str) -> Result<Option<OwnNodeInfo>> {
-        let mut request = self
-            .client
-            .get(format!("{}/v1/nodes/{}", self.base_url, wallet_address));
+        let mut request = self.client.get(format!("{}/v1/nodes/{}", self.base_url, wallet_address));
         if let Some(token) = self.node_token.as_deref() {
             request = request.bearer_auth(token);
         }
@@ -385,9 +381,8 @@ impl OrchestratorClient {
     }
 
     pub async fn get_earnings(&self, wallet_address: &str) -> Result<EarningsData> {
-        let mut request = self
-            .client
-            .get(format!("{}/v1/rewards/{}/summary", self.base_url, wallet_address));
+        let mut request =
+            self.client.get(format!("{}/v1/rewards/{}/summary", self.base_url, wallet_address));
         if let Some(token) = self.node_token.as_deref() {
             request = request.bearer_auth(token);
         }

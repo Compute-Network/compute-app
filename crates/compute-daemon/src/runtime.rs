@@ -849,11 +849,7 @@ fn gateway_model_path(config: &Config) -> PathBuf {
 }
 
 fn solo_assignment_model_available(config: &Config, model_name: &str) -> bool {
-    if detect_downloaded_models()
-        .split(',')
-        .map(str::trim)
-        .any(|model| model == model_name)
-    {
+    if detect_downloaded_models().split(',').map(str::trim).any(|model| model == model_name) {
         return true;
     }
 

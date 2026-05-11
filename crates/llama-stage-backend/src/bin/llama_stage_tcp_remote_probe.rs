@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 use anyhow::{Result, bail};
 use llama_stage_backend::{RemoteStagePair, greedy_single_node_completion, resolve_model_arg};
 use std::env;

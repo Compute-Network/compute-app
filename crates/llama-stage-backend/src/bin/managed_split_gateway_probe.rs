@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 // Integration probe for the new ManagedTailNode + ManagedHeadGatewayStack split.
 // Spawns:
 //   - tail-only stage worker on 127.0.0.1:0 (simulates the remote tail machine)

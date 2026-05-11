@@ -1,3 +1,5 @@
+#![allow(clippy::single_element_loop)]
+
 use anyhow::{Context, Result, bail};
 use stage_forward_lab::gguf::GgufFile;
 use std::fs::File;

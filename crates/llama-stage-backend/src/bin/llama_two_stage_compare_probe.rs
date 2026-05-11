@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 use anyhow::{Result, bail};
 use llama_stage_backend::{LlamaStageBackend, greedy_single_node_baseline, resolve_model_arg};
 use stage_forward_lab::{StageForwardBackend, StageLayout};

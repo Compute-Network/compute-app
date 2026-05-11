@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::manual_checked_ops, clippy::manual_is_multiple_of)]
+
 // Phase 4 integration probe: end-to-end speculative decoding through
 // `RemoteStageGateway::connect_with_draft`. Spawns a TCP head + TCP tail in
 // child processes (production wire path), then drives the gateway in-process

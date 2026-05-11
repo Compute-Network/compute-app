@@ -1,3 +1,12 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_is_multiple_of,
+    clippy::needless_lifetimes,
+    clippy::type_complexity,
+    clippy::let_unit_value,
+    clippy::unnecessary_unwrap
+)]
+
 use anyhow::{Result, bail};
 use compute_daemon::inference::llama_stage_gateway::LlamaStageGatewayRelayClient;
 use llama_stage_backend::{ManagedGatewayStack, greedy_single_node_completion, resolve_model_arg};

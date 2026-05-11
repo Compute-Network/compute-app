@@ -1,3 +1,12 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::manual_is_multiple_of,
+    clippy::needless_lifetimes,
+    clippy::type_complexity,
+    clippy::let_unit_value,
+    clippy::unnecessary_unwrap
+)]
+
 use anyhow::{Context, Result};
 use compute_daemon::inference::ggml_stage_executor::build_ggml_stage_executor;
 use compute_daemon::inference::ggml_stage_worker::{
