@@ -1,18 +1,8 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncBufReadExt;
 use tracing::{debug, info, warn};
-
-/// How many times to (re)launch `hf download` before giving up. Each attempt
-/// resumes from the partial `.incomplete` stub + already-finished shards.
-const MLX_DOWNLOAD_MAX_ATTEMPTS: u32 = 6;
-/// If the on-disk size hasn't grown for this long, treat the transfer as stalled,
-/// kill it, and retry (resuming). Generous enough that a genuinely slow-but-live
-/// transfer is never misread as stalled.
-const MLX_DOWNLOAD_STALL_SECS: u64 = 120;
 
 pub fn stages_cache_dir() -> PathBuf {
     crate::config::config_dir().unwrap_or_else(|| PathBuf::from("~/.compute")).join("stages")
@@ -136,15 +126,12 @@ fn mlx_weight_file_ready(path: &Path) -> bool {
     std::fs::metadata(path).map(|meta| meta.is_file() && meta.len() > 1024 * 1024).unwrap_or(false)
 }
 
-/// Download a HuggingFace MLX snapshot via the `hf` CLI (bundled with the
-/// huggingface-hub Python package). On macOS, `brew install jundot/omlx/omlx`
-/// pulls it in transitively; otherwise `pip install huggingface-hub`.
+/// Download a HuggingFace MLX snapshot over plain HTTPS — no `hf`/Python
+/// dependency. Lists the repo's files via the public HF API, then fetches each
+/// over the CDN with the same resumable, retrying downloader used for GGUF.
 ///
-/// Idempotent — returns the existing path if already cached. The CLI itself
-/// resumes partial downloads, so a crashed prior run doesn't re-fetch.
-///
-/// Blocking async via `tokio::process::Command` so we don't stall the
-/// runtime during a multi-GB pull.
+/// Idempotent — returns the existing path if already cached, and skips any file
+/// already fully present, so an interrupted prior run resumes rather than refetches.
 pub async fn ensure_mlx_snapshot(
     models_cache_dir: &Path,
     repo_id: &str,
@@ -177,197 +164,100 @@ where
             .with_context(|| format!("creating mlx cache dir {}", parent.display()))?;
     }
 
-    let hf_bin = locate_hf_cli()
-        .ok_or_else(|| anyhow::anyhow!(
-            "huggingface CLI (`hf` or `huggingface-cli`) not found — install via `pip install huggingface-hub` or rely on the oMLX brew formula which pulls it in"
-        ))?;
-
     debug!("Downloading MLX snapshot {} -> {}", repo_id, dest.display());
-    let total_bytes = total_size_mb.checked_mul(1024 * 1024).filter(|value| *value > 0);
 
-    // `hf download` resumes from the partial `.incomplete` stub and already
-    // completed shards, so each retry continues where the last left off instead
-    // of restarting. We retry on both hard failures and stalls (a hung transfer
-    // that stops writing) — the common real-world case on large anonymous pulls,
-    // and the reason a download could otherwise sit frozen forever.
-    let mut attempt = 0u32;
-    let mut backoff = Duration::from_secs(2);
-    loop {
-        attempt += 1;
-        match run_hf_download_attempt(&hf_bin, repo_id, &dest, total_bytes, &mut on_progress).await {
-            Ok(()) => break,
-            Err(e) => {
-                // A retry may have actually completed the snapshot before erroring
-                // on a trailing detail — accept it if every file is present.
-                if mlx_model_cached(models_cache_dir, folder) {
-                    break;
-                }
-                if attempt >= MLX_DOWNLOAD_MAX_ATTEMPTS {
-                    return Err(e.context(format!(
-                        "hf download {repo_id} failed after {attempt} attempts"
-                    )));
-                }
-                warn!(
-                    "[mlx-download] {repo_id} attempt {attempt} failed: {e:#} — resuming in {}s",
-                    backoff.as_secs()
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
-            }
+    // Enumerate the repo's files via the HF API, then fetch each one over plain
+    // HTTPS from the CDN using the same resumable, retrying downloader as GGUF
+    // models. This drops the `hf` CLI dependency entirely (no Python /
+    // huggingface-hub), and avoids hf's soft-locks and metadata-stage rate
+    // limiting that could wedge large anonymous pulls.
+    let files = list_repo_files(repo_id)
+        .await
+        .with_context(|| format!("listing files for MLX repo {repo_id}"))?;
+    if files.is_empty() {
+        anyhow::bail!("no files found in MLX repo {repo_id}");
+    }
+
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+    let total_hint = if total_bytes > 0 {
+        Some(total_bytes)
+    } else {
+        total_size_mb.checked_mul(1024 * 1024).filter(|value| *value > 0)
+    };
+
+    // Aggregate per-file progress into one bar across the whole snapshot.
+    let mut completed_bytes: u64 = 0;
+    on_progress(0, total_hint);
+    for file in &files {
+        let dest_file = dest.join(&file.path);
+        if let Some(parent) = dest_file.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
         }
+
+        // Skip files already fully present (resume across runs / prior attempts).
+        if file.size > 0
+            && tokio::fs::metadata(&dest_file).await.map(|m| m.len()).unwrap_or(0) == file.size
+        {
+            completed_bytes += file.size;
+            on_progress(completed_bytes, total_hint);
+            continue;
+        }
+
+        let url = format!("https://huggingface.co/{repo_id}/resolve/main/{}", file.path);
+        let base = completed_bytes;
+        download_file_with_progress(&url, &dest_file, |downloaded_this_file, _| {
+            on_progress(base + downloaded_this_file, total_hint);
+        })
+        .await
+        .with_context(|| format!("downloading {} from {repo_id}", file.path))?;
+
+        completed_bytes += file.size;
+        on_progress(completed_bytes, total_hint);
     }
 
     if !mlx_model_cached(models_cache_dir, folder) {
-        anyhow::bail!(
-            "hf download {repo_id} returned success but config.json is missing at {}",
-            dest.display()
-        );
+        anyhow::bail!("MLX snapshot {repo_id} downloaded but is incomplete at {}", dest.display());
     }
 
-    let downloaded = dir_size_bytes(&dest);
-    on_progress(downloaded, total_bytes);
     info!("MLX snapshot ready at {}", dest.display());
     Ok(dest)
 }
 
-/// A single `hf download` attempt with live progress and stall detection.
-///
-/// Returns an error (after killing the child) if the process exits non-zero or
-/// stops growing on disk for [`MLX_DOWNLOAD_STALL_SECS`]. The caller retries and
-/// `hf` resumes. `hf`'s stderr is drained to the log so the real failure reason
-/// (HTTP 429, network reset, gated repo) is visible instead of silently lost.
-async fn run_hf_download_attempt<F>(
-    hf_bin: &Path,
-    repo_id: &str,
-    dest: &Path,
-    total_bytes: Option<u64>,
-    on_progress: &mut F,
-) -> Result<()>
-where
-    F: FnMut(u64, Option<u64>) + Send,
-{
-    // huggingface_hub uses a soft (file-existence) lock per shard that is NOT
-    // released if the process is killed. A previous attempt we (or a stall kill)
-    // terminated leaves a stale `*.lock` behind, and the next `hf` then waits on
-    // it forever ("Still waiting to acquire lock ..."). Single-flight is enforced
-    // upstream (active_downloads set + single-instance app lock), so any lock here
-    // is guaranteed stale — clear it before launching.
-    clear_stale_download_locks(dest);
-
-    let mut child = tokio::process::Command::new(hf_bin)
-        .arg("download")
-        .arg(repo_id)
-        .arg("--local-dir")
-        .arg(dest)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("invoking {}", hf_bin.display()))?;
-
-    // Keep the last stderr line for the error message, and echo all of it to the
-    // debug log for diagnosis.
-    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    if let Some(stderr) = child.stderr.take() {
-        let stderr_tail = stderr_tail.clone();
-        tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                debug!("[mlx-download:hf] {line}");
-                if let Ok(mut tail) = stderr_tail.lock() {
-                    *tail = line;
-                }
-            }
-        });
-    }
-
-    let mut last_bytes = dir_size_bytes(dest);
-    // Report the absolute on-disk size immediately so a resume shows real progress
-    // (e.g. 17 GB already present) instead of 0 until the next byte is written.
-    on_progress(last_bytes, total_bytes);
-
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
-    let mut last_progress_at = tokio::time::Instant::now();
-    loop {
-        tokio::select! {
-            status = child.wait() => {
-                let status = status.with_context(|| format!("waiting for {}", hf_bin.display()))?;
-                if !status.success() {
-                    let tail = stderr_tail.lock().map(|t| t.clone()).unwrap_or_default();
-                    anyhow::bail!("hf download {repo_id} exited with {status}: {tail}");
-                }
-                return Ok(());
-            }
-            _ = interval.tick() => {
-                // Always report the absolute size so the bar reflects reality; track
-                // growth separately, only for stall detection.
-                let downloaded = dir_size_bytes(dest);
-                on_progress(downloaded, total_bytes);
-                if downloaded > last_bytes {
-                    last_bytes = downloaded;
-                    last_progress_at = tokio::time::Instant::now();
-                } else if last_progress_at.elapsed() >= Duration::from_secs(MLX_DOWNLOAD_STALL_SECS) {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                    anyhow::bail!("download stalled — no progress for {}s", MLX_DOWNLOAD_STALL_SECS);
-                }
-            }
-        }
-    }
+/// A file entry in a HuggingFace repo (path relative to the repo root + size).
+struct RepoFile {
+    path: String,
+    size: u64,
 }
 
-/// Remove stale huggingface_hub `*.lock` files left in the snapshot's download
-/// cache. Safe only because single-flight is guaranteed by the caller — there is
-/// never a *live* `hf` for this snapshot whose lock we'd be stealing.
-fn clear_stale_download_locks(dest: &Path) {
-    let lock_dir = dest.join(".cache").join("huggingface").join("download");
-    let Ok(entries) = std::fs::read_dir(&lock_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "lock") {
-            if let Err(e) = std::fs::remove_file(&path) {
-                debug!("[mlx-download] could not remove stale lock {}: {e}", path.display());
-            } else {
-                debug!("[mlx-download] cleared stale lock {}", path.display());
-            }
-        }
-    }
-}
+/// List the downloadable files in a HuggingFace model repo via the public API.
+/// For LFS weights the real size lives under `lfs.size` (the top-level `size` is
+/// the pointer size), so prefer that.
+async fn list_repo_files(repo_id: &str) -> Result<Vec<RepoFile>> {
+    let url = format!("https://huggingface.co/api/models/{repo_id}/tree/main?recursive=1");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent(concat!("compute-cli/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let entries: Vec<serde_json::Value> =
+        client.get(&url).send().await?.error_for_status()?.json().await?;
 
-fn locate_hf_cli() -> Option<PathBuf> {
-    // `hf` is the new-style CLI (huggingface-hub ≥ 0.x); `huggingface-cli`
-    // is the legacy alias, still provided by the package.
-    let candidates: [PathBuf; 4] = [
-        PathBuf::from("/opt/homebrew/bin/hf"),
-        PathBuf::from("/usr/local/bin/hf"),
-        PathBuf::from("/opt/homebrew/bin/huggingface-cli"),
-        PathBuf::from("/usr/local/bin/huggingface-cli"),
-    ];
-    for c in candidates.iter() {
-        if c.exists() {
-            return Some(c.clone());
+    let mut files = Vec::new();
+    for entry in entries {
+        if entry.get("type").and_then(|t| t.as_str()) != Some("file") {
+            continue;
         }
+        let Some(path) = entry.get("path").and_then(|p| p.as_str()) else {
+            continue;
+        };
+        let size = entry
+            .get("lfs")
+            .and_then(|lfs| lfs.get("size"))
+            .and_then(|s| s.as_u64())
+            .or_else(|| entry.get("size").and_then(|s| s.as_u64()))
+            .unwrap_or(0);
+        files.push(RepoFile { path: path.to_string(), size });
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        for py in ["3.9", "3.10", "3.11", "3.12", "3.13"] {
-            let p = PathBuf::from(&home).join(format!("Library/Python/{py}/bin/hf"));
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in path.split(':') {
-            for name in ["hf", "huggingface-cli"] {
-                let p = PathBuf::from(dir).join(name);
-                if p.exists() {
-                    return Some(p);
-                }
-            }
-        }
-    }
-    None
+    Ok(files)
 }
 
 fn gguf_magic_ok(path: &Path) -> Result<bool> {
@@ -615,20 +505,6 @@ where
     Ok(())
 }
 
-fn dir_size_bytes(path: &Path) -> u64 {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return 0;
-    };
-    if meta.is_file() {
-        return meta.len();
-    }
-
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-
-    entries.flatten().map(|entry| dir_size_bytes(&entry.path())).sum()
-}
 
 fn sha256_file(path: &Path) -> Result<String> {
     let output = std::process::Command::new("shasum")
