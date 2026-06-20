@@ -81,6 +81,14 @@ pub struct SplashScreen {
     update_rx: Option<mpsc::Receiver<Result<AutoUpdateOutcome, String>>>,
     /// True after a new Compute bundle has been installed.
     update_applied: bool,
+    /// Step index for the oMLX runtime health check (`usize::MAX` if not shown —
+    /// e.g. off-Apple-Silicon, or oMLX not installed).
+    omlx_status_step: usize,
+    /// Whether the oMLX runtime is healthy (or not applicable). False means it's
+    /// installed but broken and a repair should run.
+    omlx_healthy: bool,
+    /// Tracks oMLX auto-repair progress (None = not repairing).
+    omlx_repair_rx: Option<mpsc::Receiver<Result<(), String>>>,
 }
 
 #[derive(PartialEq)]
@@ -91,6 +99,8 @@ enum SplashPhase {
     UpdatingCompute,
     /// Waiting for llama-server install to complete
     InstallingLlama,
+    /// Waiting for the oMLX runtime auto-repair (brew) to complete.
+    RepairingOmlx,
     /// Waiting for model to load into llama-server
     LoadingModel,
     Complete,
@@ -202,6 +212,22 @@ impl SplashScreen {
             });
         }
 
+        // oMLX runtime health: only relevant on Apple Silicon, and only shown when
+        // oMLX is actually installed. A *broken* install (e.g. brew removed its
+        // bundled Python) triggers an auto-repair; a *missing* one is skipped so we
+        // don't force a heavy install on GGUF-only nodes.
+        let omlx_health = check_omlx_health();
+        let omlx_applicable = !matches!(omlx_health, OmlxHealth::NotApplicable);
+        let omlx_status_step = if omlx_applicable { steps.len() } else { usize::MAX };
+        let omlx_healthy = !matches!(omlx_health, OmlxHealth::Broken);
+        if omlx_applicable {
+            steps.push(StartupStep {
+                label: "Checking oMLX runtime...".into(),
+                done: false,
+                result: None,
+            });
+        }
+
         // Show the model the daemon will actually pre-warm (from config), not just the first file
         let config = compute_daemon::config::Config::load().unwrap_or_default();
         let stage_mode_enabled = config.experimental.stage_mode_enabled;
@@ -272,6 +298,9 @@ impl SplashScreen {
             update_step,
             update_rx: None,
             update_applied: false,
+            omlx_status_step,
+            omlx_healthy,
+            omlx_repair_rx: None,
         }
     }
 
@@ -444,6 +473,21 @@ impl SplashScreen {
                             return;
                         }
 
+                        if self.current_step == self.omlx_status_step {
+                            if !self.omlx_healthy {
+                                self.steps[self.current_step].label = "Repairing oMLX runtime...".into();
+                                self.steps[self.current_step].done = false;
+                                self.start_omlx_repair();
+                                self.phase = SplashPhase::RepairingOmlx;
+                                return;
+                            }
+                            self.steps[self.current_step].label = "oMLX runtime ready".into();
+                            self.steps[self.current_step].done = true;
+                            self.current_step += 1;
+                            self.step_timer = Instant::now();
+                            return;
+                        }
+
                         if self.current_step == self.model_step && self.stage_mode_enabled {
                             if self.has_active_download() {
                                 self.steps[self.current_step].label =
@@ -585,6 +629,28 @@ impl SplashScreen {
                     }
                 }
             }
+            SplashPhase::RepairingOmlx => {
+                // Poll repair progress. Either outcome advances the splash — a failed
+                // repair shouldn't block startup; the node just stays MLX-unready and
+                // surfaces the downstream error.
+                if let Some(ref rx) = self.omlx_repair_rx {
+                    if let Ok(result) = rx.try_recv() {
+                        match result {
+                            Ok(()) => {
+                                self.omlx_healthy = true;
+                                self.steps[self.current_step].label = "oMLX runtime repaired".into();
+                            }
+                            Err(e) => {
+                                self.steps[self.current_step].label = format!("oMLX repair failed: {e}");
+                            }
+                        }
+                        self.steps[self.current_step].done = true;
+                        self.current_step += 1;
+                        self.step_timer = Instant::now();
+                        self.phase = SplashPhase::StepsRunning;
+                    }
+                }
+            }
             SplashPhase::Complete => {}
         }
     }
@@ -696,6 +762,14 @@ impl SplashScreen {
         });
     }
 
+    fn start_omlx_repair(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.omlx_repair_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(repair_omlx());
+        });
+    }
+
     fn start_model_health_poll(&mut self) {
         let (tx, rx) = mpsc::channel();
         self.model_load_rx = Some(rx);
@@ -739,6 +813,7 @@ impl SplashScreen {
         // Don't skip if we're in the middle of installing llama or waiting for model
         if self.phase == SplashPhase::UpdatingCompute
             || self.phase == SplashPhase::InstallingLlama
+            || self.phase == SplashPhase::RepairingOmlx
             || self.phase == SplashPhase::LoadingModel
             || (self.current_step <= self.update_step && !self.steps[self.update_step].done)
         {
@@ -885,11 +960,15 @@ impl SplashScreen {
 
             let is_updating = i == self.current_step && self.phase == SplashPhase::UpdatingCompute;
 
+            let is_repairing_omlx =
+                i == self.current_step && self.phase == SplashPhase::RepairingOmlx;
+
             let (icon, color) = if step.done {
                 ("  ✓ ".to_string(), p.success)
             } else if is_updating
                 || is_installing
                 || is_loading_model
+                || is_repairing_omlx
                 || (i == self.current_step && self.phase == SplashPhase::StepsRunning)
             {
                 (format!("  {spinner} "), p.warning)
@@ -968,6 +1047,18 @@ impl SplashScreen {
                     Style::default().fg(p.warning),
                 )),
                 Line::from(Span::styled("  [i] What is llama-server?", Style::default().fg(p.dim))),
+            ]);
+            frame.render_widget(msg, right_chunks[5]);
+        } else if self.phase == SplashPhase::RepairingOmlx {
+            let msg = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  Repairing oMLX runtime via Homebrew...",
+                    Style::default().fg(p.warning),
+                )),
+                Line::from(Span::styled(
+                    "  One-time fix — this can take a few minutes.",
+                    Style::default().fg(p.dim),
+                )),
             ]);
             frame.render_widget(msg, right_chunks[5]);
         } else if !self.has_local_model && !self.stage_mode_enabled {
@@ -1125,6 +1216,100 @@ fn find_llama_server() -> bool {
 
     let candidates = ["/usr/local/bin/llama-server", "/opt/homebrew/bin/llama-server"];
     candidates.iter().any(|p| std::path::Path::new(p).exists())
+}
+
+/// Result of probing the oMLX runtime at startup.
+enum OmlxHealth {
+    /// oMLX is installed and looks runnable.
+    Healthy,
+    /// oMLX is installed but won't run (e.g. brew removed its bundled Python,
+    /// leaving a dangling shebang interpreter — the exact failure seen in the field).
+    Broken,
+    /// oMLX isn't relevant here (not Apple Silicon, or not installed). Skip it.
+    NotApplicable,
+}
+
+/// Locate the oMLX executable, if installed.
+fn omlx_binary() -> Option<std::path::PathBuf> {
+    if let Ok(output) = std::process::Command::new("which").arg("omlx").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    for candidate in ["/opt/homebrew/bin/omlx", "/usr/local/bin/omlx"] {
+        if std::path::Path::new(candidate).exists() {
+            return Some(std::path::PathBuf::from(candidate));
+        }
+    }
+    None
+}
+
+/// Probe oMLX cheaply. oMLX is a Python entry-point script, so we resolve it and
+/// verify its `#!` interpreter still resolves — this catches the brew-removed-Python
+/// breakage instantly without paying the cost of starting the Python runtime.
+fn check_omlx_health() -> OmlxHealth {
+    if !(cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")) {
+        return OmlxHealth::NotApplicable;
+    }
+    let Some(bin) = omlx_binary() else {
+        return OmlxHealth::NotApplicable;
+    };
+    match shebang_interpreter(&bin) {
+        // `exists()` follows symlinks, so a dangling interpreter chain reports false.
+        Some(interp) if !interp.exists() => OmlxHealth::Broken,
+        _ => OmlxHealth::Healthy,
+    }
+}
+
+/// Read the `#!interpreter` from a script (following a symlinked launcher first).
+fn shebang_interpreter(bin: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::io::Read;
+    let real = std::fs::canonicalize(bin).unwrap_or_else(|_| bin.to_path_buf());
+    let mut file = std::fs::File::open(&real).ok()?;
+    let mut buf = [0u8; 256];
+    let n = file.read(&mut buf).ok()?;
+    let first_line = std::str::from_utf8(&buf[..n]).ok()?.lines().next()?;
+    let interp = first_line.strip_prefix("#!")?.split_whitespace().next()?;
+    Some(std::path::PathBuf::from(interp))
+}
+
+/// Auto-repair a broken oMLX install via Homebrew. Tries a full reinstall first
+/// (rebuilds the venv + pulls its Python back), then falls back to just restoring
+/// the bundled Python interpreter. Returns Ok only if oMLX runs afterwards.
+fn repair_omlx() -> Result<(), String> {
+    // The oMLX formula lives in a third-party tap that newer Homebrew treats as
+    // untrusted; tap + trust make `reinstall` non-interactive.
+    let _ = std::process::Command::new("brew").args(["tap", "jundot/omlx"]).output();
+    let _ = std::process::Command::new("brew").args(["trust", "jundot/omlx"]).output();
+
+    let reinstall = std::process::Command::new("brew")
+        .args(["reinstall", "omlx"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status();
+    if matches!(reinstall, Ok(status) if status.success()) && omlx_now_healthy() {
+        return Ok(());
+    }
+
+    // Fallback: the common breakage is just the missing bundled Python.
+    let _ = std::process::Command::new("brew")
+        .args(["install", "python@3.11"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status();
+    if omlx_now_healthy() {
+        Ok(())
+    } else {
+        Err("oMLX still not runnable after repair — try `brew reinstall omlx`".into())
+    }
+}
+
+/// Whether oMLX is installed and its interpreter resolves after a repair attempt.
+fn omlx_now_healthy() -> bool {
+    matches!(check_omlx_health(), OmlxHealth::Healthy)
 }
 
 /// Open a URL in the default browser.
