@@ -246,6 +246,14 @@ async fn run_hf_download_attempt<F>(
 where
     F: FnMut(u64, Option<u64>) + Send,
 {
+    // huggingface_hub uses a soft (file-existence) lock per shard that is NOT
+    // released if the process is killed. A previous attempt we (or a stall kill)
+    // terminated leaves a stale `*.lock` behind, and the next `hf` then waits on
+    // it forever ("Still waiting to acquire lock ..."). Single-flight is enforced
+    // upstream (active_downloads set + single-instance app lock), so any lock here
+    // is guaranteed stale — clear it before launching.
+    clear_stale_download_locks(dest);
+
     let mut child = tokio::process::Command::new(hf_bin)
         .arg("download")
         .arg(repo_id)
@@ -272,8 +280,12 @@ where
         });
     }
 
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
     let mut last_bytes = dir_size_bytes(dest);
+    // Report the absolute on-disk size immediately so a resume shows real progress
+    // (e.g. 17 GB already present) instead of 0 until the next byte is written.
+    on_progress(last_bytes, total_bytes);
+
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
     let mut last_progress_at = tokio::time::Instant::now();
     loop {
         tokio::select! {
@@ -286,16 +298,38 @@ where
                 return Ok(());
             }
             _ = interval.tick() => {
+                // Always report the absolute size so the bar reflects reality; track
+                // growth separately, only for stall detection.
                 let downloaded = dir_size_bytes(dest);
+                on_progress(downloaded, total_bytes);
                 if downloaded > last_bytes {
                     last_bytes = downloaded;
                     last_progress_at = tokio::time::Instant::now();
-                    on_progress(downloaded, total_bytes);
                 } else if last_progress_at.elapsed() >= Duration::from_secs(MLX_DOWNLOAD_STALL_SECS) {
                     let _ = child.kill().await;
                     let _ = child.wait().await;
                     anyhow::bail!("download stalled — no progress for {}s", MLX_DOWNLOAD_STALL_SECS);
                 }
+            }
+        }
+    }
+}
+
+/// Remove stale huggingface_hub `*.lock` files left in the snapshot's download
+/// cache. Safe only because single-flight is guaranteed by the caller — there is
+/// never a *live* `hf` for this snapshot whose lock we'd be stealing.
+fn clear_stale_download_locks(dest: &Path) {
+    let lock_dir = dest.join(".cache").join("huggingface").join("download");
+    let Ok(entries) = std::fs::read_dir(&lock_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "lock") {
+            if let Err(e) = std::fs::remove_file(&path) {
+                debug!("[mlx-download] could not remove stale lock {}: {e}", path.display());
+            } else {
+                debug!("[mlx-download] cleared stale lock {}", path.display());
             }
         }
     }
