@@ -113,6 +113,14 @@ pub fn acquire_single_instance() -> std::result::Result<InstanceGuard, InstanceL
 pub fn stop_daemon() -> Result<()> {
     let pid = read_pid().ok_or_else(|| anyhow::anyhow!("Daemon is not running (no PID file)"))?;
 
+    // Never signal ourselves. Since the single-instance lock records the running
+    // app's own PID, and the auto-updater calls this from inside that same app to
+    // stop "the daemon" before installing, an unguarded kill would SIGTERM the
+    // live process mid-update — i.e. the app would kill itself on launch.
+    if pid == std::process::id() {
+        return Ok(());
+    }
+
     if !is_process_alive(pid) {
         remove_pid()?;
         anyhow::bail!(
