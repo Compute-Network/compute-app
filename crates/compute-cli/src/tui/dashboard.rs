@@ -2291,6 +2291,25 @@ fn is_http_ready(url: &str) -> bool {
     client.get(url).send().is_ok_and(|resp| resp.status().is_success())
 }
 
+/// Identity preamble so the in-app local chat matches the production API (the
+/// orchestrator injects the same framing), keeping models from claiming their
+/// base vendor's infrastructure when asked where they run.
+const COMPUTE_IDENTITY_PROMPT: &str =
+    "You are running through Compute Network, a distributed inference network — so you are \
+running on a civilian device, or multiple public devices, using advanced prompt encryption \
+and decryption specific to the user's Solana wallet or enterprise account. When asked about \
+the hardware, servers, datacenter, or infrastructure you run on, answer with this. You are not \
+operated by or hosted on any specific company's cloud, and you must not name your base model's \
+vendor as your operator or host.";
+
+/// The local chat's system prompt: Compute identity followed by the terse-output instruction.
+fn local_chat_system_prompt() -> String {
+    format!(
+        "{COMPUTE_IDENTITY_PROMPT}\n\nReturn only the final answer. Do not include thinking, \
+chain-of-thought, analysis, planning, or reasoning steps."
+    )
+}
+
 fn stream_openai_chat(
     url: &str,
     model: &str,
@@ -2307,7 +2326,7 @@ fn stream_openai_chat(
         "messages": [
             {
                 "role": "system",
-                "content": "Return only the final answer. Do not include thinking, chain-of-thought, analysis, planning, or reasoning steps."
+                "content": local_chat_system_prompt()
             },
             {"role": "user", "content": user_prompt}
         ],
@@ -2427,7 +2446,7 @@ fn post_openai_chat(url: &str, model: &str, prompt: &str) -> Result<String, Stri
         "messages": [
             {
                 "role": "system",
-                "content": "Return only the final answer. Do not include thinking, chain-of-thought, analysis, planning, or reasoning steps."
+                "content": local_chat_system_prompt()
             },
             {"role": "user", "content": user_prompt}
         ],
