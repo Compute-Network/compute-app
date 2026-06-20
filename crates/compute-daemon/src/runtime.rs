@@ -1199,6 +1199,9 @@ pub struct DaemonState {
     pub inference_status: String,
     pub downloads: Vec<DownloadStatus>,
     pub backend_warmup: BackendWarmupStatus,
+    /// True when the orchestrator has rejected this node's session as expired/invalid.
+    /// The TUI uses this to prompt the user to log in again.
+    pub session_expired: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1277,6 +1280,7 @@ impl Default for DaemonState {
             inference_status: "idle".into(),
             downloads: Vec::new(),
             backend_warmup: BackendWarmupStatus::default(),
+            session_expired: false,
         }
     }
 }
@@ -1588,6 +1592,7 @@ impl DaemonRuntime {
         let relay_tps_at_ms = relay.last_tps_at_ms();
         let relay_completed_requests = relay.completed_requests();
         let relay_is_connected = relay.is_connected();
+        let relay_session_expired = relay.session_expired();
         let relay_active_requests = relay.active_requests();
         let relay_handle = tokio::spawn(async move {
             if let Err(e) = relay.run().await {
@@ -1611,8 +1616,12 @@ impl DaemonRuntime {
 
             tokio::select! {
                 _ = heartbeat_interval.tick() => {
-                    let relay_busy_slots = relay_active_requests.load(std::sync::atomic::Ordering::Relaxed) as i32;
-                    self.heartbeat(&inference_mgr, stage_runtime.as_ref(), relay_busy_slots).await;
+                    // Skip heartbeats once the session is rejected — they'd just 401
+                    // until the user re-authenticates (which relaunches the process).
+                    if !relay_session_expired.load(std::sync::atomic::Ordering::Relaxed) {
+                        let relay_busy_slots = relay_active_requests.load(std::sync::atomic::Ordering::Relaxed) as i32;
+                        self.heartbeat(&inference_mgr, stage_runtime.as_ref(), relay_busy_slots).await;
+                    }
                 }
                 Some(assignment) = assignment_rx.recv() => {
                     // Instant assignment push from orchestrator via WebSocket
@@ -2184,8 +2193,11 @@ impl DaemonRuntime {
                 }
                 _ = assignment_interval.tick() => {
                     // Fallback: only poll orchestrator when WS relay is not actively connected
-                    // When WS is connected, assignments come via push (no polling needed)
-                    if !relay_is_connected.load(std::sync::atomic::Ordering::Relaxed) {
+                    // When WS is connected, assignments come via push (no polling needed).
+                    // Also skip while the session is expired — it would only 401.
+                    if !relay_is_connected.load(std::sync::atomic::Ordering::Relaxed)
+                        && !relay_session_expired.load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         self.check_assignment(
                             &mut inference_mgr,
                             &mut stage_runtime,
@@ -2201,6 +2213,11 @@ impl DaemonRuntime {
                     }
                 }
                 _ = metrics_interval.tick() => {
+                    // Surface relay session-expiry to the TUI so it can prompt re-login.
+                    let session_expired = relay_session_expired.load(std::sync::atomic::Ordering::Relaxed);
+                    self.update_state(|state| {
+                        state.session_expired = session_expired;
+                    });
                     // Fast crash detection: check process alive every 1s (not 30s)
                     if stage_runtime.is_some() {
                         inference_mgr.set_externally_managed(true);

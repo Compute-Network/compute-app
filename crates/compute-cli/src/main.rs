@@ -125,10 +125,17 @@ fn restore_plain_terminal_for_cli() {
 }
 
 fn cmd_start() -> Result<()> {
-    if daemon::is_running() {
-        println!("Daemon is already running (PID: {})", daemon::read_pid().unwrap_or(0));
-        return Ok(());
-    }
+    // Single-instance lock: only one Compute app/daemon may run at a time.
+    // Held for the whole function; released (and PID file cleared) on return.
+    let _instance = match daemon::acquire_single_instance() {
+        Ok(guard) => guard,
+        Err(daemon::InstanceLockError::AlreadyRunning { pid }) => {
+            println!("Compute is already running (PID: {}).", pid.unwrap_or(0));
+            println!("Run `compute dashboard` to view it, or `compute stop` to stop it first.");
+            return Ok(());
+        }
+        Err(daemon::InstanceLockError::Io(e)) => return Err(e),
+    };
 
     // Check if wallet auth is configured — prompt if not
     let mut config_check = Config::load()?;
@@ -159,7 +166,6 @@ fn cmd_start() -> Result<()> {
     // Set up logging and dirs
     config::ensure_dirs()?;
     compute_daemon::logging::init(true)?;
-    daemon::write_pid()?;
 
     let mut config = Config::load()?;
     if !config.wallet.public_address.is_empty() && !config.wallet.node_token.is_empty() {
@@ -181,7 +187,6 @@ fn cmd_start() -> Result<()> {
         }
     });
 
-    daemon::remove_pid()?;
     Ok(())
 }
 

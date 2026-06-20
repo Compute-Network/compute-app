@@ -228,6 +228,10 @@ pub struct RelayClient {
     is_active: Arc<AtomicBool>,
     /// Whether the websocket relay is currently connected and identified.
     is_connected: Arc<AtomicBool>,
+    /// Set when the orchestrator rejects our node session (close code 4004/4005).
+    /// Unlike a transient disconnect, this is terminal: the loop stops reconnecting
+    /// and the TUI surfaces a "session expired, log in again" prompt.
+    session_expired: Arc<AtomicBool>,
     /// Number of in-flight relay requests currently being processed
     active_requests: Arc<AtomicU32>,
     /// Channel to send assignment pushes to the runtime
@@ -279,6 +283,11 @@ impl RelayClient {
         self.is_connected.clone()
     }
 
+    /// Shared flag set when the node session is rejected as expired/invalid.
+    pub fn session_expired(&self) -> Arc<AtomicBool> {
+        self.session_expired.clone()
+    }
+
     pub fn active_requests(&self) -> Arc<AtomicU32> {
         self.active_requests.clone()
     }
@@ -317,6 +326,7 @@ impl RelayClient {
             completed_requests: Arc::new(AtomicU64::new(0)),
             is_active: Arc::new(AtomicBool::new(false)),
             is_connected: Arc::new(AtomicBool::new(false)),
+            session_expired: Arc::new(AtomicBool::new(false)),
             active_requests: Arc::new(AtomicU32::new(0)),
             assignment_tx,
             download_tx,
@@ -354,6 +364,15 @@ impl RelayClient {
             }
 
             if self.shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            // An expired/invalid session is terminal, not a transient drop:
+            // reconnecting with the same dead token can never succeed and would
+            // loop forever. Stop here; the TUI will prompt the user to log in
+            // again (which mints a fresh token and relaunches).
+            if self.session_expired.load(Ordering::Relaxed) {
+                warn!("[relay] Session expired — stopping reconnect loop until re-authentication.");
                 return Ok(());
             }
 
@@ -654,9 +673,11 @@ impl RelayClient {
                         match frame.code {
                             tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Library(4004) => {
                                 warn!("[relay] Node session expired or invalid. Run `compute wallet login`.");
+                                self.session_expired.store(true, Ordering::Relaxed);
                             }
                             tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Library(4005) => {
                                 warn!("[relay] Relay wallet mismatch. Re-authenticate with `compute wallet login`.");
+                                self.session_expired.store(true, Ordering::Relaxed);
                             }
                             _ => {}
                         }

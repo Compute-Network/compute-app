@@ -103,6 +103,17 @@ pub enum UpdateGateOutcome {
     Restart,
 }
 
+/// What the user chose to do when the splash screen exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplashAction {
+    /// Proceed to the dashboard.
+    ToDashboard,
+    /// Quit the app.
+    Quit,
+    /// Session expired — re-authenticate (browser login) and relaunch.
+    Reauth,
+}
+
 impl SplashScreen {
     pub fn new(
         hardware_info: &compute_daemon::hardware::HardwareInfo,
@@ -269,55 +280,82 @@ impl SplashScreen {
         self
     }
 
-    /// Run the splash screen animation. Returns true if user wants to continue to dashboard.
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<bool> {
+    /// Run the splash screen animation. Returns the action the user chose.
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<SplashAction> {
         let tick_rate = Duration::from_millis(50); // 20 fps
 
         loop {
             terminal.draw(|frame| self.draw(frame))?;
+
+            let session_expired = self.session_expired();
 
             // Handle input
             if event::poll(tick_rate)?
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(false),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(false);
-                    }
-                    KeyCode::Char('i') | KeyCode::Char('I') => {
-                        // Open llama-server docs page
-                        open_url("https://computenetwork.sh/docs/llama-server");
-                    }
-                    KeyCode::Enter if self.phase == SplashPhase::Complete => {
-                        if self.update_applied {
-                            return Ok(false);
+                // A dead session overrides the normal splash flow: the only useful
+                // actions are to log in again or quit. Reconnecting is pointless.
+                if session_expired {
+                    match key.code {
+                        KeyCode::Enter => return Ok(SplashAction::Reauth),
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(SplashAction::Quit),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(SplashAction::Quit);
                         }
-                        return Ok(true);
+                        _ => {}
                     }
-                    // Any key during animation speeds it up (but not during install)
-                    _ if self.phase == SplashPhase::StepsRunning => {
-                        self.skip_to_complete();
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(SplashAction::Quit),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(SplashAction::Quit);
+                        }
+                        KeyCode::Char('i') | KeyCode::Char('I') => {
+                            // Open llama-server docs page
+                            open_url("https://computenetwork.sh/docs/llama-server");
+                        }
+                        // Don't let the user skip into the dashboard while a model is
+                        // still downloading — it isn't ready to serve yet.
+                        KeyCode::Enter
+                            if self.phase == SplashPhase::Complete
+                                && !self.has_active_download() =>
+                        {
+                            if self.update_applied {
+                                return Ok(SplashAction::Quit);
+                            }
+                            return Ok(SplashAction::ToDashboard);
+                        }
+                        // Any key during animation speeds it up (but not during install)
+                        _ if self.phase == SplashPhase::StepsRunning => {
+                            self.skip_to_complete();
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
 
             // Update state
             self.tick();
 
-            // Auto-complete after all steps done + brief pause
-            if self.phase == SplashPhase::Complete
+            // Auto-complete after all steps done + brief pause — but never while the
+            // session is expired (user must log in) or a download is in flight.
+            if !session_expired
+                && self.phase == SplashPhase::Complete
                 && self.start_time.elapsed() > Duration::from_secs(4)
                 && !self.has_active_download()
             {
                 if self.update_applied {
-                    return Ok(false);
+                    return Ok(SplashAction::Quit);
                 }
-                return Ok(true);
+                return Ok(SplashAction::ToDashboard);
             }
         }
+    }
+
+    /// Whether the daemon has reported the node session as expired/invalid.
+    fn session_expired(&self) -> bool {
+        self.daemon_state_rx.as_ref().is_some_and(|rx| rx.borrow().session_expired)
     }
 
     /// Run only the splash update gate. Returns `Restart` when an update was
@@ -875,7 +913,19 @@ impl SplashScreen {
         frame.render_widget(steps_widget, right_chunks[4]);
 
         // Bottom message
-        if let Some(download) = self.visible_download() {
+        if self.session_expired() {
+            let msg = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  Session expired — your node session has ended.",
+                    Style::default().fg(p.danger).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "  [Enter] log in (opens browser)   ·   [q] quit",
+                    Style::default().fg(p.warning),
+                )),
+            ]);
+            frame.render_widget(msg, right_chunks[5]);
+        } else if let Some(download) = self.visible_download() {
             let msg = Paragraph::new(download_lines(&download));
             frame.render_widget(msg, right_chunks[5]);
         } else if self.update_applied {
@@ -983,7 +1033,7 @@ fn download_lines(download: &DownloadStatus) -> Vec<Line<'static>> {
                     Style::default().fg(p.muted),
                 )),
                 Line::from(Span::styled(
-                    "  Enter opens dashboard; download continues.",
+                    "  Waiting for download to finish before the model is ready...",
                     Style::default().fg(p.dim),
                 )),
             ]

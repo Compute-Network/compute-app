@@ -39,6 +39,76 @@ pub fn remove_pid() -> Result<()> {
     Ok(())
 }
 
+/// Error returned when a single-instance lock cannot be acquired.
+pub enum InstanceLockError {
+    /// Another Compute instance already holds the lock.
+    AlreadyRunning { pid: Option<u32> },
+    /// An IO/OS error occurred while trying to acquire the lock.
+    Io(anyhow::Error),
+}
+
+/// Guard that holds the single-instance lock for the lifetime of the process.
+///
+/// On Unix the lock is an advisory `flock` on the PID file; the kernel releases
+/// it automatically when the process exits (even on crash or SIGKILL), so there
+/// is never a stale lock to clean up. Dropping the guard also clears the PID file.
+pub struct InstanceGuard {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        let _ = remove_pid();
+    }
+}
+
+/// Acquire the single-instance lock so only one Compute app/daemon runs at a time.
+///
+/// Returns `AlreadyRunning` (with the holder's PID, if known) when another
+/// instance is live. The returned guard must be kept alive for the whole run.
+#[cfg(unix)]
+pub fn acquire_single_instance() -> std::result::Result<InstanceGuard, InstanceLockError> {
+    use std::os::unix::io::AsRawFd;
+
+    let path = config::pid_file_path().map_err(InstanceLockError::Io)?;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Rust opens files with O_CLOEXEC by default, so the lock fd is released on
+    // exec() — this is what lets the session-expired flow relaunch into a fresh
+    // process that can re-acquire the lock cleanly.
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| InstanceLockError::Io(e.into()))?;
+
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if matches!(err.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK) {
+            return Err(InstanceLockError::AlreadyRunning { pid: read_pid() });
+        }
+        return Err(InstanceLockError::Io(err.into()));
+    }
+
+    // We hold the lock — record our PID so `compute status`/`stop` can find us.
+    let _ = write_pid();
+    Ok(InstanceGuard { _file: file })
+}
+
+/// Windows fallback: best-effort PID-file check (no atomic file lock).
+#[cfg(windows)]
+pub fn acquire_single_instance() -> std::result::Result<InstanceGuard, InstanceLockError> {
+    if is_running() {
+        return Err(InstanceLockError::AlreadyRunning { pid: read_pid() });
+    }
+    write_pid().map_err(InstanceLockError::Io)?;
+    Ok(InstanceGuard {})
+}
+
 /// Stop the running daemon by sending a signal.
 pub fn stop_daemon() -> Result<()> {
     let pid = read_pid().ok_or_else(|| anyhow::anyhow!("Daemon is not running (no PID file)"))?;

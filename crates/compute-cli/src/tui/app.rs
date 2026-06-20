@@ -10,9 +10,9 @@ use compute_network::client::{
     NodeRegistration as OrchestratorNodeRegistration, OrchestratorClient,
 };
 
-use super::dashboard::Dashboard;
+use super::dashboard::{Dashboard, DashboardAction};
 use super::onboarding::{OnboardingResult, OnboardingScreen};
-use super::splash::{SplashScreen, UpdateGateOutcome};
+use super::splash::{SplashAction, SplashScreen, UpdateGateOutcome};
 
 pub struct NodeRegistrationResult {
     pub node_id: String,
@@ -22,6 +22,18 @@ pub struct NodeRegistrationResult {
 /// Initialize the terminal and run the TUI application.
 /// Flow: check config → onboarding (if needed) → splash → dashboard
 pub fn run_splash_then_dashboard() -> Result<()> {
+    // Single-instance lock: only one Compute app/daemon may run at a time.
+    // Held for the whole session; the kernel releases it if this process dies.
+    let _instance = match compute_daemon::daemon::acquire_single_instance() {
+        Ok(guard) => guard,
+        Err(compute_daemon::daemon::InstanceLockError::AlreadyRunning { pid }) => {
+            eprintln!("Compute is already running (PID: {}).", pid.unwrap_or(0));
+            eprintln!("Run `compute dashboard` to view it, or `compute stop` to stop it first.");
+            return Ok(());
+        }
+        Err(compute_daemon::daemon::InstanceLockError::Io(e)) => return Err(e),
+    };
+
     let hw = hardware::detect();
     let mut config = Config::load()?;
 
@@ -60,9 +72,11 @@ pub fn run_dashboard_only() -> Result<()> {
 
     let mut terminal = ratatui::init();
     let mut dashboard = Dashboard::new(hw);
+    // View-only dashboard has no embedded daemon, so it never reports a session
+    // expiry; we don't act on the returned action here.
     let result = dashboard.run(&mut terminal);
     ratatui::restore();
-    result
+    result.map(|_action| ())
 }
 
 fn run_inner(
@@ -107,11 +121,16 @@ fn run_inner(
         UpdateGateOutcome::Restart => return relaunch_current_command(),
     }
 
-    // Start daemon runtime in background DURING splash so there's no lag on transition
+    // Start daemon runtime in background DURING splash so there's no lag on transition.
+    // Wrapped in an Arc so we can signal a graceful shutdown from this thread.
     let daemon_config = config.clone();
-    let runtime = compute_daemon::runtime::DaemonRuntime::with_hardware(daemon_config, hw.clone());
+    let runtime = std::sync::Arc::new(compute_daemon::runtime::DaemonRuntime::with_hardware(
+        daemon_config,
+        hw.clone(),
+    ));
     let state_rx = runtime.state_receiver();
 
+    let runtime_for_thread = runtime.clone();
     let daemon_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -119,7 +138,7 @@ fn run_inner(
             .expect("Failed to create tokio runtime");
 
         rt.block_on(async {
-            if let Err(e) = runtime.run().await {
+            if let Err(e) = runtime_for_thread.run().await {
                 tracing::error!("Daemon error: {e}");
             }
         });
@@ -127,19 +146,74 @@ fn run_inner(
 
     // Show splash (daemon boots in parallel)
     let mut splash = splash.with_daemon_state(state_rx.clone());
-    let continue_to_dashboard = splash.run(terminal)?;
-
-    if continue_to_dashboard {
-        let mut dashboard = Dashboard::with_daemon_state(hw, state_rx);
-        dashboard.run(terminal)?;
+    let mut reauth_requested = false;
+    match splash.run(terminal)? {
+        SplashAction::ToDashboard => {
+            let mut dashboard = Dashboard::with_daemon_state(hw.clone(), state_rx);
+            match dashboard.run(terminal)? {
+                DashboardAction::Quit => {}
+                DashboardAction::Reauth => reauth_requested = true,
+            }
+        }
+        SplashAction::Quit => {}
+        SplashAction::Reauth => reauth_requested = true,
     }
 
-    // Clean shutdown: kill any llama-server we started
+    // Graceful shutdown: signal the runtime and wait for its event loop to return
+    // so its Drop handlers kill the inference children (stage nodes, oMLX) instead
+    // of orphaning them to PID 1.
+    runtime.shutdown();
+    let _ = daemon_handle.join();
     kill_llama_server();
 
-    drop(daemon_handle);
+    if reauth_requested {
+        return reauthenticate_and_relaunch(&hw);
+    }
 
     Ok(())
+}
+
+/// Handle a "session expired" re-authentication request from the TUI: drop out of
+/// the alternate screen, run the browser wallet-login flow, persist the fresh
+/// token, re-register the node, and relaunch into a clean process so every
+/// component picks up the new session. On Unix the relaunch `exec`s and never
+/// returns; the CLOEXEC lock fd is released so the new process re-acquires it.
+fn reauthenticate_and_relaunch(hw: &hardware::HardwareInfo) -> Result<()> {
+    ratatui::restore();
+    println!("\n  Session expired — your node session has ended.");
+    println!("  Re-authenticating your wallet...\n");
+
+    let login = match crate::wallet_login_flow() {
+        Ok(login) => login,
+        Err(e) => {
+            eprintln!("\n  Login failed: {e}");
+            eprintln!("  Run `compute wallet login`, then start Compute again.\n");
+            return Ok(());
+        }
+    };
+
+    let mut config = Config::load().unwrap_or_default();
+    config.wallet.public_address = login.wallet_address;
+    config.wallet.node_token = login.node_token;
+    if let Err(e) = config.save() {
+        eprintln!("  Warning: could not save config: {e}");
+    }
+
+    // Re-register so the node_id matches the new session (login may mint a new one).
+    if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        rt.block_on(async {
+            if let Ok(Some(result)) = register_node_orchestrator(&config, hw).await {
+                config.wallet.node_id = result.node_id;
+                if let Some(token) = result.node_token {
+                    config.wallet.node_token = token;
+                }
+                let _ = config.save();
+            }
+        });
+    }
+
+    println!("\n  Re-authenticated. Restarting Compute...\n");
+    relaunch_current_command()
 }
 
 fn relaunch_current_command() -> Result<()> {

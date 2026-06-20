@@ -3,7 +3,16 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::AsyncBufReadExt;
 use tracing::{debug, info, warn};
+
+/// How many times to (re)launch `hf download` before giving up. Each attempt
+/// resumes from the partial `.incomplete` stub + already-finished shards.
+const MLX_DOWNLOAD_MAX_ATTEMPTS: u32 = 6;
+/// If the on-disk size hasn't grown for this long, treat the transfer as stalled,
+/// kill it, and retry (resuming). Generous enough that a genuinely slow-but-live
+/// transfer is never misread as stalled.
+const MLX_DOWNLOAD_STALL_SECS: u64 = 120;
 
 pub fn stages_cache_dir() -> PathBuf {
     crate::config::config_dir().unwrap_or_else(|| PathBuf::from("~/.compute")).join("stages")
@@ -175,34 +184,39 @@ where
 
     debug!("Downloading MLX snapshot {} -> {}", repo_id, dest.display());
     let total_bytes = total_size_mb.checked_mul(1024 * 1024).filter(|value| *value > 0);
-    let mut child = tokio::process::Command::new(&hf_bin)
-        .arg("download")
-        .arg(repo_id)
-        .arg("--local-dir")
-        .arg(&dest)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("invoking {}", hf_bin.display()))?;
 
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    // `hf download` resumes from the partial `.incomplete` stub and already
+    // completed shards, so each retry continues where the last left off instead
+    // of restarting. We retry on both hard failures and stalls (a hung transfer
+    // that stops writing) — the common real-world case on large anonymous pulls,
+    // and the reason a download could otherwise sit frozen forever.
+    let mut attempt = 0u32;
+    let mut backoff = Duration::from_secs(2);
     loop {
-        tokio::select! {
-            status = child.wait() => {
-                let status = status.with_context(|| format!("waiting for {}", hf_bin.display()))?;
-                if !status.success() {
-                    anyhow::bail!("hf download {repo_id} failed with status {status}");
+        attempt += 1;
+        match run_hf_download_attempt(&hf_bin, repo_id, &dest, total_bytes, &mut on_progress).await {
+            Ok(()) => break,
+            Err(e) => {
+                // A retry may have actually completed the snapshot before erroring
+                // on a trailing detail — accept it if every file is present.
+                if mlx_model_cached(models_cache_dir, folder) {
+                    break;
                 }
-                break;
-            }
-            _ = interval.tick() => {
-                let downloaded = dir_size_bytes(&dest);
-                if downloaded > 0 {
-                    on_progress(downloaded, total_bytes);
+                if attempt >= MLX_DOWNLOAD_MAX_ATTEMPTS {
+                    return Err(e.context(format!(
+                        "hf download {repo_id} failed after {attempt} attempts"
+                    )));
                 }
+                warn!(
+                    "[mlx-download] {repo_id} attempt {attempt} failed: {e:#} — resuming in {}s",
+                    backoff.as_secs()
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }
     }
+
     if !mlx_model_cached(models_cache_dir, folder) {
         anyhow::bail!(
             "hf download {repo_id} returned success but config.json is missing at {}",
@@ -214,6 +228,77 @@ where
     on_progress(downloaded, total_bytes);
     info!("MLX snapshot ready at {}", dest.display());
     Ok(dest)
+}
+
+/// A single `hf download` attempt with live progress and stall detection.
+///
+/// Returns an error (after killing the child) if the process exits non-zero or
+/// stops growing on disk for [`MLX_DOWNLOAD_STALL_SECS`]. The caller retries and
+/// `hf` resumes. `hf`'s stderr is drained to the log so the real failure reason
+/// (HTTP 429, network reset, gated repo) is visible instead of silently lost.
+async fn run_hf_download_attempt<F>(
+    hf_bin: &Path,
+    repo_id: &str,
+    dest: &Path,
+    total_bytes: Option<u64>,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>) + Send,
+{
+    let mut child = tokio::process::Command::new(hf_bin)
+        .arg("download")
+        .arg(repo_id)
+        .arg("--local-dir")
+        .arg(dest)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("invoking {}", hf_bin.display()))?;
+
+    // Keep the last stderr line for the error message, and echo all of it to the
+    // debug log for diagnosis.
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let stderr_tail = stderr_tail.clone();
+        tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                debug!("[mlx-download:hf] {line}");
+                if let Ok(mut tail) = stderr_tail.lock() {
+                    *tail = line;
+                }
+            }
+        });
+    }
+
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    let mut last_bytes = dir_size_bytes(dest);
+    let mut last_progress_at = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                let status = status.with_context(|| format!("waiting for {}", hf_bin.display()))?;
+                if !status.success() {
+                    let tail = stderr_tail.lock().map(|t| t.clone()).unwrap_or_default();
+                    anyhow::bail!("hf download {repo_id} exited with {status}: {tail}");
+                }
+                return Ok(());
+            }
+            _ = interval.tick() => {
+                let downloaded = dir_size_bytes(dest);
+                if downloaded > last_bytes {
+                    last_bytes = downloaded;
+                    last_progress_at = tokio::time::Instant::now();
+                    on_progress(downloaded, total_bytes);
+                } else if last_progress_at.elapsed() >= Duration::from_secs(MLX_DOWNLOAD_STALL_SECS) {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    anyhow::bail!("download stalled — no progress for {}s", MLX_DOWNLOAD_STALL_SECS);
+                }
+            }
+        }
+    }
 }
 
 fn locate_hf_cli() -> Option<PathBuf> {

@@ -309,6 +309,15 @@ const CONFIG_ITEMS: &[ConfigItem] = &[
     ConfigItem { label: "Theme", key: "appearance.theme", kind: ConfigItemKind::Choice },
 ];
 
+/// What the user chose to do when the dashboard exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DashboardAction {
+    /// Quit the app.
+    Quit,
+    /// Session expired — re-authenticate (browser login) and relaunch.
+    Reauth,
+}
+
 pub struct Dashboard {
     globe: Globe,
     hardware: HardwareInfo,
@@ -404,8 +413,13 @@ impl Dashboard {
         }
     }
 
+    /// Whether the daemon has reported the node session as expired/invalid.
+    fn session_expired(&self) -> bool {
+        self.daemon_state_rx.as_ref().is_some_and(|rx| rx.borrow().session_expired)
+    }
+
     /// Run the dashboard event loop.
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<()> {
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> anyhow::Result<DashboardAction> {
         let tick_rate = Duration::from_millis(100); // 10 fps
 
         loop {
@@ -416,11 +430,27 @@ impl Dashboard {
                 && key.kind == KeyEventKind::Press
             {
                 match key.code {
+                    // A dead session takes priority over everything: log in again or quit.
+                    _ if self.session_expired() => {
+                        match key.code {
+                            KeyCode::Enter => return Ok(DashboardAction::Reauth),
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                return Ok(DashboardAction::Quit);
+                            }
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                return Ok(DashboardAction::Quit);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     _ if self.local_chat_focused && self.active_tab == Tab::Logs => {
                         if key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
-                            return Ok(());
+                            return Ok(DashboardAction::Quit);
                         }
                         self.handle_local_chat_key(key.code);
                         continue;
@@ -444,9 +474,9 @@ impl Dashboard {
                         }
                         continue;
                     }
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(DashboardAction::Quit),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(());
+                        return Ok(DashboardAction::Quit);
                     }
                     KeyCode::Char('p') => {
                         self.pipeline.active = !self.pipeline.active;
@@ -785,6 +815,29 @@ impl Dashboard {
         } else {
             // Narrow/mobile: content only, no globe
             self.draw_right_panel(frame, area);
+        }
+
+        // Session-expired banner overlays everything — it's the only actionable state.
+        if self.session_expired() {
+            let p = theme::palette();
+            let banner = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 1,
+            };
+            frame.render_widget(Clear, banner);
+            let text = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " Session expired ",
+                    Style::default().fg(p.danger).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "— [Enter] log in (opens browser)  ·  [q] quit",
+                    Style::default().fg(p.warning),
+                ),
+            ]));
+            frame.render_widget(text, banner);
         }
     }
 
