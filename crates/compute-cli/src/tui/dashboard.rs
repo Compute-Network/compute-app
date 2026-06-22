@@ -1061,7 +1061,7 @@ impl Dashboard {
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Today      ", Style::default().fg(p.dim)),
-                Span::styled(format!("{:.1} $COMPUTE", e.today), Style::default().fg(p.text)),
+                Span::styled(format!("{:.1} $CPU", e.today), Style::default().fg(p.text)),
                 Span::styled(
                     format!("    ≈ ${:.2}", e.today * e.usd_rate),
                     Style::default().fg(p.dim),
@@ -1069,7 +1069,7 @@ impl Dashboard {
             ]),
             Line::from(vec![
                 Span::styled("  This Week  ", Style::default().fg(p.dim)),
-                Span::styled(format!("{:.1} $COMPUTE", e.this_week), Style::default().fg(p.text)),
+                Span::styled(format!("{:.1} $CPU", e.this_week), Style::default().fg(p.text)),
                 Span::styled(
                     format!("    ≈ ${:.2}", e.this_week * e.usd_rate),
                     Style::default().fg(p.dim),
@@ -1077,11 +1077,11 @@ impl Dashboard {
             ]),
             Line::from(vec![
                 Span::styled("  All Time   ", Style::default().fg(p.dim)),
-                Span::styled(format!("{:.0} $COMPUTE", e.all_time), Style::default().fg(p.text)),
+                Span::styled(format!("{:.0} $CPU", e.all_time), Style::default().fg(p.text)),
             ]),
             Line::from(vec![
                 Span::styled("  Pending    ", Style::default().fg(p.dim)),
-                Span::styled(format!("{:.1} $COMPUTE", e.pending), Style::default().fg(p.warning)),
+                Span::styled(format!("{:.1} $CPU", e.pending), Style::default().fg(p.warning)),
                 Span::styled("  [c]laim", Style::default().fg(p.dim)),
             ]),
         ];

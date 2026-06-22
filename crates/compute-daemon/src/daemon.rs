@@ -80,6 +80,7 @@ pub fn acquire_single_instance() -> std::result::Result<InstanceGuard, InstanceL
     // process that can re-acquire the lock cleanly.
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)

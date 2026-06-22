@@ -578,11 +578,11 @@ fn cmd_earnings() -> Result<()> {
 
     match earnings {
         Ok(e) => {
-            println!("  Today       {:.2} $COMPUTE", e.today);
-            println!("  This Week   {:.2} $COMPUTE", e.this_week);
-            println!("  This Month  {:.2} $COMPUTE", e.this_month);
-            println!("  All Time    {:.2} $COMPUTE", e.all_time);
-            println!("  Pending     {:.2} $COMPUTE", e.pending);
+            println!("  Today       {:.2} $CPU", e.today);
+            println!("  This Week   {:.2} $CPU", e.this_week);
+            println!("  This Month  {:.2} $CPU", e.this_month);
+            println!("  All Time    {:.2} $CPU", e.all_time);
+            println!("  Pending     {:.2} $CPU", e.pending);
             println!();
             println!("  Claim at: https://computenetwork.sh/dashboard/claim");
         }

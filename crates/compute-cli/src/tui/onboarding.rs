@@ -518,7 +518,7 @@ impl OnboardingScreen {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  To start earning $COMPUTE, you need to connect",
+                "  To start earning $CPU, you need to connect",
                 Style::default().fg(p.muted),
             )),
             Line::from(Span::styled(

@@ -505,7 +505,6 @@ where
     Ok(())
 }
 
-
 fn sha256_file(path: &Path) -> Result<String> {
     let output = std::process::Command::new("shasum")
         .args(["-a", "256", &path.to_string_lossy()])

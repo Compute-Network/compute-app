@@ -1034,7 +1034,7 @@ impl SplashScreen {
         } else if self.phase == SplashPhase::Complete {
             let msg = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    "  Daemon started. Earning $COMPUTE...",
+                    "  Daemon started. Earning $CPU...",
                     Style::default().fg(p.success),
                 )),
                 Line::from(Span::styled("  [i] What is llama-server?", Style::default().fg(p.dim))),

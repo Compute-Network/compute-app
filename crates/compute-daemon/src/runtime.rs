@@ -2501,10 +2501,17 @@ impl DaemonRuntime {
                 // Fetch time-bucketed earnings from reward_events
                 let wallet_owned = wallet.to_string();
                 let orchestrator_url = self.config.network.orchestrator_url.clone();
+                let node_token = if self.config.wallet.node_token.is_empty() {
+                    None
+                } else {
+                    Some(self.config.wallet.node_token.clone())
+                };
                 let state_tx = self.state_tx.clone();
                 tokio::spawn(async move {
-                    let client =
-                        compute_network::client::OrchestratorClient::new(&orchestrator_url, None);
+                    let client = compute_network::client::OrchestratorClient::new(
+                        &orchestrator_url,
+                        node_token,
+                    );
                     match client.get_earnings(&wallet_owned).await {
                         Ok(e) => {
                             state_tx.send_modify(|state| {
