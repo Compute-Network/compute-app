@@ -12,113 +12,158 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-
+  build-linux:
+    name: Build x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
     steps:
+      - name: Install base build deps
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            git \
+            patchelf \
+            pkg-config
+
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
-
-      # Linux: install cmake/build tools needed by the patched llama.cpp build
-      - name: Install Linux build deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake build-essential pkg-config
+          key: x86_64-unknown-linux-gnu
 
       - name: Build
         run: |
-          cargo build --release --target ${{ matrix.target }} \
+          cargo build --release --target x86_64-unknown-linux-gnu \
             -p compute-cli --bin compute \
             -p llama-stage-backend --bin llama_stage_tcp_node \
             -p llama-stage-backend --bin llama_stage_gateway_tcp_node
 
-      # Bundle compute + sidecars + the libllama/libggml dylibs the sidecars
-      # need at runtime (they're built by the cmake step inside cargo's
-      # OUT_DIR; we copy them into the bundle so they sit next to the binaries
-      # in ~/.compute/bin/).
       - name: Package bundle
         run: |
           set -e
           rm -rf bundle
           mkdir -p bundle
-          cp target/${{ matrix.target }}/release/compute bundle/compute
-          cp target/${{ matrix.target }}/release/llama_stage_tcp_node bundle/llama_stage_tcp_node
-          cp target/${{ matrix.target }}/release/llama_stage_gateway_tcp_node bundle/llama_stage_gateway_tcp_node
+          cp target/x86_64-unknown-linux-gnu/release/compute bundle/compute
+          cp target/x86_64-unknown-linux-gnu/release/llama_stage_tcp_node bundle/llama_stage_tcp_node
+          cp target/x86_64-unknown-linux-gnu/release/llama_stage_gateway_tcp_node bundle/llama_stage_gateway_tcp_node
 
           # The cmake build script installs libllama/libggml under
           # target/<triple>/release/build/llama-stage-backend-*/out/lib
-          # — copy every .dylib/.so into the bundle.
-          BUILD_DIRS=$(ls -d target/${{ matrix.target }}/release/build/llama-stage-backend-*/out/lib 2>/dev/null || true)
+          # — copy every .so into the bundle.
+          BUILD_DIRS=$(ls -d target/x86_64-unknown-linux-gnu/release/build/llama-stage-backend-*/out/lib 2>/dev/null || true)
           if [ -z "$BUILD_DIRS" ]; then
             echo "ERROR: no llama-stage-backend cmake output dir found" >&2
-            ls -la target/${{ matrix.target }}/release/build/ || true
+            ls -la target/x86_64-unknown-linux-gnu/release/build/ || true
             exit 1
           fi
           for d in $BUILD_DIRS; do
-            find "$d" -maxdepth 1 \( -name '*.dylib' -o -name '*.so' -o -name '*.so.*' \) -exec cp -av {} bundle/ \;
+            find "$d" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -exec cp -av {} bundle/ \;
           done
 
-          # On macOS, rewrite the dylib install names so the sidecars look for
-          # them next to themselves (@loader_path) instead of the build-time
-          # absolute path baked in by cmake.
-          if [ "$(uname -s)" = "Darwin" ]; then
-            for binary in bundle/llama_stage_tcp_node bundle/llama_stage_gateway_tcp_node; do
-              for dep in $(otool -L "$binary" | awk 'NR>1 {print $1}' | grep -E '/libllama|/libggml' || true); do
-                base=$(basename "$dep")
-                install_name_tool -change "$dep" "@loader_path/$base" "$binary" || true
-              done
-            done
-            for dy in bundle/*.dylib; do
-              [ -f "$dy" ] || continue
-              install_name_tool -id "@loader_path/$(basename "$dy")" "$dy" || true
-              for dep in $(otool -L "$dy" | awk 'NR>1 {print $1}' | grep -E '/libllama|/libggml' || true); do
-                base=$(basename "$dep")
-                install_name_tool -change "$dep" "@loader_path/$base" "$dy" || true
-              done
-            done
-          fi
-
-          # On Linux, set rpath so the binaries find sibling .so files.
-          if [ "$(uname -s)" = "Linux" ]; then
-            sudo apt-get install -y patchelf || true
-            for binary in bundle/llama_stage_tcp_node bundle/llama_stage_gateway_tcp_node; do
-              patchelf --set-rpath '$ORIGIN' "$binary" || true
-            done
-          fi
+          # Set rpath so the binaries find sibling .so files.
+          for binary in bundle/llama_stage_tcp_node bundle/llama_stage_gateway_tcp_node; do
+            patchelf --set-rpath '$ORIGIN' "$binary" || true
+          done
 
           ls -la bundle/
 
-          tar czf compute-${{ matrix.target }}.tar.gz -C bundle .
-          shasum -a 256 compute-${{ matrix.target }}.tar.gz > compute-${{ matrix.target }}.tar.gz.sha256
+          tar czf compute-x86_64-unknown-linux-gnu.tar.gz -C bundle .
+          sha256sum compute-x86_64-unknown-linux-gnu.tar.gz > compute-x86_64-unknown-linux-gnu.tar.gz.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: compute-${{ matrix.target }}
+          name: compute-x86_64-unknown-linux-gnu
           path: |
-            compute-${{ matrix.target }}.tar.gz
-            compute-${{ matrix.target }}.tar.gz.sha256
+            compute-x86_64-unknown-linux-gnu.tar.gz
+            compute-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+  build-macos:
+    name: Build aarch64-apple-darwin
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin
+
+      - name: Build
+        run: |
+          cargo build --release --target aarch64-apple-darwin \
+            -p compute-cli --bin compute \
+            -p llama-stage-backend --bin llama_stage_tcp_node \
+            -p llama-stage-backend --bin llama_stage_gateway_tcp_node
+
+      - name: Package bundle
+        run: |
+          set -e
+          rm -rf bundle
+          mkdir -p bundle
+          cp target/aarch64-apple-darwin/release/compute bundle/compute
+          cp target/aarch64-apple-darwin/release/llama_stage_tcp_node bundle/llama_stage_tcp_node
+          cp target/aarch64-apple-darwin/release/llama_stage_gateway_tcp_node bundle/llama_stage_gateway_tcp_node
+
+          # The cmake build script installs libllama/libggml under
+          # target/<triple>/release/build/llama-stage-backend-*/out/lib
+          # — copy every .dylib into the bundle.
+          BUILD_DIRS=$(ls -d target/aarch64-apple-darwin/release/build/llama-stage-backend-*/out/lib 2>/dev/null || true)
+          if [ -z "$BUILD_DIRS" ]; then
+            echo "ERROR: no llama-stage-backend cmake output dir found" >&2
+            ls -la target/aarch64-apple-darwin/release/build/ || true
+            exit 1
+          fi
+          for d in $BUILD_DIRS; do
+            find "$d" -maxdepth 1 -name '*.dylib' -exec cp -av {} bundle/ \;
+          done
+
+          # Rewrite dylib install names so sidecars look next to themselves
+          # instead of at the build-time absolute path baked in by cmake.
+          for binary in bundle/llama_stage_tcp_node bundle/llama_stage_gateway_tcp_node; do
+            for dep in $(otool -L "$binary" | awk 'NR>1 {print $1}' | grep -E '/libllama|/libggml' || true); do
+              base=$(basename "$dep")
+              install_name_tool -change "$dep" "@loader_path/$base" "$binary" || true
+            done
+          done
+          for dy in bundle/*.dylib; do
+            [ -f "$dy" ] || continue
+            install_name_tool -id "@loader_path/$(basename "$dy")" "$dy" || true
+            for dep in $(otool -L "$dy" | awk 'NR>1 {print $1}' | grep -E '/libllama|/libggml' || true); do
+              base=$(basename "$dep")
+              install_name_tool -change "$dep" "@loader_path/$base" "$dy" || true
+            done
+          done
+
+          ls -la bundle/
+
+          tar czf compute-aarch64-apple-darwin.tar.gz -C bundle .
+          shasum -a 256 compute-aarch64-apple-darwin.tar.gz > compute-aarch64-apple-darwin.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compute-aarch64-apple-darwin
+          path: |
+            compute-aarch64-apple-darwin.tar.gz
+            compute-aarch64-apple-darwin.tar.gz.sha256
 
   release:
     name: Create Release
-    needs: build
+    needs:
+      - build-linux
+      - build-macos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

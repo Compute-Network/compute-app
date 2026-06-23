@@ -185,6 +185,22 @@ trap 'rm -rf "$TMPDIR"' EXIT
 curl -fSL -o "${TMPDIR}/${ASSET}" "$DOWNLOAD_URL" 2>/dev/null &
 spin "Downloading binary" $!
 
+curl -fSL -o "${TMPDIR}/${ASSET}.sha256" "${DOWNLOAD_URL}.sha256" 2>/dev/null &
+spin "Downloading checksum" $!
+
+(
+  cd "$TMPDIR"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 -c "${ASSET}.sha256"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -c "${ASSET}.sha256"
+  else
+    echo "No SHA256 verifier found (need shasum or sha256sum)" >&2
+    exit 1
+  fi
+) >/dev/null &
+spin "Verifying checksum" $!
+
 # Extract
 tar xzf "${TMPDIR}/${ASSET}" -C "$TMPDIR" &
 spin "Extracting archive" $!
