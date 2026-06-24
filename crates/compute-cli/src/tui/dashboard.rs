@@ -1009,7 +1009,7 @@ impl Dashboard {
             if let (Some(s), Some(t)) = (self.pipeline.stage, self.pipeline.total_stages) {
                 format!("Pipeline Stage {}/{}", s + 1, t)
             } else {
-                "Not assigned".into()
+                "Waiting for assignment".into()
             };
 
         let uptime = format_duration(self.uptime_start.elapsed());

@@ -1603,7 +1603,11 @@ impl DaemonRuntime {
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(10)); // 10s for faster failure detection (3 missed = 30s)
         let mut metrics_interval = tokio::time::interval(Duration::from_secs(1));
         let mut idle_interval = tokio::time::interval(Duration::from_secs(2));
-        let mut assignment_interval = tokio::time::interval(Duration::from_secs(30)); // Fallback only — primary is WS push
+        // WebSocket assignment push is the fast path, but it is not enough on
+        // its own: if a push is missed or a node reconnects after an assignment
+        // already exists, the relay can be connected while the local runtime
+        // still thinks it is unassigned. Poll as a reconciliation safety net.
+        let mut assignment_interval = tokio::time::interval(Duration::from_secs(15));
         let mut baseline_tps = 0.0f64;
         let mut served_baseline = 0u64;
         let mut last_busy_slots = 0i32;
@@ -2192,12 +2196,20 @@ impl DaemonRuntime {
                     );
                 }
                 _ = assignment_interval.tick() => {
-                    // Fallback: only poll orchestrator when WS relay is not actively connected
-                    // When WS is connected, assignments come via push (no polling needed).
-                    // Also skip while the session is expired — it would only 401.
-                    if !relay_is_connected.load(std::sync::atomic::Ordering::Relaxed)
-                        && !relay_session_expired.load(std::sync::atomic::Ordering::Relaxed)
-                    {
+                    // Reconcile assignment state even when the relay is connected.
+                    // A connected WS only proves the node identified; it does not
+                    // prove the daemon received the most recent assignment push.
+                    if !relay_session_expired.load(std::sync::atomic::Ordering::Relaxed) {
+                        let relay_connected =
+                            relay_is_connected.load(std::sync::atomic::Ordering::Relaxed);
+                        let currently_assigned = self.state_rx.borrow().pipeline.active;
+                        if !relay_connected || !currently_assigned {
+                            tracing::debug!(
+                                "[assignment] reconciliation poll relay_connected={} assigned={}",
+                                relay_connected,
+                                currently_assigned
+                            );
+                        }
                         self.check_assignment(
                             &mut inference_mgr,
                             &mut stage_runtime,
