@@ -36,6 +36,13 @@ pub enum Commands {
     /// Open the full TUI dashboard (live stats, animated)
     Dashboard,
 
+    /// Launch Compute Code, the AI coding agent (all arguments are forwarded)
+    Code {
+        /// Arguments passed straight through to the compute-code binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
+
     /// Tail daemon logs
     Logs {
         /// Number of lines to show

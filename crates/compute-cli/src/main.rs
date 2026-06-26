@@ -74,6 +74,7 @@ fn main() -> Result<()> {
         Some(Commands::Stop) => cmd_stop()?,
         Some(Commands::Status) => cmd_status()?,
         Some(Commands::Dashboard) => cmd_dashboard()?,
+        Some(Commands::Code { args }) => cmd_code(args)?,
         Some(Commands::Logs { lines, follow }) => cmd_logs(lines, follow)?,
         Some(Commands::Init) => cmd_init()?,
         Some(Commands::Config { action }) => cmd_config(action)?,
@@ -96,6 +97,78 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Launch Compute Code (the AI coding agent), forwarding every argument.
+///
+/// The agent ships as a standalone native binary installed alongside this
+/// one (`~/.compute/bin/compute-code`). On Unix we `exec` so the TUI fully
+/// takes over the terminal and inherits our exit code.
+fn cmd_code(args: Vec<String>) -> Result<()> {
+    let bin = match find_compute_code() {
+        Some(path) => path,
+        None => {
+            eprintln!("  compute-code is not installed.");
+            eprintln!();
+            eprintln!("  Reinstall Compute to include it:");
+            eprintln!("    curl -fsSL https://computenetwork.sh/install.sh | sh");
+            eprintln!();
+            eprintln!("  Or install just Compute Code:");
+            eprintln!("    curl -fsSL https://computenetwork.sh/code.sh | sh");
+            std::process::exit(1);
+        }
+    };
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(&args);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec() only returns if it failed to replace the process image.
+        let err = cmd.exec();
+        return Err(anyhow::anyhow!("failed to launch {}: {err}", bin.display()));
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+/// Locate the compute-code binary: prefer one next to this executable
+/// (the normal install layout in ~/.compute/bin), then ~/.compute/bin
+/// explicitly, then fall back to anything named `compute-code` on PATH.
+fn find_compute_code() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("compute-code"));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".compute").join("bin").join("compute-code"));
+    }
+
+    if let Some(found) = candidates.into_iter().find(|p| p.exists()) {
+        return Some(found);
+    }
+
+    // Last resort: search PATH.
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join("compute-code");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
 }
 
 fn restore_plain_terminal_for_cli() {

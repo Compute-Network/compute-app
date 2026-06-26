@@ -17,6 +17,12 @@ BINARY_NAME="compute"
 STAGE_NODE_BINARY="llama_stage_tcp_node"
 GATEWAY_BINARY="llama_stage_gateway_tcp_node"
 
+# Compute Code — the AI coding agent, shipped as a standalone native binary
+# from its own repo and launched via `compute code`. Installed alongside the
+# compute binary so the `code` subcommand can exec it.
+CODE_REPO="Compute-Network/compute-code"
+CODE_BINARY_NAME="compute-code"
+
 # Colors
 if [ -t 1 ] || [ -t 2 ]; then
   DIM='\033[2m'
@@ -296,6 +302,36 @@ echo "  ${GREEN}✓${RESET} Installed ${DIM}${BINARY_NAME}${RESET} to ${DIM}${IN
 ) &
 spin "Installing LLM backend (this may take a while)" $!
 
+# Compute Code — the AI coding agent (`compute code`). Fetched as a single
+# native binary from its own repo's latest release and dropped next to the
+# compute binary. Non-fatal: if it can't be fetched, `compute` still works
+# and `compute code` prints install instructions on demand.
+CODE_ASSET="${CODE_BINARY_NAME}-${TARGET}"
+CODE_LATEST=$(curl -fsSL "https://api.github.com/repos/${CODE_REPO}/releases/latest" 2>/dev/null | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+if [ -n "$CODE_LATEST" ]; then
+  CODE_URL="https://github.com/${CODE_REPO}/releases/download/${CODE_LATEST}/${CODE_ASSET}"
+  (
+    set -e
+    curl -fSL -o "${TMPDIR}/${CODE_ASSET}" "$CODE_URL" 2>/dev/null
+    curl -fSL -o "${TMPDIR}/${CODE_ASSET}.sha256" "${CODE_URL}.sha256" 2>/dev/null || true
+    # Verify when a checksum is published; the .sha256 lists the bare asset name.
+    if [ -s "${TMPDIR}/${CODE_ASSET}.sha256" ]; then
+      cd "$TMPDIR"
+      if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -c "${CODE_ASSET}.sha256" >/dev/null
+      elif command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -c "${CODE_ASSET}.sha256" >/dev/null
+      fi
+    fi
+    chmod +x "${TMPDIR}/${CODE_ASSET}"
+    mv "${TMPDIR}/${CODE_ASSET}" "${INSTALL_DIR}/${CODE_BINARY_NAME}"
+  ) &
+  spin "Installing Compute Code (${CODE_LATEST})" $! || \
+    echo "  ${DIM}Note: Compute Code could not be installed; run 'compute code' later to retry.${RESET}"
+else
+  echo "  ${DIM}Note: Compute Code release not found — skipping (compute itself is installed).${RESET}"
+fi
+
 # Add to PATH if not already there
 if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
   SHELL_NAME=$(basename "$SHELL")
@@ -365,6 +401,9 @@ echo ""
 echo "  ${GREEN}${BOLD}Setup complete${RESET}"
 echo ""
 echo "  ${DIM}To launch Compute anytime, just type${RESET} ${BOLD}compute${RESET} ${DIM}into your terminal.${RESET}"
+if [ -x "${INSTALL_DIR}/${CODE_BINARY_NAME}" ]; then
+  echo "  ${DIM}Start the AI coding agent with${RESET} ${BOLD}compute code${RESET}${DIM}.${RESET}"
+fi
 echo ""
 
 # Only auto-launch when the installer was invoked directly (stdin is a tty).
