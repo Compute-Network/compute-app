@@ -194,6 +194,49 @@ impl ModelCatalog {
                     gguf_filename: None,
                     mlx: None,
                 },
+                // Ornith 1.0 — agentic-coding models (deepreinforce-ai),
+                // post-trained on Qwen 3.5 / Gemma 4. Single-file Q4_K_M GGUF
+                // from the official -GGUF repos. total_layers are estimates
+                // (the model cards don't publish a layer count) — adjust if a
+                // node reports a layer mismatch on load.
+                ModelDefinition {
+                    id: "ornith-9b".into(),
+                    name: "Ornith 1.0 9B (coding)".into(),
+                    family: ModelFamily::Qwen,
+                    total_layers: 40,
+                    vram_per_layer_mb: 150,
+                    total_size_mb: 6000,
+                    quantization: Quantization::Q4,
+                    min_total_vram_mb: 8000,
+                    recommended_stages: 1,
+                    source: "deepreinforce-ai/Ornith-1.0-9B-GGUF".into(),
+                    draft_model_id: None,
+                    gguf_download_url: Some(
+                        "https://huggingface.co/deepreinforce-ai/Ornith-1.0-9B-GGUF/resolve/main/ornith-1.0-9b-Q4_K_M.gguf"
+                            .into(),
+                    ),
+                    gguf_filename: Some("ornith-1.0-9b-Q4_K_M.gguf".into()),
+                    mlx: None,
+                },
+                ModelDefinition {
+                    id: "ornith-35b".into(),
+                    name: "Ornith 1.0 35B (coding)".into(),
+                    family: ModelFamily::Qwen,
+                    total_layers: 48,
+                    vram_per_layer_mb: 460,
+                    total_size_mb: 21_700,
+                    quantization: Quantization::Q4,
+                    min_total_vram_mb: 24_000,
+                    recommended_stages: 1,
+                    source: "deepreinforce-ai/Ornith-1.0-35B-GGUF".into(),
+                    draft_model_id: None,
+                    gguf_download_url: Some(
+                        "https://huggingface.co/deepreinforce-ai/Ornith-1.0-35B-GGUF/resolve/main/ornith-1.0-35b-Q4_K_M.gguf"
+                            .into(),
+                    ),
+                    gguf_filename: Some("ornith-1.0-35b-Q4_K_M.gguf".into()),
+                    mlx: None,
+                },
                 // Qwen 3.6 (Preview) 35B-A3B MoE. Single-node only — A3B's
                 // active-3B routing doesn't shard cleanly across the split
                 // pipeline yet. On Apple Silicon the MLX variant wins by a
